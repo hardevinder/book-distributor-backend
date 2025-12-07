@@ -1,39 +1,37 @@
-// src/controllers/publisherOrderController.js
+// src/controllers/schoolOrderController.js
 
 const {
-  School,
   SchoolBookRequirement,
   Book,
-  Publisher,
-  PublisherOrder,
-  PublisherOrderItem,
-  RequirementOrderLink,
+  School,
+  SchoolOrder,
+  SchoolOrderItem,
+  SchoolRequirementOrderLink,
   sequelize,
 } = require("../models");
 
 const { sendMail } = require("../config/email");
-const {
-  buildPublisherOrderEmailHtml,
-} = require("../utils/publisherOrderEmailTemplate");
 
-// Simple order number generator – you can customise later
-function generateOrderNo(publisherId, academicSession) {
+// Later you can make a fancy HTML template:
+// const { buildSchoolOrderEmailHtml } = require("../utils/schoolOrderEmailTemplate");
+
+function generateOrderNo(schoolId, academicSession) {
   const ts = Date.now();
   const sessionPart = academicSession
     ? academicSession.replace(/[^0-9]/g, "")
     : "NA";
-  return `PO-${publisherId}-${sessionPart}-${ts}`;
+  return `SO-${schoolId}-${sessionPart}-${ts}`;
 }
 
 /* ============================================
  * Helper: recompute order status from items
  * ============================================ */
 async function recomputeOrderStatus(order, t) {
-  const fresh = await PublisherOrder.findOne({
+  const fresh = await SchoolOrder.findOne({
     where: { id: order.id },
     include: [
       {
-        model: PublisherOrderItem,
+        model: SchoolOrderItem,
         as: "items",
       },
     ],
@@ -58,20 +56,13 @@ async function recomputeOrderStatus(order, t) {
     0
   );
 
-  // If already cancelled, don't auto-change
   if (fresh.status === "cancelled") {
     return fresh;
   }
 
   if (totalReceived === 0) {
-    // nothing received yet
-    if (fresh.status === "draft") {
-      fresh.status = "draft";
-    } else {
-      fresh.status = "sent";
-    }
+    fresh.status = fresh.status === "draft" ? "draft" : "sent";
   } else if (totalReceived < totalOrdered) {
-    // 👉 140 ordered, 125 received → partial_received
     fresh.status = "partial_received";
   } else if (totalReceived === totalOrdered) {
     fresh.status = "completed";
@@ -82,105 +73,29 @@ async function recomputeOrderStatus(order, t) {
 }
 
 /* ============================================
- * 🔹 GET /api/publisher-orders
- * List all publisher orders with publisher + items + book + school breakup
+ * GET /api/school-orders
+ * SIMPLE LIST (no includes for now)
  * ============================================ */
-exports.listPublisherOrders = async (request, reply) => {
+exports.listSchoolOrders = async (request, reply) => {
   try {
-    const orders = await PublisherOrder.findAll({
-      include: [
-        {
-          model: Publisher,
-          as: "publisher",
-        },
-        {
-          model: PublisherOrderItem,
-          as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-            },
-            {
-              model: RequirementOrderLink,
-              as: "requirement_links",
-              include: [
-                {
-                  model: SchoolBookRequirement,
-                  as: "requirement",
-                  include: [
-                    {
-                      model: School,
-                      as: "school",
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
-        },
-      ],
+    const orders = await SchoolOrder.findAll({
       order: [["createdAt", "DESC"]],
     });
 
-    // Plain JSON + school-wise breakup
-    const plainOrders = orders.map((order) => {
-      const o = order.toJSON();
-
-      o.items = (o.items || []).map((item) => {
-        const schoolBreakupMap = {};
-
-        (item.requirement_links || []).forEach((link) => {
-          const req = link.requirement;
-          const school = req?.school;
-
-          if (!req || !school) return;
-
-          const schoolKey = school.id;
-
-          if (!schoolBreakupMap[schoolKey]) {
-            schoolBreakupMap[schoolKey] = {
-              school_id: school.id,
-              school_name: school.name,
-              school_city: school.city || null,
-              // only if you have code / short_name etc.
-              school_code: school.code || null,
-              total_required_copies: 0,
-              allocated_qty: 0,
-            };
-          }
-
-          schoolBreakupMap[schoolKey].allocated_qty +=
-            Number(link.allocated_qty || 0);
-
-          // From requirement table (for info)
-          schoolBreakupMap[schoolKey].total_required_copies +=
-            Number(req.required_copies || 0);
-        });
-
-        return {
-          ...item,
-          // easy for frontend (table render)
-          school_breakup: Object.values(schoolBreakupMap),
-        };
-      });
-
-      return o;
-    });
-
-    return reply.code(200).send(plainOrders);
+    return reply.code(200).send(orders);
   } catch (err) {
-    console.error("Error in listPublisherOrders:", err);
+    // Better logging + safe message
+    request.log.error({ err }, "❌ Error in listSchoolOrders");
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to load publisher orders.",
+      message: err.message || "Failed to load school orders.",
     });
   }
 };
 
 /* ============================================
- * 🔹 POST /api/publisher-orders/generate
- * Generate publisher-wise orders from confirmed school requirements
+ * POST /api/school-orders/generate
+ * Generate SCHOOL-wise orders from confirmed requirements
  * ============================================ */
 exports.generateOrdersForSession = async (request, reply) => {
   const { academic_session } = request.body || {};
@@ -193,11 +108,9 @@ exports.generateOrdersForSession = async (request, reply) => {
   }
 
   const session = academic_session.trim();
-
   const t = await sequelize.transaction();
 
   try {
-    // 1) Load all confirmed requirements for this session, with book + publisher
     const requirements = await SchoolBookRequirement.findAll({
       where: {
         academic_session: session,
@@ -207,12 +120,10 @@ exports.generateOrdersForSession = async (request, reply) => {
         {
           model: Book,
           as: "book",
-          include: [
-            {
-              model: Publisher,
-              as: "publisher",
-            },
-          ],
+        },
+        {
+          model: School,
+          as: "school",
         },
       ],
       transaction: t,
@@ -229,45 +140,44 @@ exports.generateOrdersForSession = async (request, reply) => {
       });
     }
 
-    // 2) Group requirements by publisher_id + book_id
-    const mapByPublisher = new Map();
+    // Group by school_id + book_id
+    const mapBySchool = new Map();
 
     for (const reqRow of requirements) {
+      const schoolId = reqRow.school_id;
       const book = reqRow.book;
-      if (!book || !book.publisher) continue;
+      if (!schoolId || !book) continue;
 
-      const publisherId = book.publisher.id;
       const bookId = book.id;
 
-      if (!mapByPublisher.has(publisherId)) {
-        mapByPublisher.set(publisherId, {
+      if (!mapBySchool.has(schoolId)) {
+        mapBySchool.set(schoolId, {
           books: new Map(),
         });
       }
 
-      const publisherBucket = mapByPublisher.get(publisherId);
+      const schoolBucket = mapBySchool.get(schoolId);
 
-      if (!publisherBucket.books.has(bookId)) {
-        publisherBucket.books.set(bookId, {
+      if (!schoolBucket.books.has(bookId)) {
+        schoolBucket.books.set(bookId, {
           totalQty: 0,
           requirementRows: [],
         });
       }
 
-      const bookBucket = publisherBucket.books.get(bookId);
+      const bookBucket = schoolBucket.books.get(bookId);
       bookBucket.totalQty += reqRow.required_copies || 0;
       bookBucket.requirementRows.push(reqRow);
     }
 
     const createdOrders = [];
 
-    // 3) For each publisher create PublisherOrder + items
-    for (const [publisherId, data] of mapByPublisher.entries()) {
-      const orderNo = generateOrderNo(publisherId, session);
+    for (const [schoolId, data] of mapBySchool.entries()) {
+      const orderNo = generateOrderNo(schoolId, session);
 
-      const order = await PublisherOrder.create(
+      const order = await SchoolOrder.create(
         {
-          publisher_id: publisherId,
+          school_id: schoolId,
           order_no: orderNo,
           academic_session: session,
           order_date: new Date(),
@@ -280,12 +190,12 @@ exports.generateOrdersForSession = async (request, reply) => {
       const requirementIdsToUpdate = new Set();
 
       for (const [bookId, bookData] of data.books.entries()) {
-        const item = await PublisherOrderItem.create(
+        const item = await SchoolOrderItem.create(
           {
-            publisher_order_id: order.id,
+            school_order_id: order.id,
             book_id: bookId,
             total_order_qty: bookData.totalQty,
-            received_qty: 0, // start with 0 received
+            received_qty: 0,
             unit_price: null,
             total_amount: null,
           },
@@ -295,7 +205,7 @@ exports.generateOrdersForSession = async (request, reply) => {
         for (const reqRow of bookData.requirementRows) {
           linksToCreate.push({
             requirement_id: reqRow.id,
-            publisher_order_item_id: item.id,
+            school_order_item_id: item.id,
             allocated_qty: reqRow.required_copies || 0,
           });
           requirementIdsToUpdate.add(reqRow.id);
@@ -303,14 +213,14 @@ exports.generateOrdersForSession = async (request, reply) => {
       }
 
       if (linksToCreate.length) {
-        await RequirementOrderLink.bulkCreate(linksToCreate, {
+        await SchoolRequirementOrderLink.bulkCreate(linksToCreate, {
           transaction: t,
         });
       }
 
       if (requirementIdsToUpdate.size > 0) {
         await SchoolBookRequirement.update(
-          { status: "confirmed" }, // later you can change to "ordered"
+          { status: "confirmed" }, // later can use "ordered" if you want
           {
             where: { id: Array.from(requirementIdsToUpdate) },
             transaction: t,
@@ -324,45 +234,29 @@ exports.generateOrdersForSession = async (request, reply) => {
     await t.commit();
 
     return reply.code(201).send({
-      message: "Publisher orders generated successfully.",
+      message: "School orders generated successfully.",
       academic_session: session,
       orders_count: createdOrders.length,
       orders: createdOrders,
     });
   } catch (err) {
     try {
-      if (!t.finished) {
-        await t.rollback();
-      }
+      if (!t.finished) await t.rollback();
     } catch (rollbackErr) {
-      console.error(
-        "Rollback error in generateOrdersForSession:",
-        rollbackErr
-      );
+      console.error("Rollback error in generateOrdersForSession:", rollbackErr);
     }
 
     console.error("Error in generateOrdersForSession:", err);
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to generate publisher orders.",
+      message: err.message || "Failed to generate school orders.",
     });
   }
 };
 
 /* ============================================
- * 🔹 POST /api/publisher-orders/:orderId/receive
- * Update received quantities + order status
+ * POST /api/school-orders/:orderId/receive
  * ============================================ */
-/**
- * Body:
- * {
- *   "items": [
- *     { "item_id": 10, "received_qty": 50 },
- *     { "item_id": 11, "received_qty": 20 }
- *   ],
- *   "status": "auto" | "cancelled"
- * }
- */
 exports.receiveOrderItems = async (request, reply) => {
   const { orderId } = request.params;
   const { items, status = "auto" } = request.body || {};
@@ -377,33 +271,23 @@ exports.receiveOrderItems = async (request, reply) => {
   const t = await sequelize.transaction();
 
   try {
-    // Load order with items for locking
-    const order = await PublisherOrder.findOne({
+    const order = await SchoolOrder.findOne({
       where: { id: orderId },
-      include: [
-        {
-          model: PublisherOrderItem,
-          as: "items",
-        },
-      ],
+      include: [{ model: SchoolOrderItem, as: "items" }],
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
 
     if (!order) {
       await t.rollback();
-      return reply.code(404).send({
-        message: "Publisher order not found.",
-      });
+      return reply.code(404).send({ message: "School order not found." });
     }
 
-    // Map for quick lookup
     const itemById = new Map();
     for (const it of order.items || []) {
       itemById.set(it.id, it);
     }
 
-    // Update each item (clamp 0..total_order_qty)
     for (const row of items) {
       const itemId = row.item_id;
       let receivedQty = Number(row.received_qty ?? 0);
@@ -415,30 +299,25 @@ exports.receiveOrderItems = async (request, reply) => {
 
       const ordered = Number(item.total_order_qty) || 0;
 
-      if (receivedQty > ordered) {
-        receivedQty = ordered;
-      }
+      if (receivedQty > ordered) receivedQty = ordered;
 
       item.received_qty = receivedQty;
       await item.save({ transaction: t });
     }
 
-    // If explicit cancel
     if (status === "cancelled") {
       order.status = "cancelled";
       await order.save({ transaction: t });
     } else {
-      // auto recompute: completed / partial_received / sent / draft
       await recomputeOrderStatus(order, t);
     }
 
-    // reload full order with publisher + book for response
-    const updated = await PublisherOrder.findOne({
+    const updated = await SchoolOrder.findOne({
       where: { id: orderId },
       include: [
-        { model: Publisher, as: "publisher" },
+        { model: School, as: "school" },
         {
-          model: PublisherOrderItem,
+          model: SchoolOrderItem,
           as: "items",
           include: [{ model: Book, as: "book" }],
         },
@@ -461,9 +340,7 @@ exports.receiveOrderItems = async (request, reply) => {
     });
   } catch (err) {
     try {
-      if (!t.finished) {
-        await t.rollback();
-      }
+      if (!t.finished) await t.rollback();
     } catch (rollbackErr) {
       console.error("Rollback error in receiveOrderItems:", rollbackErr);
     }
@@ -477,27 +354,18 @@ exports.receiveOrderItems = async (request, reply) => {
 };
 
 /* ============================================
- * 🔹 POST /api/publisher-orders/:orderId/reorder-pending
- * Create a NEW PO for pending quantity of this order
+ * POST /api/school-orders/:orderId/reorder-pending
  * ============================================ */
 exports.reorderPendingForOrder = async (request, reply) => {
   const { orderId } = request.params;
-
   const t = await sequelize.transaction();
 
   try {
-    // Load original order with items + publisher
-    const sourceOrder = await PublisherOrder.findOne({
+    const sourceOrder = await SchoolOrder.findOne({
       where: { id: orderId },
       include: [
-        {
-          model: Publisher,
-          as: "publisher",
-        },
-        {
-          model: PublisherOrderItem,
-          as: "items",
-        },
+        { model: School, as: "school" },
+        { model: SchoolOrderItem, as: "items" },
       ],
       transaction: t,
       lock: t.LOCK.UPDATE,
@@ -505,12 +373,9 @@ exports.reorderPendingForOrder = async (request, reply) => {
 
     if (!sourceOrder) {
       await t.rollback();
-      return reply.code(404).send({
-        message: "Publisher order not found.",
-      });
+      return reply.code(404).send({ message: "School order not found." });
     }
 
-    // Calculate pending qty per item
     const pendingItems = [];
     for (const it of sourceOrder.items || []) {
       const ordered = Number(it.total_order_qty) || 0;
@@ -532,15 +397,14 @@ exports.reorderPendingForOrder = async (request, reply) => {
       });
     }
 
-    // Create new order for pending qty
-    const publisherId = sourceOrder.publisher_id;
+    const schoolId = sourceOrder.school_id;
     const session = sourceOrder.academic_session || null;
 
-    const newOrderNo = generateOrderNo(publisherId, session || "NA");
+    const newOrderNo = generateOrderNo(schoolId, session || "NA");
 
-    const newOrder = await PublisherOrder.create(
+    const newOrder = await SchoolOrder.create(
       {
-        publisher_id: publisherId,
+        school_id: schoolId,
         order_no: newOrderNo,
         academic_session: session,
         order_date: new Date(),
@@ -550,11 +414,10 @@ exports.reorderPendingForOrder = async (request, reply) => {
       { transaction: t }
     );
 
-    // Create items for each pending line
     for (const row of pendingItems) {
-      await PublisherOrderItem.create(
+      await SchoolOrderItem.create(
         {
-          publisher_order_id: newOrder.id,
+          school_order_id: newOrder.id,
           book_id: row.book_id,
           total_order_qty: row.pending_qty,
           received_qty: 0,
@@ -565,23 +428,14 @@ exports.reorderPendingForOrder = async (request, reply) => {
       );
     }
 
-    // Reload new order with publisher + items + book for response
-    const fullNewOrder = await PublisherOrder.findOne({
+    const fullNewOrder = await SchoolOrder.findOne({
       where: { id: newOrder.id },
       include: [
+        { model: School, as: "school" },
         {
-          model: Publisher,
-          as: "publisher",
-        },
-        {
-          model: PublisherOrderItem,
+          model: SchoolOrderItem,
           as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-            },
-          ],
+          include: [{ model: Book, as: "book" }],
         },
       ],
       transaction: t,
@@ -596,9 +450,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
     });
   } catch (err) {
     try {
-      if (!t.finished) {
-        await t.rollback();
-      }
+      if (!t.finished) await t.rollback();
     } catch (rollbackErr) {
       console.error("Rollback error in reorderPendingForOrder:", rollbackErr);
     }
@@ -613,57 +465,50 @@ exports.reorderPendingForOrder = async (request, reply) => {
 };
 
 /* ============================================
- * 🔹 POST /api/publisher-orders/:orderId/send-email
- * Send this specific publisher order via email
+ * POST /api/school-orders/:orderId/send-email
  * ============================================ */
 exports.sendOrderEmailForOrder = async (request, reply) => {
   const { orderId } = request.params;
 
   try {
-    const order = await PublisherOrder.findOne({
+    const order = await SchoolOrder.findOne({
       where: { id: orderId },
       include: [
+        { model: School, as: "school" },
         {
-          model: Publisher,
-          as: "publisher",
-        },
-        {
-          model: PublisherOrderItem,
+          model: SchoolOrderItem,
           as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-            },
-          ],
+          include: [{ model: Book, as: "book" }],
         },
       ],
     });
 
     if (!order) {
-      return reply.code(404).send({
-        message: "Publisher order not found.",
-      });
+      return reply.code(404).send({ message: "School order not found." });
     }
 
-    const publisher = order.publisher;
-    if (!publisher) {
+    const school = order.school;
+    if (!school) {
       return reply.code(400).send({
-        message: "Publisher record not linked with this order.",
+        message: "School record not linked with this order.",
       });
     }
 
-    if (!publisher.email) {
+    if (!school.email) {
       return reply.code(400).send({
-        message: "Publisher does not have an email address.",
+        message: "School does not have an email address.",
       });
     }
 
-    const subject = `Purchase Order ${order.order_no || order.id} – ${
-      publisher.name
+    const subject = `Book Order ${order.order_no || order.id} – ${
+      school.name
     }`;
 
-    const html = buildPublisherOrderEmailHtml(order);
+    // temporary simple email body (you can replace with HTML template)
+    const html = `<p>Dear ${school.name},</p>
+      <p>Please find your book order details below:</p>
+      <pre>${JSON.stringify(order.toJSON(), null, 2)}</pre>`;
+
     const cc = process.env.ORDER_EMAIL_CC || undefined;
 
     const fromEmail =
@@ -673,7 +518,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     const info = await sendMail({
       from: `"EduBridge ERP – Orders" <${fromEmail}>`,
-      to: publisher.email,
+      to: school.email,
       cc,
       subject,
       html,
@@ -681,7 +526,6 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     try {
       order.status = "sent";
-      // optional field, only if you added email_sent_at in model
       if ("email_sent_at" in order) {
         order.email_sent_at = new Date();
       }
@@ -691,17 +535,17 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     }
 
     return reply.code(200).send({
-      message: "Purchase order email sent successfully.",
+      message: "School order email sent successfully.",
       order_id: order.id,
-      publisher_id: publisher.id,
-      to: publisher.email,
+      school_id: school.id,
+      to: school.email,
       message_id: info.messageId,
     });
   } catch (err) {
     console.error("Error in sendOrderEmailForOrder:", err);
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to send publisher order email.",
+      message: err.message || "Failed to send school order email.",
     });
   }
 };

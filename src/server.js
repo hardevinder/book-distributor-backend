@@ -104,6 +104,11 @@ const buildServer = () => {
     prefix: "/api/publisher-orders",
   });
 
+  // 🧾 School Orders (SCHOOL-wise; generate + list + receive + email)
+  fastify.register(require("./routes/schoolOrderRoutes"), {
+    prefix: "/api/school-orders",
+  });
+
   // 📊 Stock / Inventory (book-wise summary)
   fastify.register(require("./routes/stockRoutes"), {
     prefix: "/api/stock",

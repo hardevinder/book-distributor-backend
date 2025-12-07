@@ -76,25 +76,40 @@ module.exports = (sequelize, DataTypes) => {
         {
           fields: ["book_id"],
         },
+        {
+          fields: ["class_id"],
+        },
+        {
+          fields: ["academic_session"],
+        },
       ],
     }
   );
 
-  // 🧩 Associations (if you are using model.associate pattern in models/index.js)
+  // 🧩 Associations
   SchoolBookRequirement.associate = (models) => {
+    // 🔗 School
     SchoolBookRequirement.belongsTo(models.School, {
       foreignKey: "school_id",
       as: "school",
     });
 
+    // 🔗 Book
     SchoolBookRequirement.belongsTo(models.Book, {
       foreignKey: "book_id",
       as: "book",
     });
 
+    // 🔗 Class (optional)
     SchoolBookRequirement.belongsTo(models.Class, {
       foreignKey: "class_id",
       as: "class",
+    });
+
+    // 🔗 Links to publisher order items (allocation)
+    SchoolBookRequirement.hasMany(models.RequirementOrderLink, {
+      foreignKey: "requirement_id",
+      as: "order_links",
     });
   };
 

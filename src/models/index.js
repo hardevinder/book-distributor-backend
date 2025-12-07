@@ -2,7 +2,7 @@
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/db");
 
-// Models
+// Base Models
 const User = require("./user")(sequelize, DataTypes);
 const Publisher = require("./publisher")(sequelize, DataTypes);
 const Book = require("./book")(sequelize, DataTypes);
@@ -15,10 +15,18 @@ const SchoolBookRequirement = require("./schoolBookRequirement")(
   DataTypes
 );
 
-// ⭐ NEW: Publisher Orders models
+// ⭐ Publisher Orders models
 const PublisherOrder = require("./publisherOrder")(sequelize, DataTypes);
 const PublisherOrderItem = require("./publisherOrderItem")(sequelize, DataTypes);
 const RequirementOrderLink = require("./requirementOrderLink")(
+  sequelize,
+  DataTypes
+);
+
+// ⭐ NEW: School Orders models
+const SchoolOrder = require("./schoolOrder")(sequelize, DataTypes);
+const SchoolOrderItem = require("./schoolOrderItem")(sequelize, DataTypes);
+const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(
   sequelize,
   DataTypes
 );
@@ -27,7 +35,10 @@ const RequirementOrderLink = require("./requirementOrderLink")(
         ASSOCIATIONS
    ====================== */
 
-// 📌 Publisher → Books (1:N)
+/* -------------------------
+   Publisher ↔ Books (1:N)
+   ------------------------- */
+
 Publisher.hasMany(Book, {
   foreignKey: "publisher_id",
   as: "books",
@@ -109,7 +120,7 @@ PublisherOrderItem.belongsTo(PublisherOrder, {
   as: "order",
 });
 
-// 📌 Book → PublisherOrderItem (1:N)  (each item is for a specific book)
+// 📌 Book → PublisherOrderItem (1:N)
 Book.hasMany(PublisherOrderItem, {
   foreignKey: "book_id",
   as: "publisher_order_items",
@@ -146,7 +157,70 @@ RequirementOrderLink.belongsTo(PublisherOrderItem, {
   as: "order_item",
 });
 
-// 📌 (Future) If School will have Orders / Students, link here.
+/* ============================
+   School Orders Relations
+   ============================ */
+
+// 📌 School → SchoolOrder (1:N)
+School.hasMany(SchoolOrder, {
+  foreignKey: "school_id",
+  as: "school_orders",
+});
+
+SchoolOrder.belongsTo(School, {
+  foreignKey: "school_id",
+  as: "school", // used in controller includes
+});
+
+// 📌 SchoolOrder → SchoolOrderItem (1:N)
+SchoolOrder.hasMany(SchoolOrderItem, {
+  foreignKey: "school_order_id",
+  as: "items",
+});
+
+SchoolOrderItem.belongsTo(SchoolOrder, {
+  foreignKey: "school_order_id",
+  as: "order",
+});
+
+// 📌 Book → SchoolOrderItem (1:N)
+Book.hasMany(SchoolOrderItem, {
+  foreignKey: "book_id",
+  as: "school_order_items",
+});
+
+SchoolOrderItem.belongsTo(Book, {
+  foreignKey: "book_id",
+  as: "book",
+});
+
+/* =========================================
+   Requirement ↔ SchoolOrderItem Mapping
+   ========================================= */
+
+// 📌 SchoolBookRequirement → SchoolRequirementOrderLink (1:N)
+SchoolBookRequirement.hasMany(SchoolRequirementOrderLink, {
+  foreignKey: "requirement_id",
+  as: "school_order_links",
+});
+
+SchoolRequirementOrderLink.belongsTo(SchoolBookRequirement, {
+  foreignKey: "requirement_id",
+  as: "requirement",
+});
+
+// 📌 SchoolOrderItem → SchoolRequirementOrderLink (1:N)
+SchoolOrderItem.hasMany(SchoolRequirementOrderLink, {
+  foreignKey: "school_order_item_id",
+  as: "requirement_links",
+});
+
+SchoolRequirementOrderLink.belongsTo(SchoolOrderItem, {
+  foreignKey: "school_order_item_id",
+  as: "school_order_item",
+});
+
+// 📌 (Future) If School will have Students, link here.
 
 module.exports = {
   sequelize,
@@ -159,4 +233,8 @@ module.exports = {
   PublisherOrder,
   PublisherOrderItem,
   RequirementOrderLink,
+  // NEW exports for school orders
+  SchoolOrder,
+  SchoolOrderItem,
+  SchoolRequirementOrderLink,
 };
