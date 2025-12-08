@@ -8,10 +8,13 @@ module.exports = async function (fastify, opts) {
   // EXPORT (Excel)
   fastify.get("/export", requirementController.exportRequirements);
 
-  // CREATE
+  // PRINT (PDF)
+  fastify.get("/print-pdf", requirementController.printRequirementsPdf);
+
+  // CREATE (single / upsert)
   fastify.post("/", requirementController.createRequirement);
 
-  // GET ALL (with filters)
+  // GET ALL (with filters, latest on top)
   fastify.get("/", requirementController.getRequirements);
 
   // GET SINGLE

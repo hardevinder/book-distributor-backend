@@ -11,6 +11,7 @@ const {
 const { Op } = require("sequelize");
 const XLSX = require("xlsx");
 const ExcelJS = require("exceljs");
+const PDFDocument = require("pdfkit"); // 🆕 for PDF printing
 
 /**
  * GET /api/requirements
@@ -107,11 +108,8 @@ exports.getRequirements = async (request, reply) => {
     const { rows, count } = await SchoolBookRequirement.findAndCountAll({
       where,
       include,
-      order: [
-        [sequelize.literal("`school`.`name`"), "ASC"],
-        [sequelize.literal("`class`.`sort_order`"), "ASC"],
-        ["id", "ASC"],
-      ],
+      // 🆕 LATEST ON TOP for frontend list
+      order: [["id", "DESC"]],
       limit: pageSize,
       offset,
       distinct: true,
@@ -173,6 +171,9 @@ exports.getRequirementById = async (request, reply) => {
 
 /**
  * POST /api/requirements
+ *  👉 Upsert-style:
+ *    - If (school_id, book_id, academic_session) not present → CREATE
+ *    - If exists → UPDATE existing record with latest values
  */
 exports.createRequirement = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -195,13 +196,14 @@ exports.createRequirement = async (request, reply) => {
       });
     }
 
-    const school = await School.findByPk(school_id);
+    // Basic validations (school / book / class must exist)
+    const school = await School.findByPk(school_id, { transaction: t });
     if (!school) {
       await t.rollback();
       return reply.code(400).send({ message: "Invalid school_id." });
     }
 
-    const book = await Book.findByPk(book_id);
+    const book = await Book.findByPk(book_id, { transaction: t });
     if (!book) {
       await t.rollback();
       return reply.code(400).send({ message: "Invalid book_id." });
@@ -209,58 +211,86 @@ exports.createRequirement = async (request, reply) => {
 
     let classObj = null;
     if (class_id) {
-      classObj = await Class.findByPk(class_id);
+      classObj = await Class.findByPk(class_id, { transaction: t });
       if (!classObj) {
         await t.rollback();
         return reply.code(400).send({ message: "Invalid class_id." });
       }
     }
 
-    const requirement = await SchoolBookRequirement.create(
-      {
+    const numericCopies = Number(required_copies) || 0;
+
+    // 🔑 Uniq key: (school_id, book_id, academic_session)
+    const [record, created] = await SchoolBookRequirement.findOrCreate({
+      where: {
         school_id,
         book_id,
-        class_id: classObj ? class_id : null,
         academic_session: academic_session || null,
-        required_copies: Number(required_copies) || 0,
+      },
+      defaults: {
+        class_id: classObj ? class_id : null,
+        required_copies: numericCopies,
         status: status || "draft",
         remarks: remarks || null,
         is_locked: Boolean(is_locked),
       },
-      { transaction: t }
-    );
+      transaction: t,
+    });
+
+    // Agar record already exist tha → latest values se update
+    if (!created) {
+      record.class_id = classObj ? class_id : null;
+      record.required_copies = numericCopies;
+      if (typeof status !== "undefined") {
+        record.status = status || "draft";
+      }
+      if (typeof remarks !== "undefined") {
+        record.remarks = remarks || null;
+      }
+      if (typeof is_locked !== "undefined") {
+        record.is_locked = Boolean(is_locked);
+      }
+
+      await record.save({ transaction: t });
+    }
 
     await t.commit();
 
-    const fullRequirement = await SchoolBookRequirement.findByPk(
-      requirement.id,
-      {
-        include: [
-          { model: School, as: "school", attributes: ["id", "name"] },
-          {
-            model: Book,
-            as: "book",
-            attributes: ["id", "title"],
-            include: [
-              {
-                model: Publisher,
-                as: "publisher",
-                attributes: ["id", "name"],
-              },
-            ],
-          },
-          { model: Class, as: "class", attributes: ["id", "class_name"] },
-        ],
-      }
-    );
+    const fullRequirement = await SchoolBookRequirement.findByPk(record.id, {
+      include: [
+        { model: School, as: "school", attributes: ["id", "name"] },
+        {
+          model: Book,
+          as: "book",
+          attributes: ["id", "title"],
+          include: [
+            {
+              model: Publisher,
+              as: "publisher",
+              attributes: ["id", "name"],
+            },
+          ],
+        },
+        { model: Class, as: "class", attributes: ["id", "class_name"] },
+      ],
+    });
 
-    return reply.code(201).send(fullRequirement);
+    return reply.code(created ? 201 : 200).send(fullRequirement);
   } catch (err) {
     await t.rollback();
     request.log.error({ err }, "Error in createRequirement");
+
+    // Agar fir bhi unique error aaye to clean message
+    if (err.name === "SequelizeUniqueConstraintError") {
+      return reply.code(400).send({
+        error:
+          "Requirement already exists for this School / Book / Session. Please edit it or change session/class.",
+      });
+    }
+
     return reply.code(500).send({
       error: "InternalServerError",
-      message: err.message || "Failed to create requirement",
+      message: err.message || "Failed to create/update requirement",
     });
   }
 };
@@ -568,7 +598,7 @@ exports.importRequirements = async (request, reply) => {
       } else if (isNaN(Number(copiesRaw))) {
         errors.push({
           row: rowNumber,
-          error: 'Required Copies must be numeric.',
+          error: "Required Copies must be numeric.",
         });
         await t.rollback();
         continue;
@@ -910,3 +940,224 @@ exports.exportRequirements = async (request, reply) => {
     });
   }
 };
+
+/* ------------ PDF EXPORT: GET /api/requirements/print-pdf ------------ */
+/**
+ * Pretty PDF:
+ *  - If schoolId filter → single school, heading on top + table of books.
+ *  - If no schoolId → group by school, each school on separate page.
+ */
+exports.printRequirementsPdf = (request, reply) => {
+  const { schoolId, academic_session, status, publisherId } =
+    request.query || {};
+
+  const where = {};
+  if (schoolId) where.school_id = Number(schoolId);
+  if (academic_session) where.academic_session = String(academic_session);
+  if (status) where.status = String(status);
+  if (publisherId) where["$book.publisher_id$"] = Number(publisherId);
+
+  SchoolBookRequirement.findAll({
+    where,
+    include: [
+      { model: School, as: "school", attributes: ["id", "name"] },
+      {
+        model: Book,
+        as: "book",
+        attributes: ["id", "title", "publisher_id"],
+        include: [
+          { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        ],
+      },
+      {
+        model: Class,
+        as: "class",
+        attributes: ["id", "class_name", "sort_order"],
+      },
+    ],
+    order: [
+      [sequelize.literal("`school`.`name`"), "ASC"],
+      [sequelize.literal("`class`.`sort_order`"), "ASC"],
+      ["id", "ASC"],
+    ],
+  })
+    .then((requirements) => {
+      // Group by school
+      const groups = new Map();
+      for (const r of requirements) {
+        const sid = r.school ? r.school.id : 0;
+        if (!groups.has(sid)) {
+          groups.set(sid, { school: r.school, items: [] });
+        }
+        groups.get(sid).items.push(r);
+      }
+
+      // 🔹 Build PDF fully in memory
+      const doc = new PDFDocument({ size: "A4", margin: 40 });
+
+      const chunks = [];
+      doc.on("data", (chunk) => {
+        chunks.push(chunk);
+      });
+
+      doc.on("end", () => {
+        const pdfBuffer = Buffer.concat(chunks);
+
+        if (reply.sent) return; // safety
+
+        reply
+          .header("Content-Type", "application/pdf")
+          .header(
+            "Content-Disposition",
+            'attachment; filename="school-book-requirements.pdf"'
+          )
+          .send(pdfBuffer);
+      });
+
+      doc.on("error", (err) => {
+        request.log.error({ err }, "PDF generation error");
+        if (!reply.sent) {
+          reply.code(500).send({
+            error: "InternalServerError",
+            message: "Failed to generate requirements PDF",
+          });
+        }
+      });
+
+      // ---------- Helpers to draw ----------
+      const printHeader = (schoolName) => {
+        const title = "School Book Requirements";
+        const today = new Date();
+
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(16)
+          .text(title, { align: "center" });
+        doc.moveDown(0.3);
+
+        if (schoolName) {
+          doc
+            .font("Helvetica-Bold")
+            .fontSize(13)
+            .text(schoolName, { align: "center" });
+        } else {
+          doc
+            .font("Helvetica-Bold")
+            .fontSize(13)
+            .text("All Schools", { align: "center" });
+        }
+
+        const dateStr = today.toLocaleDateString("en-IN");
+        doc.moveDown(0.2);
+        doc.font("Helvetica").fontSize(9).text(`Date: ${dateStr}`, {
+          align: "center",
+        });
+
+        if (academic_session) {
+          doc
+            .font("Helvetica")
+            .fontSize(9)
+            .text(`Session: ${academic_session}`, { align: "center" });
+        }
+
+        doc.moveDown(0.7);
+        doc
+          .moveTo(doc.page.margins.left, doc.y)
+          .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+          .stroke();
+        doc.moveDown(0.5);
+      };
+
+      const printTableHeader = () => {
+        const y = doc.y;
+        doc.font("Helvetica-Bold").fontSize(9);
+
+        doc.text("Sr", 40, y, { width: 20 });
+        doc.text("Class", 65, y, { width: 45 });
+        doc.text("Book Title", 115, y, { width: 230 });
+        doc.text("Publisher", 350, y, { width: 120 });
+        doc.text("Sess", 475, y, { width: 40 });
+        doc.text("Qty", 515, y, { width: 40, align: "right" });
+
+        doc.moveDown(0.4);
+        doc
+          .moveTo(doc.page.margins.left, doc.y)
+          .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+          .stroke();
+        doc.moveDown(0.3);
+      };
+
+      const ensureSpaceForRow = (approxHeight = 16, schoolName) => {
+        const bottom = doc.page.height - doc.page.margins.bottom;
+        if (doc.y + approxHeight > bottom) {
+          doc.addPage();
+          printHeader(schoolName);
+          printTableHeader();
+        }
+      };
+
+      // ---------- No data case ----------
+      if (!requirements.length) {
+        printHeader(null);
+        doc.font("Helvetica").fontSize(11).text("No requirements found.", {
+          align: "left",
+        });
+        doc.end();
+        return;
+      }
+
+      // ---------- Draw all groups ----------
+      const groupEntries = Array.from(groups.values());
+
+      groupEntries.forEach((group, idx) => {
+        const schoolName = group.school?.name || "Unknown School";
+
+        if (idx > 0) {
+          doc.addPage();
+        }
+
+        printHeader(schoolName);
+        printTableHeader();
+
+        let sr = 1;
+        for (const r of group.items) {
+          ensureSpaceForRow(18, schoolName);
+
+          const y = doc.y;
+          doc.font("Helvetica").fontSize(9);
+
+          const className = r.class?.class_name || "-";
+          const bookTitle = r.book?.title || "-";
+          const publisherName = r.book?.publisher?.name || "-";
+          const session = r.academic_session || "-";
+          const qty =
+            r.required_copies !== null && r.required_copies !== undefined
+              ? String(r.required_copies)
+              : "0";
+
+          doc.text(String(sr), 40, y, { width: 20 });
+          doc.text(className, 65, y, { width: 45 });
+          doc.text(bookTitle, 115, y, { width: 230 });
+          doc.text(publisherName, 350, y, { width: 120 });
+          doc.text(session, 475, y, { width: 40 });
+          doc.text(qty, 515, y, { width: 40, align: "right" });
+
+          doc.moveDown(0.7);
+          sr++;
+        }
+      });
+
+      // ✅ Finish PDF (triggers "end" → buffer → reply.send)
+      doc.end();
+    })
+    .catch((err) => {
+      request.log.error({ err }, "Error in printRequirementsPdf");
+      if (!reply.sent) {
+        reply.code(500).send({
+          error: "InternalServerError",
+          message: err.message || "Failed to generate requirements PDF",
+        });
+      }
+    });
+};
+

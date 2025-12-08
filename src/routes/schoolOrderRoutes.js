@@ -29,4 +29,10 @@ module.exports = async function (fastify, opts) {
     "/:orderId/send-email",
     schoolOrderController.sendOrderEmailForOrder
   );
+
+  // 🆕 GET /api/school-orders/:orderId/pdf  → single order PDF
+  fastify.get(
+    "/:orderId/pdf",
+    schoolOrderController.printOrderPdf
+  );
 };

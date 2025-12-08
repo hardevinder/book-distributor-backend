@@ -11,6 +11,8 @@ const {
 } = require("../models");
 
 const { sendMail } = require("../config/email");
+const { Op } = require("sequelize");
+const PDFDocument = require("pdfkit"); // 🆕 for order PDF
 
 // Later you can make a fancy HTML template:
 // const { buildSchoolOrderEmailHtml } = require("../utils/schoolOrderEmailTemplate");
@@ -74,15 +76,51 @@ async function recomputeOrderStatus(order, t) {
 
 /* ============================================
  * GET /api/school-orders
- * SIMPLE LIST (no includes for now)
+ * List with optional filters + includes
+ * query:
+ *  - academic_session
+ *  - school_id
+ *  - status
  * ============================================ */
 exports.listSchoolOrders = async (request, reply) => {
   try {
+    const { academic_session, school_id, status } = request.query || {};
+
+    const where = {};
+    if (academic_session) where.academic_session = academic_session;
+    if (school_id) where.school_id = school_id;
+    if (status) where.status = status;
+
     const orders = await SchoolOrder.findAll({
-      order: [["createdAt", "DESC"]],
+      where,
+      include: [
+        { model: School, as: "school" },
+        {
+          model: SchoolOrderItem,
+          as: "items",
+          include: [{ model: Book, as: "book" }],
+        },
+      ],
+      order: [
+        [{ model: School, as: "school" }, "name", "ASC"],
+        ["order_date", "DESC"],
+        ["createdAt", "DESC"],
+      ],
     });
 
-    return reply.code(200).send(orders);
+    // Add computed pending_qty on items (for UI convenience)
+    const plainOrders = orders.map((order) => {
+      const o = order.toJSON();
+      o.items =
+        (o.items || []).map((it) => ({
+          ...it,
+          pending_qty:
+            (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
+        })) || [];
+      return o;
+    });
+
+    return reply.code(200).send(plainOrders);
   } catch (err) {
     // Better logging + safe message
     request.log.error({ err }, "❌ Error in listSchoolOrders");
@@ -115,6 +153,7 @@ exports.generateOrdersForSession = async (request, reply) => {
       where: {
         academic_session: session,
         status: "confirmed",
+        // required_copies: { [Op.gt]: 0 }, // optional filter
       },
       include: [
         {
@@ -148,6 +187,9 @@ exports.generateOrdersForSession = async (request, reply) => {
       const book = reqRow.book;
       if (!schoolId || !book) continue;
 
+      const qty = Number(reqRow.required_copies || 0);
+      if (!qty || qty <= 0) continue;
+
       const bookId = book.id;
 
       if (!mapBySchool.has(schoolId)) {
@@ -166,8 +208,19 @@ exports.generateOrdersForSession = async (request, reply) => {
       }
 
       const bookBucket = schoolBucket.books.get(bookId);
-      bookBucket.totalQty += reqRow.required_copies || 0;
+      bookBucket.totalQty += qty;
       bookBucket.requirementRows.push(reqRow);
+    }
+
+    if (!mapBySchool.size) {
+      await t.rollback();
+      return reply.code(200).send({
+        message:
+          "No positive quantity found to generate school orders for this session.",
+        academic_session: session,
+        orders_count: 0,
+        orders: [],
+      });
     }
 
     const createdOrders = [];
@@ -190,11 +243,14 @@ exports.generateOrdersForSession = async (request, reply) => {
       const requirementIdsToUpdate = new Set();
 
       for (const [bookId, bookData] of data.books.entries()) {
+        const totalQty = Number(bookData.totalQty || 0);
+        if (!totalQty || totalQty <= 0) continue;
+
         const item = await SchoolOrderItem.create(
           {
             school_order_id: order.id,
             book_id: bookId,
-            total_order_qty: bookData.totalQty,
+            total_order_qty: totalQty,
             received_qty: 0,
             unit_price: null,
             total_amount: null,
@@ -203,10 +259,13 @@ exports.generateOrdersForSession = async (request, reply) => {
         );
 
         for (const reqRow of bookData.requirementRows) {
+          const rqQty = Number(reqRow.required_copies || 0);
+          if (!rqQty || rqQty <= 0) continue;
+
           linksToCreate.push({
             requirement_id: reqRow.id,
             school_order_item_id: item.id,
-            allocated_qty: reqRow.required_copies || 0,
+            allocated_qty: rqQty,
           });
           requirementIdsToUpdate.add(reqRow.id);
         }
@@ -220,7 +279,9 @@ exports.generateOrdersForSession = async (request, reply) => {
 
       if (requirementIdsToUpdate.size > 0) {
         await SchoolBookRequirement.update(
-          { status: "confirmed" }, // later can use "ordered" if you want
+          {
+            status: "confirmed", // later can be "ordered"
+          },
           {
             where: { id: Array.from(requirementIdsToUpdate) },
             transaction: t,
@@ -548,4 +609,249 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       message: err.message || "Failed to send school order email.",
     });
   }
+};
+
+/* ============================================
+ * GET /api/school-orders/:orderId/pdf
+ * Pretty PDF for a single school order
+ * ============================================ */
+exports.printOrderPdf = (request, reply) => {
+  const { orderId } = request.params;
+
+  SchoolOrder.findOne({
+    where: { id: orderId },
+    include: [
+      {
+        model: School,
+        as: "school",
+        attributes: ["id", "name", "city"],
+      },
+      {
+        model: SchoolOrderItem,
+        as: "items",
+        include: [
+          {
+            model: Book,
+            as: "book",
+            attributes: [
+              "id",
+              "title",
+              "class_name",
+              "subject",
+              "code",
+              "isbn",
+            ],
+          },
+        ],
+      },
+    ],
+    order: [[{ model: SchoolOrderItem, as: "items" }, "id", "ASC"]],
+  })
+    .then((order) => {
+      if (!order) {
+        return reply
+          .code(404)
+          .send({ error: "NotFound", message: "School order not found" });
+      }
+
+      const school = order.school;
+      const items = order.items || [];
+
+      // 🔹 Build PDF fully in memory (same style as printRequirementsPdf)
+      const doc = new PDFDocument({ size: "A4", margin: 40 });
+
+      const chunks = [];
+      doc.on("data", (chunk) => {
+        chunks.push(chunk);
+      });
+
+      doc.on("end", () => {
+        const pdfBuffer = Buffer.concat(chunks);
+        if (reply.sent) return;
+
+        const safeOrderNo = String(
+          order.order_no || `order-${order.id}`
+        ).replace(/[^\w\-]+/g, "_");
+
+        reply
+          .header("Content-Type", "application/pdf")
+          .header(
+            "Content-Disposition",
+            `attachment; filename="school-order-${safeOrderNo}.pdf"`
+          )
+          .send(pdfBuffer);
+      });
+
+      doc.on("error", (err) => {
+        request.log.error({ err }, "Order PDF generation error");
+        if (!reply.sent) {
+          reply.code(500).send({
+            error: "InternalServerError",
+            message: "Failed to generate school order PDF",
+          });
+        }
+      });
+
+      // ---------- Header ----------
+      const today = new Date();
+      const dateStr = today.toLocaleDateString("en-IN");
+
+      doc.font("Helvetica-Bold").fontSize(16).text("School Book Order", {
+        align: "center",
+      });
+      doc.moveDown(0.4);
+
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(13)
+        .text(school?.name || "Unknown School", { align: "center" });
+
+      if (school?.city) {
+        doc
+          .font("Helvetica")
+          .fontSize(10)
+          .text(school.city, { align: "center" });
+      }
+
+      doc.moveDown(0.4);
+
+      const orderDate = order.order_date
+        ? new Date(order.order_date).toLocaleDateString("en-IN")
+        : "-";
+
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(`Order No: ${order.order_no || order.id}`, { align: "center" });
+
+      if (order.academic_session) {
+        doc
+          .font("Helvetica")
+          .fontSize(9)
+          .text(`Session: ${order.academic_session}`, { align: "center" });
+      }
+
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(`Order Date: ${orderDate}`, { align: "center" });
+
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(`Print Date: ${dateStr}`, { align: "center" });
+
+      doc.moveDown(0.7);
+      doc
+        .moveTo(doc.page.margins.left, doc.y)
+        .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+        .stroke();
+      doc.moveDown(0.5);
+
+      // ---------- Status + totals ----------
+      const totalOrdered = items.reduce(
+        (sum, it) => sum + (Number(it.total_order_qty) || 0),
+        0
+      );
+      const totalReceived = items.reduce(
+        (sum, it) => sum + (Number(it.received_qty) || 0),
+        0
+      );
+      const totalPending = Math.max(totalOrdered - totalReceived, 0);
+
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .text(`Status: ${order.status}`, { align: "left" });
+      doc.moveDown(0.2);
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(`Total Ordered Qty: ${totalOrdered}`);
+      doc
+        .font("Helvetica")
+        .fontSize(9)
+        .text(`Total Received Qty: ${totalReceived}`);
+      doc.font("Helvetica").fontSize(9).text(`Pending Qty: ${totalPending}`);
+      doc.moveDown(0.6);
+
+      // ---------- Table helpers ----------
+      const printTableHeader = () => {
+        const y = doc.y;
+        doc.font("Helvetica-Bold").fontSize(9);
+
+        doc.text("Sr", 40, y, { width: 20 });
+        doc.text("Book Title", 65, y, { width: 230 });
+        doc.text("Class", 300, y, { width: 45 });
+        doc.text("Subject", 350, y, { width: 70 });
+        doc.text("Code / ISBN", 425, y, { width: 80 });
+        doc.text("Ordered", 505, y, { width: 45, align: "right" });
+        doc.text("Received", 550, y, { width: 45, align: "right" });
+        doc.text("Pending", 595, y, { width: 45, align: "right" });
+
+        doc.moveDown(0.4);
+        doc
+          .moveTo(doc.page.margins.left, doc.y)
+          .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+          .stroke();
+        doc.moveDown(0.3);
+      };
+
+      const ensureSpaceForRow = (approxHeight = 18) => {
+        const bottom = doc.page.height - doc.page.margins.bottom;
+        if (doc.y + approxHeight > bottom) {
+          doc.addPage();
+          printTableHeader();
+        }
+      };
+
+      // ---------- Table ----------
+      printTableHeader();
+
+      if (!items.length) {
+        doc
+          .font("Helvetica")
+          .fontSize(10)
+          .text("No items found in this order.", { align: "left" });
+      } else {
+        let sr = 1;
+        for (const it of items) {
+          ensureSpaceForRow(18);
+          const y = doc.y;
+          const orderedQty = Number(it.total_order_qty) || 0;
+          const receivedQty = Number(it.received_qty) || 0;
+          const pendingQty = Math.max(orderedQty - receivedQty, 0);
+
+          doc.font("Helvetica").fontSize(9);
+
+          doc.text(String(sr), 40, y, { width: 20 });
+          doc.text(it.book?.title || `Book #${it.book_id}`, 65, y, {
+            width: 230,
+          });
+          doc.text(it.book?.class_name || "-", 300, y, { width: 45 });
+          doc.text(it.book?.subject || "-", 350, y, { width: 70 });
+          doc.text(it.book?.code || it.book?.isbn || "-", 425, y, {
+            width: 80,
+          });
+          doc.text(String(orderedQty), 505, y, { width: 45, align: "right" });
+          doc.text(String(receivedQty), 550, y, { width: 45, align: "right" });
+          doc.text(String(pendingQty), 595, y, { width: 45, align: "right" });
+
+          doc.moveDown(0.7);
+          sr++;
+        }
+      }
+
+      // ✅ Finish PDF (triggers "end" → buffer → reply.send)
+      doc.end();
+    })
+    .catch((err) => {
+      request.log.error({ err }, "Error in printOrderPdf");
+      if (!reply.sent) {
+        reply.code(500).send({
+          error: "InternalServerError",
+          message: err.message || "Failed to generate school order PDF",
+        });
+      }
+    });
 };
