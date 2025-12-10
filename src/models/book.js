@@ -1,4 +1,5 @@
 // src/models/book.js
+
 module.exports = (sequelize, DataTypes) => {
   const Book = sequelize.define(
     "Book",
@@ -20,12 +21,12 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       code: {
-        type: DataTypes.STRING(50),   // ⭐ Book internal code
+        type: DataTypes.STRING(50), // internal book code
         allowNull: true,
       },
 
       isbn: {
-        type: DataTypes.STRING(20),   // ISBN-10 / ISBN-13
+        type: DataTypes.STRING(20), // ISBN-10 / ISBN-13
         allowNull: true,
       },
 
@@ -71,6 +72,14 @@ module.exports = (sequelize, DataTypes) => {
       timestamps: true,
     }
   );
+
+  // 🔗 Relation: Book → Publisher
+  Book.associate = (models) => {
+    Book.belongsTo(models.Publisher, {
+      foreignKey: "publisher_id",
+      as: "publisher",
+    });
+  };
 
   return Book;
 };

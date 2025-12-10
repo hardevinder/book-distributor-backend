@@ -3,6 +3,12 @@ const fastifyFactory = require("fastify");
 const cors = require("@fastify/cors");
 const jwt = require("@fastify/jwt");
 const multipart = require("@fastify/multipart");
+const fastifyStatic = require("@fastify/static");
+const pump = require("pump");
+const fs = require("fs");
+const fsp = require("fs/promises");
+const path = require("path");
+
 const config = require("./config");
 const { sequelize } = require("./models");
 
@@ -23,28 +29,27 @@ const buildServer = () => {
     },
   });
 
-  /* ---------------- CORS (FULL FIXED) ---------------- */
+  /* ---------------- CORS ---------------- */
   fastify.register(cors, {
     origin: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    exposedHeaders: ["Content-Type"],
     credentials: true,
-    preflightContinue: false,
-    optionsSuccessStatus: 204,
   });
 
-  /* -------------- Multipart (for file uploads) -------------- */
+  /* ---------------- Multipart Uploads ---------------- */
   fastify.register(multipart, {
-    limits: {
-      fileSize: 5 * 1024 * 1024, // 5 MB
-    },
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  });
+
+  /* ---------------- Serve Static Uploads ---------------- */
+  fastify.register(fastifyStatic, {
+    root: path.join(__dirname, "../uploads"),
+    prefix: "/uploads/", // http://server/uploads/<file>
   });
 
   /* ---------------- JWT ---------------- */
-  fastify.register(jwt, {
-    secret: config.jwt.secret,
-  });
+  fastify.register(jwt, { secret: config.jwt.secret });
 
   fastify.decorate("authenticate", async function (request, reply) {
     try {
@@ -55,87 +60,116 @@ const buildServer = () => {
     }
   });
 
-  /* ---------------- Basic Routes ---------------- */
-  fastify.get("/", async () => ({
-    status: "ok",
-    service: "books-distribution-api",
-    message: "Books Distribution API is running",
-  }));
-
-  fastify.get("/api/health", async () => ({
-    status: "ok",
-    service: "books-distribution-api",
-  }));
-
-  /* ---------------- Register Routes ---------------- */
-
-  // 🔐 Auth routes
-  fastify.register(require("./routes/authRoutes"), {
-    prefix: "/api/auth",
+  /* ---------------- BASIC ROUTES ---------------- */
+  fastify.get("/", async () => {
+    return {
+      status: "ok",
+      service: "books-distribution-api",
+      message: "Books Distribution API is running",
+    };
   });
 
-  // 📚 Books
-  fastify.register(require("./routes/bookRoutes"), {
-    prefix: "/api/books",
+  fastify.get("/api/health", async () => {
+    return {
+      status: "ok",
+      service: "books-distribution-api",
+    };
   });
 
-  // 🏢 Publishers
+  /* ----------------------------------------------------------
+     LOGO UPLOAD ROUTE
+     URL: POST /api/company-profile/logo-upload
+     Saves files → /uploads/company-logos/<filename>
+  ---------------------------------------------------------- */
+  fastify.post("/api/company-profile/logo-upload", async (request, reply) => {
+    try {
+      const file = await request.file();
+      if (!file) {
+        return reply.code(400).send({ message: "No file uploaded" });
+      }
+
+      const uploadDir = path.join(__dirname, "../uploads/company-logos");
+      await fsp.mkdir(uploadDir, { recursive: true });
+
+      const ext = path.extname(file.filename) || ".png";
+      const filename = `logo-${Date.now()}${ext}`;
+      const fullPath = path.join(uploadDir, filename);
+
+      await new Promise((resolve, reject) => {
+        pump(file.file, fs.createWriteStream(fullPath), (err) => {
+          if (err) return reject(err);
+          resolve();
+        });
+      });
+
+      const publicPath = `/uploads/company-logos/${filename}`;
+
+      // Auto detect base URL
+      const baseUrl =
+        process.env.APP_BASE_URL ||
+        `${request.protocol}://${request.headers.host}`;
+
+      const logoUrl = `${baseUrl}${publicPath}`;
+
+      return reply.send({
+        message: "Logo uploaded successfully",
+        logo_url: logoUrl, // full URL
+        logo_path: publicPath, // optional relative path
+      });
+    } catch (err) {
+      request.log.error(err);
+      return reply.code(500).send({ message: "Failed to upload logo" });
+    }
+  });
+
+  /* ---------------- REGISTER OTHER ROUTES ---------------- */
+  fastify.register(require("./routes/authRoutes"), { prefix: "/api/auth" });
+  fastify.register(require("./routes/bookRoutes"), { prefix: "/api/books" });
   fastify.register(require("./routes/publisherRoutes"), {
     prefix: "/api/publishers",
   });
-
-  // 🎓 Classes
-  fastify.register(require("./routes/classRoutes"), {
-    prefix: "/api/classes",
+  fastify.register(require("./routes/transportRoutes"), {
+    prefix: "/api/transports",
   });
-
-  // 🏫 Schools
+  fastify.register(require("./routes/classRoutes"), { prefix: "/api/classes" });
   fastify.register(require("./routes/schoolRoutes"), {
     prefix: "/api/schools",
   });
-
-  // 📦 School Book Requirements
   fastify.register(require("./routes/schoolBookRequirementRoutes"), {
     prefix: "/api/requirements",
   });
-
-  // 🧾 Publisher Orders (generate + list + receive + email)
   fastify.register(require("./routes/publisherOrderRoutes"), {
     prefix: "/api/publisher-orders",
   });
-
-  // 🧾 School Orders (SCHOOL-wise; generate + list + receive + email)
   fastify.register(require("./routes/schoolOrderRoutes"), {
     prefix: "/api/school-orders",
   });
-
-  // 📊 Stock / Inventory (book-wise summary)
-  fastify.register(require("./routes/stockRoutes"), {
-    prefix: "/api/stock",
+  fastify.register(require("./routes/stockRoutes"), { prefix: "/api/stock" });
+  fastify.register(require("./routes/companyProfileRoutes"), {
+    prefix: "/api",
   });
 
-  /* ---------------- Error & 404 Handlers ---------------- */
+  /* ---------------- ERROR HANDLERS ---------------- */
   fastify.setErrorHandler((err, request, reply) => {
-    request.log.error({ err }, "Unhandled error");
-
-    const statusCode = err.statusCode || 500;
-    reply.code(statusCode).send({
+    request.log.error(err);
+    reply.code(err.statusCode || 500).send({
       error: err.name || "Error",
       message: err.message || "Something went wrong",
     });
   });
 
-  fastify.setNotFoundHandler((request, reply) => {
+  fastify.setNotFoundHandler((request, reply) =>
     reply.code(404).send({
       error: "Not Found",
       path: request.raw.url,
       message: "The requested route does not exist.",
-    });
-  });
+    })
+  );
 
   return fastify;
 };
 
+/* ---------------- START SERVER ---------------- */
 const start = async () => {
   const fastify = buildServer();
 
@@ -143,36 +177,15 @@ const start = async () => {
     await sequelize.authenticate();
     fastify.log.info("✅ Database connected");
 
-    // 👉 Normal safe sync (no alter)
     await sequelize.sync();
     fastify.log.info("✅ Models synced");
 
-    await fastify.listen({
-      port: config.port,
-      host: "0.0.0.0",
-    });
-
+    await fastify.listen({ port: config.port, host: "0.0.0.0" });
     fastify.log.info(`🚀 Server running on port ${config.port}`);
   } catch (err) {
     console.error("Startup Error:", err);
     process.exit(1);
   }
-
-  const shutdown = async (signal) => {
-    fastify.log.info(`${signal} received. Shutting down...`);
-    try {
-      await fastify.close();
-      await sequelize.close();
-      fastify.log.info("🛑 Server closed gracefully");
-      process.exit(0);
-    } catch (err) {
-      console.error("Error during shutdown:", err);
-      process.exit(1);
-    }
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 };
 
 start();

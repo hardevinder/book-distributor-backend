@@ -12,6 +12,12 @@ module.exports = async function (fastify, opts) {
   // POST /api/school-orders/generate
   fastify.post("/generate", schoolOrderController.generateOrdersForSession);
 
+  // 🆕 PATCH /api/school-orders/:orderId/meta  → update transport / notes / remarks
+  fastify.patch(
+    "/:orderId/meta",
+    schoolOrderController.updateSchoolOrderMeta
+  );
+
   // POST /api/school-orders/:orderId/receive
   fastify.post(
     "/:orderId/receive",
@@ -30,7 +36,7 @@ module.exports = async function (fastify, opts) {
     schoolOrderController.sendOrderEmailForOrder
   );
 
-  // 🆕 GET /api/school-orders/:orderId/pdf  → single order PDF
+  // GET /api/school-orders/:orderId/pdf  → single order PDF
   fastify.get(
     "/:orderId/pdf",
     schoolOrderController.printOrderPdf

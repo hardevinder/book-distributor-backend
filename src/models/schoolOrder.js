@@ -48,6 +48,24 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.TEXT,
         allowNull: true,
       },
+
+      // FK → transports.id
+      transport_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
+      // “Through” text
+      transport_through: {
+        type: DataTypes.STRING(150),
+        allowNull: true,
+      },
+
+      // Extra notes
+      notes: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+      },
     },
     {
       tableName: "school_orders",
@@ -59,6 +77,12 @@ module.exports = (sequelize, DataTypes) => {
     SchoolOrder.belongsTo(models.School, {
       foreignKey: "school_id",
       as: "school",
+    });
+
+    // ✅ NEW alias: transportCompany  (avoid conflict with any old 'transport')
+    SchoolOrder.belongsTo(models.Transport, {
+      foreignKey: "transport_id",
+      as: "transportCompany",
     });
 
     SchoolOrder.hasMany(models.SchoolOrderItem, {

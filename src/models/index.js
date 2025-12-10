@@ -1,4 +1,3 @@
-// src/models/index.js
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/db");
 
@@ -9,6 +8,12 @@ const Book = require("./book")(sequelize, DataTypes);
 const Class = require("./class")(sequelize, DataTypes);
 const School = require("./school")(sequelize, DataTypes);
 
+// ⭐ NEW: Transport master
+const Transport = require("./transport")(sequelize, DataTypes);
+
+// ⭐ NEW: Company Profile master (Header for PDFs & Purchase Orders)
+const CompanyProfile = require("./companyProfile")(sequelize, DataTypes);
+
 // ⭐ SchoolBookRequirement model
 const SchoolBookRequirement = require("./schoolBookRequirement")(
   sequelize,
@@ -17,13 +22,16 @@ const SchoolBookRequirement = require("./schoolBookRequirement")(
 
 // ⭐ Publisher Orders models
 const PublisherOrder = require("./publisherOrder")(sequelize, DataTypes);
-const PublisherOrderItem = require("./publisherOrderItem")(sequelize, DataTypes);
+const PublisherOrderItem = require("./publisherOrderItem")(
+  sequelize,
+  DataTypes
+);
 const RequirementOrderLink = require("./requirementOrderLink")(
   sequelize,
   DataTypes
 );
 
-// ⭐ NEW: School Orders models
+// ⭐ School Orders models
 const SchoolOrder = require("./schoolOrder")(sequelize, DataTypes);
 const SchoolOrderItem = require("./schoolOrderItem")(sequelize, DataTypes);
 const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(
@@ -83,7 +91,7 @@ SchoolBookRequirement.belongsTo(Book, {
   as: "book",
 });
 
-// 📌 Class → SchoolBookRequirement (1:N, optional)
+// 📌 Class → SchoolBookRequirement (1:N)
 Class.hasMany(SchoolBookRequirement, {
   foreignKey: "class_id",
   as: "requirements",
@@ -169,7 +177,7 @@ School.hasMany(SchoolOrder, {
 
 SchoolOrder.belongsTo(School, {
   foreignKey: "school_id",
-  as: "school", // used in controller includes
+  as: "school",
 });
 
 // 📌 SchoolOrder → SchoolOrderItem (1:N)
@@ -220,7 +228,25 @@ SchoolRequirementOrderLink.belongsTo(SchoolOrderItem, {
   as: "school_order_item",
 });
 
-// 📌 (Future) If School will have Students, link here.
+/* ============================
+   Transport Relations
+   ============================ */
+
+Transport.hasMany(SchoolOrder, {
+  foreignKey: "transport_id",
+  as: "school_orders",
+});
+
+SchoolOrder.belongsTo(Transport, {
+  foreignKey: "transport_id",
+  as: "transport",
+});
+
+// No associations required for CompanyProfile yet (it's a stand-alone master)
+
+/* ============================
+         EXPORT MODELS
+   ============================ */
 
 module.exports = {
   sequelize,
@@ -229,11 +255,12 @@ module.exports = {
   Book,
   Class,
   School,
+  Transport,
+  CompanyProfile,       // ⭐ ADDED EXPORT
   SchoolBookRequirement,
   PublisherOrder,
   PublisherOrderItem,
   RequirementOrderLink,
-  // NEW exports for school orders
   SchoolOrder,
   SchoolOrderItem,
   SchoolRequirementOrderLink,
