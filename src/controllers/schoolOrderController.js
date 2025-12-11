@@ -109,7 +109,7 @@ exports.listSchoolOrders = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes – let Sequelize use real columns
+          as: "transport",
         },
       ],
       order: [
@@ -397,7 +397,7 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes
+          as: "transport",
         },
       ],
     });
@@ -504,7 +504,7 @@ exports.receiveOrderItems = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes
+          as: "transport",
         },
       ],
       transaction: t,
@@ -637,7 +637,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes
+          as: "transport",
         },
       ],
       transaction: t,
@@ -668,9 +668,12 @@ exports.reorderPendingForOrder = async (request, reply) => {
 
 /* ============================================
  * POST /api/school-orders/:orderId/send-email
+ * - If ?publisher_id=xx → send to that publisher (publisher-wise) with PDF
+ * - Else → send to school with full order PDF
  * ============================================ */
 exports.sendOrderEmailForOrder = async (request, reply) => {
   const { orderId } = request.params;
+  const { publisher_id } = request.query || {};
 
   try {
     const order = await SchoolOrder.findOne({
@@ -684,6 +687,15 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
             {
               model: Book,
               as: "book",
+              attributes: [
+                "id",
+                "title",
+                "class_name",
+                "subject",
+                "code",
+                "isbn",
+                "publisher_id",
+              ],
               include: [
                 {
                   model: Publisher,
@@ -696,7 +708,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes
+          as: "transport",
         },
       ],
     });
@@ -706,6 +718,221 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     }
 
     const school = order.school;
+    const items = order.items || [];
+
+    const today = new Date();
+    const todayStr = today.toLocaleDateString("en-IN");
+    const orderDate = order.order_date
+      ? new Date(order.order_date).toLocaleDateString("en-IN")
+      : "-";
+
+    // Company header for PDF
+    const companyProfile = await CompanyProfile.findOne({
+      where: { is_active: true },
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
+    });
+
+    // Common: safe base for file name
+    const safeOrderNo = String(
+      order.order_no || `order-${order.id}`
+    ).replace(/[^\w\-]+/g, "_");
+
+    // Common support email for replyTo / display
+    const supportEmail =
+      process.env.ORDER_SUPPORT_EMAIL ||
+      process.env.SMTP_FROM ||
+      process.env.SMTP_USER;
+
+    /* =======================================================
+     * 1) PUBLISHER-WISE EMAIL (when ?publisher_id= present)
+     * ======================================================= */
+    if (publisher_id) {
+      const pid = Number(publisher_id);
+      if (Number.isNaN(pid)) {
+        return reply.code(400).send({ message: "Invalid publisher_id." });
+      }
+
+      // Filter items for this publisher
+      const itemsForPublisher = items.filter((it) => {
+        const b = it.book;
+        if (!b) return false;
+        const pbid =
+          (b.publisher && b.publisher.id) ||
+          (b.publisher_id != null ? Number(b.publisher_id) : undefined);
+        return pbid === pid;
+      });
+
+      if (!itemsForPublisher.length) {
+        return reply.code(400).send({
+          message:
+            "No items found for this publisher in this school order.",
+        });
+      }
+
+      // Fetch publisher from DB to get email fields
+      let publisher = await Publisher.findByPk(pid);
+      if (!publisher) {
+        // fallback to whatever is on the item
+        publisher = itemsForPublisher[0].book.publisher;
+      }
+
+      if (!publisher) {
+        return reply
+          .code(404)
+          .send({ message: "Publisher not found for this order." });
+      }
+
+      // Decide which email to use from Publisher model
+      const toEmail =
+        publisher.email ||
+        publisher.contact_email ||
+        process.env.PUBLISHER_ORDER_FALLBACK_EMAIL;
+
+      if (!toEmail) {
+        return reply.code(400).send({
+          message:
+            "Publisher email not set. Please update publisher master or set PUBLISHER_ORDER_FALLBACK_EMAIL.",
+        });
+      }
+
+      const subject = `Purchase Order ${order.order_no || order.id} – ${
+        publisher.name
+      }`;
+
+      // Build HTML table for this publisher only
+      const rowsHtml = itemsForPublisher
+        .map((it, idx) => {
+          const b = it.book || {};
+          const ordered = Number(it.total_order_qty) || 0;
+          const received = Number(it.received_qty) || 0;
+          const pending = Math.max(ordered - received, 0);
+          return `
+            <tr>
+              <td style="border:1px solid #ddd;padding:4px;">${idx + 1}</td>
+              <td style="border:1px solid #ddd;padding:4px;">${b.title || ""}</td>
+              <td style="border:1px solid #ddd;padding:4px;">${b.class_name || ""}</td>
+              <td style="border:1px solid #ddd;padding:4px;">${b.subject || ""}</td>
+              <td style="border:1px solid #ddd;padding:4px;">${
+                b.code || b.isbn || ""
+              }</td>
+              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${ordered}</td>
+              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${received}</td>
+              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${pending}</td>
+            </tr>
+          `;
+        })
+        .join("");
+
+      const html = `
+        <p>Dear ${publisher.name},</p>
+        <p>
+          Please find below the book order from
+          <strong>${school?.name || "our client school"}</strong>
+          for session <strong>${order.academic_session || "-"}</strong>.
+        </p>
+
+        <h3>Order Summary</h3>
+        <div><strong>Order No:</strong> ${order.order_no || order.id}</div>
+        <div><strong>School:</strong> ${
+          school?.name || "-"
+        }${school?.city ? " (" + school.city + ")" : ""}</div>
+        <div><strong>School Email:</strong> ${school?.email || "-"}</div>
+        <div><strong>Order Date:</strong> ${orderDate}</div>
+        <div><strong>Print Date:</strong> ${todayStr}</div>
+        <div><strong>Reply To (Query Email):</strong> ${supportEmail || "-"}</div>
+
+        <h3 style="margin-top:16px;">Items for ${publisher.name}</h3>
+        <table style="border-collapse:collapse;font-size:12px;">
+          <thead>
+            <tr>
+              <th style="border:1px solid #ddd;padding:4px;">Sr</th>
+              <th style="border:1px solid #ddd;padding:4px;">Book</th>
+              <th style="border:1px solid #ddd;padding:4px;">Class</th>
+              <th style="border:1px solid #ddd;padding:4px;">Subject</th>
+              <th style="border:1px solid #ddd;padding:4px;">Code / ISBN</th>
+              <th style="border:1px solid #ddd;padding:4px;">Ordered</th>
+              <th style="border:1px solid #ddd;padding:4px;">Received</th>
+              <th style="border:1px solid #ddd;padding:4px;">Pending</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+
+        <p style="margin-top:16px;">
+          Regards,<br/>
+          EduBridge ERP<br/>
+          ${supportEmail ? `Email: ${supportEmail}<br/>` : ""}
+        </p>
+      `;
+
+      // 👉 Build publisher-wise PDF buffer using same helper as /pdf endpoint
+      const pdfBuffer = await buildSchoolOrderPdfBuffer({
+        order,
+        school,
+        companyProfile,
+        items: itemsForPublisher,
+        pdfTitle: `Purchase Order – ${publisher.name}`,
+        publisherNameForHeader: publisher.name,
+        dateStr: todayStr,
+        orderDate,
+      });
+
+      const fileSuffix = `-publisher-${String(publisher.id).replace(
+        /[^\w\-]+/g,
+        "_"
+      )}`;
+      const filename = `school-order-${safeOrderNo}${fileSuffix}.pdf`;
+
+      // CC yourself so you can see the mail coming & debug if needed
+      const cc =
+        process.env.PUBLISHER_ORDER_CC ||
+        process.env.ORDER_EMAIL_CC ||
+        process.env.SMTP_USER;
+
+      const info = await sendMail({
+        to: toEmail,
+        cc,
+        subject,
+        html,
+        replyTo: supportEmail || undefined,
+        attachments: [
+          {
+            filename,
+            content: pdfBuffer,
+            contentType: "application/pdf",
+          },
+        ],
+      });
+
+      // Optional: mark order as sent
+      try {
+        order.status = "sent";
+        if ("email_sent_at" in order) {
+          order.email_sent_at = new Date();
+        }
+        await order.save();
+      } catch (statusErr) {
+        console.warn("Order status/email_sent_at update failed:", statusErr);
+      }
+
+      return reply.code(200).send({
+        message: "Publisher order email (with PDF) sent successfully.",
+        order_id: order.id,
+        publisher_id: publisher.id,
+        to: toEmail,
+        message_id: info.messageId,
+      });
+    }
+
+    /* =======================================================
+     * 2) EMAIL TO SCHOOL (no publisher_id)
+     *    + FULL ORDER PDF ATTACHED
+     * ======================================================= */
     if (!school) {
       return reply.code(400).send({
         message: "School record not linked with this order.",
@@ -722,12 +949,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       school.name
     }`;
 
-    // ---------- Build nicer HTML with conditional transport/notes ----------
-    const orderDate = order.order_date
-      ? new Date(order.order_date).toLocaleDateString("en-IN")
-      : "-";
-    const todayStr = new Date().toLocaleDateString("en-IN");
-
+    // Transport block (same as before)
     const transportLines = [];
     const tObj = order.transport;
 
@@ -736,33 +958,31 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     const transportCity = tObj?.city || null;
     const transportPhone = tObj?.phone || null;
 
-    if (transportThrough || transportName || order.notes) {
-      if (transportThrough) {
-        transportLines.push(
-          `<div><strong>Through:</strong> ${transportThrough}</div>`
-        );
-      } else if (transportName) {
-        transportLines.push(
-          `<div><strong>Through:</strong> ${transportName}${
-            transportCity ? " (" + transportCity + ")" : ""
-          }</div>`
-        );
-      }
+    if (transportThrough) {
+      transportLines.push(
+        `<div><strong>Through:</strong> ${transportThrough}</div>`
+      );
+    } else if (transportName) {
+      transportLines.push(
+        `<div><strong>Through:</strong> ${transportName}${
+          transportCity ? " (" + transportCity + ")" : ""
+        }</div>`
+      );
+    }
 
-      if (transportPhone) {
-        transportLines.push(
-          `<div><strong>Transport Phone:</strong> ${transportPhone}</div>`
-        );
-      }
+    if (transportPhone) {
+      transportLines.push(
+        `<div><strong>Transport Phone:</strong> ${transportPhone}</div>`
+      );
+    }
 
-      if (order.notes) {
-        transportLines.push(
-          `<div><strong>Notes:</strong> ${String(order.notes).replace(
-            /\n/g,
-            "<br/>"
-          )}</div>`
-        );
-      }
+    if (order.notes) {
+      transportLines.push(
+        `<div><strong>Notes:</strong> ${String(order.notes).replace(
+          /\n/g,
+          "<br/>"
+        )}</div>`
+      );
     }
 
     const transportBlock =
@@ -785,6 +1005,11 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       <div><strong>Order Date:</strong> ${orderDate}</div>
       <div><strong>Print Date:</strong> ${todayStr}</div>
       <div><strong>Status:</strong> ${order.status}</div>
+      ${
+        supportEmail
+          ? `<div><strong>For any query, please write to:</strong> ${supportEmail}</div>`
+          : ""
+      }
 
       ${transportBlock}
 
@@ -806,19 +1031,35 @@ ${JSON.stringify(
       </pre>
     `;
 
+    // 👉 Build full-order PDF buffer (same as clicking PDF without publisher_id)
+    const pdfBuffer = await buildSchoolOrderPdfBuffer({
+      order,
+      school,
+      companyProfile,
+      items,
+      pdfTitle: "School Book Order",
+      publisherNameForHeader: "",
+      dateStr: todayStr,
+      orderDate,
+    });
+
+    const filename = `school-order-${safeOrderNo}.pdf`;
+
     const cc = process.env.ORDER_EMAIL_CC || undefined;
 
-    const fromEmail =
-      process.env.SMTP_FROM ||
-      process.env.SMTP_USER ||
-      "admin@edubridgeerp.in";
-
     const info = await sendMail({
-      from: `"EduBridge ERP – Orders" <${fromEmail}>`,
       to: school.email,
       cc,
       subject,
       html,
+      replyTo: supportEmail || undefined,
+      attachments: [
+        {
+          filename,
+          content: pdfBuffer,
+          contentType: "application/pdf",
+        },
+      ],
     });
 
     try {
@@ -832,7 +1073,7 @@ ${JSON.stringify(
     }
 
     return reply.code(200).send({
-      message: "School order email sent successfully.",
+      message: "School order email (with PDF) sent successfully.",
       order_id: order.id,
       school_id: school.id,
       to: school.email,
@@ -1170,7 +1411,7 @@ exports.printOrderPdf = async (request, reply) => {
         },
         {
           model: Transport,
-          as: "transport", // ❗ no attributes
+          as: "transport",
         },
       ],
       order: [[{ model: SchoolOrderItem, as: "items" }, "id", "ASC"]],
