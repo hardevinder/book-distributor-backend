@@ -26,10 +26,14 @@ const { Op } = require("sequelize");
  * Helpers
  * ============================================ */
 
-function generateOrderNo(schoolId, academicSession) {
-  const ts = Date.now();
-  const sessionPart = academicSession ? academicSession.replace(/[^0-9]/g, "") : "NA";
-  return `SO-${schoolId}-${sessionPart}-${ts}`;
+// ✅ SUPER SHORT order no (ONLY code)
+// Example: 0N9A7   (5 chars)
+function generateOrderNo() {
+  return Math.random()
+    .toString(36)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 5);
 }
 
 /* ============================================================
@@ -63,8 +67,10 @@ async function loadLogoBuffer(logoRef) {
 
   const s = String(logoRef).trim();
 
+  // skip svg/webp (pdfkit unreliable)
   if (/\.(svg|webp)(\?.*)?$/i.test(s)) return null;
 
+  // data url
   if (s.startsWith("data:image/")) {
     try {
       const base64 = s.split(",")[1];
@@ -75,6 +81,7 @@ async function loadLogoBuffer(logoRef) {
     }
   }
 
+  // url
   if (s.startsWith("http://") || s.startsWith("https://")) {
     try {
       return await fetchUrlBuffer(s);
@@ -83,6 +90,7 @@ async function loadLogoBuffer(logoRef) {
     }
   }
 
+  // local file
   const localPath = path.isAbsolute(s) ? s : path.join(process.cwd(), s);
   if (fs.existsSync(localPath)) {
     try {
@@ -261,7 +269,8 @@ exports.generateOrdersForSession = async (request, reply) => {
     const createdOrders = [];
 
     for (const [schoolId, data] of mapBySchool.entries()) {
-      const orderNo = generateOrderNo(schoolId, session);
+      // ✅ ONLY SHORT CODE
+      const orderNo = generateOrderNo();
 
       const order = await SchoolOrder.create(
         {
@@ -358,7 +367,9 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
 
     if (typeof transport_through !== "undefined") {
       order.transport_through =
-        transport_through === null || transport_through === "" ? null : String(transport_through).trim();
+        transport_through === null || transport_through === ""
+          ? null
+          : String(transport_through).trim();
     }
 
     if (typeof notes !== "undefined") {
@@ -428,7 +439,11 @@ exports.updateSchoolOrderNo = async (request, reply) => {
     order.order_no = newNo;
     await order.save();
 
-    return reply.code(200).send({ message: "Order number updated successfully.", order_id: order.id, order_no: order.order_no });
+    return reply.code(200).send({
+      message: "Order number updated successfully.",
+      order_id: order.id,
+      order_no: order.order_no,
+    });
   } catch (err) {
     console.error("Error in updateSchoolOrderNo:", err);
     return reply.code(500).send({ error: "Error", message: err.message || "Failed to update order number." });
@@ -558,15 +573,14 @@ exports.reorderPendingForOrder = async (request, reply) => {
       return reply.code(400).send({ message: "No pending quantity found to re-order for this order." });
     }
 
-    const schoolId = sourceOrder.school_id;
-    const session = sourceOrder.academic_session || null;
-    const newOrderNo = generateOrderNo(schoolId, session || "NA");
+    // ✅ ONLY SHORT CODE
+    const newOrderNo = generateOrderNo();
 
     const newOrder = await SchoolOrder.create(
       {
-        school_id: schoolId,
+        school_id: sourceOrder.school_id,
         order_no: newOrderNo,
-        academic_session: session,
+        academic_session: sourceOrder.academic_session || null,
         order_date: new Date(),
         status: "draft",
         remarks: `Re-order for pending quantity of ${sourceOrder.order_no}`,
@@ -625,10 +639,11 @@ exports.reorderPendingForOrder = async (request, reply) => {
 };
 
 /* ============================================================
- * PDF builder -> Buffer (UPDATED as per request)
- * - Summary looks better (boxed)
- * - Transport + Notes moved to bottom (after table)
- * - No line through logo (safe gap + drawHR after header block)
+ * PDF builder -> Buffer (FINAL POLISHED)
+ * - Publisher column removed (because "To" shows it)
+ * - Transport+Notes at bottom
+ * - Safe header (no line through logo)
+ * - Dynamic row heights + page breaks
  * ============================================================ */
 function buildSchoolOrderPdfBuffer({
   order,
@@ -661,24 +676,7 @@ function buildSchoolOrderPdfBuffer({
       doc.restore();
     };
 
-    const twoColLine = (leftText, rightText, fontSize = 9, bold = false) => {
-      const y = doc.y;
-      doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(fontSize);
-
-      doc.text(leftText || "", pageLeft, y, { width: contentWidth * 0.6, align: "left" });
-      doc.text(rightText || "", pageLeft + contentWidth * 0.6, y, { width: contentWidth * 0.4, align: "right" });
-
-      doc.moveDown(0.25);
-    };
-
-    const ensureSpace = (neededHeight) => {
-      const bottom = doc.page.height - doc.page.margins.bottom;
-      if (doc.y + neededHeight > bottom) {
-        doc.addPage();
-      }
-    };
-
-    /* ---------- Header: Logo + Company (SAFE, no HR through logo) ---------- */
+    /* ---------- Header (logo + company) ---------- */
     if (companyProfile) {
       const startY = doc.y;
       const logoSize = 52;
@@ -700,7 +698,6 @@ function buildSchoolOrderPdfBuffer({
 
       const logoX = pageLeft;
       const logoY = startY;
-
       const textX = logoBuf ? logoX + logoSize + gap : pageLeft;
       const textWidth = pageRight - textX;
 
@@ -738,16 +735,15 @@ function buildSchoolOrderPdfBuffer({
         yCursor += h + 2;
       }
 
-      const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 10;
+      // ✅ Move y below logo+text, then HR (so it never touches logo)
+      const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 12;
       doc.y = headerBottom;
 
-      // EXTRA SAFE GAP before HR (prevents line touching logo area)
-      doc.y += 2;
       drawHR();
       doc.moveDown(0.35);
     }
 
-    /* ---------- Title (tight) ---------- */
+    /* ---------- Title ---------- */
     doc.font("Helvetica-Bold").fontSize(isPurchaseOrder ? 16 : 14).fillColor("#000");
     doc.text(pdfTitle, { align: "center" });
     doc.moveDown(0.15);
@@ -759,22 +755,15 @@ function buildSchoolOrderPdfBuffer({
       doc.moveDown(0.15);
     }
 
-    /* ---------- Meta ---------- */
-    const orderNoText = `Order No: ${order.order_no || order.id}`;
-    const dateRightText = `Order Date: ${orderDate} | Print: ${dateStr}`;
-    twoColLine(orderNoText, dateRightText, 8, false);
-
-    if (order.academic_session) {
-      twoColLine(`Session: ${order.academic_session}`, `Status: ${order.status || "-"}`, 9, false);
-    } else {
-      twoColLine("", `Status: ${order.status || "-"}`, 9, false);
-    }
-
-    doc.moveDown(0.1);
+    /* ---------- Meta (Order No already short) ---------- */
+    doc.font("Helvetica").fontSize(9);
+    doc.text(`Order No: ${safeText(order.order_no || order.id)}`, pageLeft);
+    doc.text(`Order Date: ${orderDate}   |   Print: ${dateStr}`, pageLeft, doc.y + 2);
+    doc.moveDown(0.3);
     drawHR();
     doc.moveDown(0.35);
 
-    /* ---------- Summary (MORE WONDERFUL BOX) ---------- */
+    /* ---------- Summary (boxed) ---------- */
     const totalOrdered = items.reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
     const totalReceived = items.reduce((sum, it) => sum + (Number(it.received_qty) || 0), 0);
     const totalPending = Math.max(totalOrdered - totalReceived, 0);
@@ -791,31 +780,24 @@ function buildSchoolOrderPdfBuffer({
     doc.text("Summary", pageLeft + 10, boxY + 8);
 
     doc.font("Helvetica").fontSize(9);
-
     doc.text(`Total Ordered: ${totalOrdered}`, pageLeft + 10, boxY + 26, { width: contentWidth / 2 - 10 });
     doc.text(`Total Received: ${totalReceived}`, pageLeft + 10, boxY + 40, { width: contentWidth / 2 - 10 });
 
-    doc.text(`Pending: ${totalPending}`, pageLeft + contentWidth / 2, boxY + 26, {
-      width: contentWidth / 2 - 10,
-      align: "right",
-    });
-    doc.text(`Completion: ${completion}%`, pageLeft + contentWidth / 2, boxY + 40, {
-      width: contentWidth / 2 - 10,
-      align: "right",
-    });
+    doc.text(`Pending: ${totalPending}`, pageLeft + contentWidth / 2, boxY + 26, { width: contentWidth / 2 - 10, align: "right" });
+    doc.text(`Completion: ${completion}%`, pageLeft + contentWidth / 2, boxY + 40, { width: contentWidth / 2 - 10, align: "right" });
 
     doc.y = boxY + boxH + 10;
 
-    /* ---------- Table (auto-fit) ---------- */
-    const W = {
+    /* ---------- Table (NO publisher column) ---------- */
+   const W = {
       sr: Math.max(24, Math.floor(contentWidth * 0.06)),
-      title: Math.floor(contentWidth * 0.44),
-      subject: Math.floor(contentWidth * 0.18),
-      publisher: Math.floor(contentWidth * 0.16),
-      ord: Math.floor(contentWidth * 0.06),
-      rec: Math.floor(contentWidth * 0.05),
-      pend: Math.floor(contentWidth * 0.05),
+      title: Math.floor(contentWidth * 0.52),   // ✅ reduced
+      subject: Math.floor(contentWidth * 0.16), // ✅ slightly reduced
+      ord: Math.floor(contentWidth * 0.09),     // ✅ increased
+      rec: Math.floor(contentWidth * 0.09),     // ✅ increased
+      pend: Math.floor(contentWidth * 0.08),    // ✅ increased
     };
+
 
     const sumW = Object.values(W).reduce((a, b) => a + b, 0);
     const diff = contentWidth - sumW;
@@ -825,10 +807,9 @@ function buildSchoolOrderPdfBuffer({
       sr: pageLeft,
       title: pageLeft + W.sr,
       subject: pageLeft + W.sr + W.title,
-      publisher: pageLeft + W.sr + W.title + W.subject,
-      ord: pageLeft + W.sr + W.title + W.subject + W.publisher,
-      rec: pageLeft + W.sr + W.title + W.subject + W.publisher + W.ord,
-      pend: pageLeft + W.sr + W.title + W.subject + W.publisher + W.ord + W.rec,
+      ord: pageLeft + W.sr + W.title + W.subject,
+      rec: pageLeft + W.sr + W.title + W.subject + W.ord,
+      pend: pageLeft + W.sr + W.title + W.subject + W.ord + W.rec,
     };
 
     const printTableHeader = () => {
@@ -843,11 +824,10 @@ function buildSchoolOrderPdfBuffer({
       doc.text("Sr", X.sr, y, { width: W.sr });
       doc.text("Book Title", X.title, y, { width: W.title });
       doc.text("Subject", X.subject, y, { width: W.subject });
-      doc.text("Publisher", X.publisher, y, { width: W.publisher });
+      doc.text("Ordered", X.ord, y, { width: W.ord, align: "right" });
+      doc.text("Received", X.rec, y, { width: W.rec, align: "right" });
+      doc.text("Pending", X.pend, y, { width: W.pend, align: "right" });
 
-      doc.text("Ord", X.ord, y, { width: W.ord, align: "right" });
-      doc.text("Rec", X.rec, y, { width: W.rec, align: "right" });
-      doc.text("Pend", X.pend, y, { width: W.pend, align: "right" });
 
       doc.moveDown(1.1);
       drawHR();
@@ -866,8 +846,7 @@ function buildSchoolOrderPdfBuffer({
       doc.font("Helvetica").fontSize(fontSize);
       const h1 = doc.heightOfString(cells.title, { width: W.title });
       const h2 = doc.heightOfString(cells.subject, { width: W.subject });
-      const h3 = doc.heightOfString(cells.publisher, { width: W.publisher });
-      return Math.ceil(Math.max(h1, h2, h3, fontSize + 2)) + 6;
+      return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
     };
 
     printTableHeader();
@@ -885,7 +864,6 @@ function buildSchoolOrderPdfBuffer({
         const cells = {
           title: safeText(it.book?.title || `Book #${it.book_id}`),
           subject: safeText(it.book?.subject || "-"),
-          publisher: safeText(it.book?.publisher?.name || "-"),
         };
 
         const rh = rowHeight(cells, 9);
@@ -894,12 +872,9 @@ function buildSchoolOrderPdfBuffer({
         const y = doc.y;
 
         doc.font("Helvetica").fontSize(9).fillColor("#000");
-
         doc.text(String(sr), X.sr, y, { width: W.sr });
         doc.text(cells.title, X.title, y, { width: W.title });
         doc.text(cells.subject, X.subject, y, { width: W.subject });
-        doc.text(cells.publisher, X.publisher, y, { width: W.publisher });
-
         doc.text(String(orderedQty), X.ord, y, { width: W.ord, align: "right" });
         doc.text(String(receivedQty), X.rec, y, { width: W.rec, align: "right" });
         doc.text(String(pendingQty), X.pend, y, { width: W.pend, align: "right" });
@@ -909,7 +884,7 @@ function buildSchoolOrderPdfBuffer({
       }
     }
 
-    /* ---------- Transport + Notes (BOTTOM, AFTER TABLE) ---------- */
+    /* ---------- Transport + Notes (BOTTOM) ---------- */
     const transportLines = [];
     const transportThrough = order.transport_through || null;
     const transportName = order.transport?.name || order.transport_name || null;
@@ -922,7 +897,7 @@ function buildSchoolOrderPdfBuffer({
     if (order.notes) transportLines.push(`Notes: ${order.notes}`);
 
     if (transportLines.length) {
-      const approx = 18 + transportLines.length * 12 + 16; // safe
+      const approx = 18 + transportLines.length * 12 + 16;
       ensureSpaceWithHeader(approx);
 
       doc.moveDown(0.4);
@@ -986,9 +961,9 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     });
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
-
     const supportEmail = process.env.ORDER_SUPPORT_EMAIL || process.env.SMTP_FROM || process.env.SMTP_USER;
 
+    // ---------- Publisher-wise ----------
     if (publisher_id) {
       const pid = Number(publisher_id);
       if (Number.isNaN(pid)) return reply.code(400).send({ message: "Invalid publisher_id." });
@@ -1113,11 +1088,11 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       });
     }
 
+    // ---------- School email ----------
     if (!school) return reply.code(400).send({ message: "School record not linked with this order." });
     if (!school.email) return reply.code(400).send({ message: "School does not have an email address." });
 
     const subject = `Book Order ${order.order_no || order.id} – ${school.name}`;
-
     const plainOrder = order.toJSON();
 
     const html = `
@@ -1130,9 +1105,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       <div><strong>Order Date:</strong> ${orderDate}</div>
       <div><strong>Print Date:</strong> ${todayStr}</div>
       <div><strong>Status:</strong> ${order.status}</div>
-      ${
-        supportEmail ? `<div><strong>For any query, please write to:</strong> ${supportEmail}</div>` : ""
-      }
+      ${supportEmail ? `<div><strong>For any query, please write to:</strong> ${supportEmail}</div>` : ""}
 
       <h3 style="margin-top:18px;">Items</h3>
       <pre style="font-size:11px; background:#f7f7f7; padding:8px; border-radius:4px;">
