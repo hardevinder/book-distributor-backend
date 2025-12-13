@@ -13,16 +13,14 @@ module.exports = async function (fastify, opts) {
   fastify.post("/generate", schoolOrderController.generateOrdersForSession);
 
   // 🆕 PATCH /api/school-orders/:orderId/meta  → update transport / notes / remarks
-  fastify.patch(
-    "/:orderId/meta",
-    schoolOrderController.updateSchoolOrderMeta
-  );
+  fastify.patch("/:orderId/meta", schoolOrderController.updateSchoolOrderMeta);
+
+  // ✅ NEW: PATCH /api/school-orders/:orderId/order-no → update editable order number
+  // Body: { order_no: "PO-2025-001" }
+  fastify.patch("/:orderId/order-no", schoolOrderController.updateSchoolOrderNo);
 
   // POST /api/school-orders/:orderId/receive
-  fastify.post(
-    "/:orderId/receive",
-    schoolOrderController.receiveOrderItems
-  );
+  fastify.post("/:orderId/receive", schoolOrderController.receiveOrderItems);
 
   // POST /api/school-orders/:orderId/reorder-pending
   fastify.post(
@@ -31,14 +29,9 @@ module.exports = async function (fastify, opts) {
   );
 
   // POST /api/school-orders/:orderId/send-email
-  fastify.post(
-    "/:orderId/send-email",
-    schoolOrderController.sendOrderEmailForOrder
-  );
+  fastify.post("/:orderId/send-email", schoolOrderController.sendOrderEmailForOrder);
 
   // GET /api/school-orders/:orderId/pdf  → single order PDF
-  fastify.get(
-    "/:orderId/pdf",
-    schoolOrderController.printOrderPdf
-  );
+  fastify.get("/:orderId/pdf", schoolOrderController.printOrderPdf);
 };
+  
