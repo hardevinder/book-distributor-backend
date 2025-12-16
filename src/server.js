@@ -125,9 +125,17 @@ const buildServer = () => {
   /* ---------------- REGISTER OTHER ROUTES ---------------- */
   fastify.register(require("./routes/authRoutes"), { prefix: "/api/auth" });
   fastify.register(require("./routes/bookRoutes"), { prefix: "/api/books" });
+
+  // Publishers CRUD (independent)
   fastify.register(require("./routes/publisherRoutes"), {
     prefix: "/api/publishers",
   });
+
+  // ✅ NEW: Suppliers CRUD (create auto-creates publisher inside controller)
+  fastify.register(require("./routes/supplierRoutes"), {
+    prefix: "/api/suppliers",
+  });
+
   fastify.register(require("./routes/transportRoutes"), {
     prefix: "/api/transports",
   });

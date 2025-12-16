@@ -1,47 +1,45 @@
+// src/models/index.js
+
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/db");
 
 // Base Models
 const User = require("./user")(sequelize, DataTypes);
+
+// Supplier master (independent)
+const Supplier = require("./supplier")(sequelize, DataTypes);
+
 const Publisher = require("./publisher")(sequelize, DataTypes);
 const Book = require("./book")(sequelize, DataTypes);
 const Class = require("./class")(sequelize, DataTypes);
 const School = require("./school")(sequelize, DataTypes);
 
-// ⭐ NEW: Transport master
+// Transport master
 const Transport = require("./transport")(sequelize, DataTypes);
 
-// ⭐ NEW: Company Profile master (Header for PDFs & Purchase Orders)
+// Company Profile master
 const CompanyProfile = require("./companyProfile")(sequelize, DataTypes);
 
-// ⭐ SchoolBookRequirement model
-const SchoolBookRequirement = require("./schoolBookRequirement")(
-  sequelize,
-  DataTypes
-);
+// SchoolBookRequirement model
+const SchoolBookRequirement = require("./schoolBookRequirement")(sequelize, DataTypes);
 
-// ⭐ Publisher Orders models
+// Publisher Orders models
 const PublisherOrder = require("./publisherOrder")(sequelize, DataTypes);
-const PublisherOrderItem = require("./publisherOrderItem")(
-  sequelize,
-  DataTypes
-);
-const RequirementOrderLink = require("./requirementOrderLink")(
-  sequelize,
-  DataTypes
-);
+const PublisherOrderItem = require("./publisherOrderItem")(sequelize, DataTypes);
+const RequirementOrderLink = require("./requirementOrderLink")(sequelize, DataTypes);
 
-// ⭐ School Orders models
+// School Orders models
 const SchoolOrder = require("./schoolOrder")(sequelize, DataTypes);
 const SchoolOrderItem = require("./schoolOrderItem")(sequelize, DataTypes);
-const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(
-  sequelize,
-  DataTypes
-);
+const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(sequelize, DataTypes);
 
 /* ======================
         ASSOCIATIONS
    ====================== */
+
+/* ------------------------------------------------
+   ✅ Supplier is INDEPENDENT (NO relation to Publisher)
+   ------------------------------------------------ */
 
 /* -------------------------
    Publisher ↔ Books (1:N)
@@ -56,14 +54,6 @@ Book.belongsTo(Publisher, {
   foreignKey: "publisher_id",
   as: "publisher",
 });
-
-/**
- * OPTIONAL (future):
- * If you later add `class_id` to Books table
- *
- * Class.hasMany(Book, { foreignKey: "class_id", as: "books" });
- * Book.belongsTo(Class, { foreignKey: "class_id", as: "class" });
- */
 
 /* ============================
    School ↔ Book Requirements
@@ -100,6 +90,20 @@ Class.hasMany(SchoolBookRequirement, {
 SchoolBookRequirement.belongsTo(Class, {
   foreignKey: "class_id",
   as: "class",
+});
+
+/* ---------------------------------------
+   ✅ Supplier ↔ SchoolBookRequirement (1:N)
+   --------------------------------------- */
+
+Supplier.hasMany(SchoolBookRequirement, {
+  foreignKey: "supplier_id",
+  as: "requirements",
+});
+
+SchoolBookRequirement.belongsTo(Supplier, {
+  foreignKey: "supplier_id",
+  as: "supplier",
 });
 
 /* ============================
@@ -180,6 +184,20 @@ SchoolOrder.belongsTo(School, {
   as: "school",
 });
 
+/* ---------------------------------------------------
+   ✅ FIX: Supplier ↔ SchoolOrder (1:N)  (MISSING EARLIER)
+   --------------------------------------------------- */
+
+Supplier.hasMany(SchoolOrder, {
+  foreignKey: "supplier_id",
+  as: "schoolOrders",
+});
+
+SchoolOrder.belongsTo(Supplier, {
+  foreignKey: "supplier_id",
+  as: "supplier",
+});
+
 // 📌 SchoolOrder → SchoolOrderItem (1:N)
 SchoolOrder.hasMany(SchoolOrderItem, {
   foreignKey: "school_order_id",
@@ -242,7 +260,18 @@ SchoolOrder.belongsTo(Transport, {
   as: "transport",
 });
 
-// No associations required for CompanyProfile yet (it's a stand-alone master)
+// ✅ Option 2 transport relation (use different alias)
+Transport.hasMany(SchoolOrder, {
+  foreignKey: "transport_id_2",
+  as: "school_orders_2",
+});
+
+SchoolOrder.belongsTo(Transport, {
+  foreignKey: "transport_id_2",
+  as: "transport2",
+});
+
+// No associations required for CompanyProfile yet (stand-alone master)
 
 /* ============================
          EXPORT MODELS
@@ -251,12 +280,15 @@ SchoolOrder.belongsTo(Transport, {
 module.exports = {
   sequelize,
   User,
+
+  Supplier,
+
   Publisher,
   Book,
   Class,
   School,
   Transport,
-  CompanyProfile,       // ⭐ ADDED EXPORT
+  CompanyProfile,
   SchoolBookRequirement,
   PublisherOrder,
   PublisherOrderItem,

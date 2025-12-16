@@ -1,5 +1,7 @@
 // src/controllers/schoolOrderController.js
 
+"use strict";
+
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
@@ -14,6 +16,7 @@ const {
   SchoolOrderItem,
   SchoolRequirementOrderLink,
   Publisher,
+  Supplier,
   CompanyProfile,
   Transport,
   sequelize,
@@ -27,7 +30,6 @@ const { Op } = require("sequelize");
  * ============================================ */
 
 // ✅ SUPER SHORT order no (ONLY code)
-// Example: 0N9A7   (5 chars)
 function generateOrderNo() {
   return Math.random()
     .toString(36)
@@ -53,7 +55,7 @@ async function generateUniqueOrderNo(t) {
   );
 }
 
-// ✅ Stable signature to detect "no changes" per school+session
+// ✅ Stable signature to detect "no changes" per supplier-order
 function buildItemsSignatureFromMap(bookQtyMap) {
   const pairs = Array.from(bookQtyMap.entries())
     .map(([bookId, qty]) => `${Number(bookId)}:${Number(qty) || 0}`)
@@ -78,11 +80,7 @@ function fetchUrlBuffer(url) {
 
     lib
       .get(url, (res) => {
-        if (
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           return resolve(fetchUrlBuffer(res.headers.location));
         }
 
@@ -150,7 +148,7 @@ async function recomputeOrderStatus(order, t) {
     lock: t.LOCK.UPDATE,
   });
 
-  const items = fresh.items || [];
+  const items = fresh?.items || [];
 
   if (!items.length) {
     fresh.status = "draft";
@@ -158,14 +156,8 @@ async function recomputeOrderStatus(order, t) {
     return fresh;
   }
 
-  const totalOrdered = items.reduce(
-    (sum, it) => sum + (Number(it.total_order_qty) || 0),
-    0
-  );
-  const totalReceived = items.reduce(
-    (sum, it) => sum + (Number(it.received_qty) || 0),
-    0
-  );
+  const totalOrdered = items.reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
+  const totalReceived = items.reduce((sum, it) => sum + (Number(it.received_qty) || 0), 0);
 
   if (fresh.status === "cancelled") return fresh;
 
@@ -183,20 +175,23 @@ async function recomputeOrderStatus(order, t) {
 
 /* ============================================
  * GET /api/school-orders
+ * Supplier-wise listing
  * ============================================ */
 exports.listSchoolOrders = async (request, reply) => {
   try {
-    const { academic_session, school_id, status } = request.query || {};
+    const { academic_session, school_id, status, supplier_id } = request.query || {};
 
     const where = {};
     if (academic_session) where.academic_session = academic_session;
     if (school_id) where.school_id = school_id;
     if (status) where.status = status;
+    if (supplier_id) where.supplier_id = supplier_id;
 
     const orders = await SchoolOrder.findAll({
       where,
       include: [
         { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
@@ -204,13 +199,7 @@ exports.listSchoolOrders = async (request, reply) => {
             {
               model: Book,
               as: "book",
-              include: [
-                {
-                  model: Publisher,
-                  as: "publisher",
-                  attributes: ["id", "name"],
-                },
-              ],
+              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
             },
           ],
         },
@@ -218,6 +207,7 @@ exports.listSchoolOrders = async (request, reply) => {
       ],
       order: [
         [{ model: School, as: "school" }, "name", "ASC"],
+        [{ model: Supplier, as: "supplier" }, "name", "ASC"],
         ["order_date", "DESC"],
         ["createdAt", "DESC"],
       ],
@@ -228,8 +218,7 @@ exports.listSchoolOrders = async (request, reply) => {
       o.items =
         (o.items || []).map((it) => ({
           ...it,
-          pending_qty:
-            (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
+          pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
         })) || [];
       return o;
     });
@@ -246,25 +235,34 @@ exports.listSchoolOrders = async (request, reply) => {
 
 /* ============================================
  * POST /api/school-orders/generate
+ * one order per (school + supplier + session)
  * ✅ If nothing changed, do NOT create again
  * ============================================ */
 exports.generateOrdersForSession = async (request, reply) => {
   const { academic_session } = request.body || {};
 
-  if (!academic_session || !academic_session.trim()) {
+  if (!academic_session || !String(academic_session).trim()) {
     return reply.code(400).send({
       error: "ValidationError",
       message: "academic_session is required.",
     });
   }
 
-  const session = academic_session.trim();
+  const session = String(academic_session).trim();
   const t = await sequelize.transaction();
 
   try {
     const requirements = await SchoolBookRequirement.findAll({
       where: { academic_session: session, status: "confirmed" },
-      include: [{ model: Book, as: "book" }, { model: School, as: "school" }],
+      include: [
+        {
+          model: Book,
+          as: "book",
+          include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+        },
+        { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
+      ],
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -281,7 +279,7 @@ exports.generateOrdersForSession = async (request, reply) => {
       });
     }
 
-    // schoolId -> { books: Map(bookId -> totalQty), reqRowsByBook: Map(bookId -> [reqRow]) }
+    // schoolId -> supplierId -> { books: Map(bookId -> totalQty), reqRowsByBook: Map(bookId -> [reqRow]) }
     const mapBySchool = new Map();
 
     for (const reqRow of requirements) {
@@ -292,29 +290,32 @@ exports.generateOrdersForSession = async (request, reply) => {
       const qty = Number(reqRow.required_copies || 0);
       if (!qty || qty <= 0) continue;
 
-      const bookId = book.id;
+      // supplier_id is on requirement table
+      const supplierId =
+        Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
 
-      if (!mapBySchool.has(schoolId)) {
-        mapBySchool.set(schoolId, { books: new Map(), reqRowsByBook: new Map() });
+      if (!supplierId) continue;
+
+      if (!mapBySchool.has(schoolId)) mapBySchool.set(schoolId, new Map());
+      const bySupplier = mapBySchool.get(schoolId);
+
+      if (!bySupplier.has(supplierId)) {
+        bySupplier.set(supplierId, { books: new Map(), reqRowsByBook: new Map() });
       }
 
-      const schoolBucket = mapBySchool.get(schoolId);
+      const bucket = bySupplier.get(supplierId);
+      const bookId = book.id;
 
-      schoolBucket.books.set(
-        bookId,
-        (Number(schoolBucket.books.get(bookId)) || 0) + qty
-      );
+      bucket.books.set(bookId, (Number(bucket.books.get(bookId)) || 0) + qty);
 
-      if (!schoolBucket.reqRowsByBook.has(bookId))
-        schoolBucket.reqRowsByBook.set(bookId, []);
-      schoolBucket.reqRowsByBook.get(bookId).push(reqRow);
+      if (!bucket.reqRowsByBook.has(bookId)) bucket.reqRowsByBook.set(bookId, []);
+      bucket.reqRowsByBook.get(bookId).push(reqRow);
     }
 
     if (!mapBySchool.size) {
       await t.rollback();
       return reply.code(200).send({
-        message:
-          "No positive quantity found to generate school orders for this session.",
+        message: "No valid supplier-linked items found to generate orders for this session.",
         academic_session: session,
         orders_count: 0,
         skipped_count: 0,
@@ -326,104 +327,98 @@ exports.generateOrdersForSession = async (request, reply) => {
     const createdOrders = [];
     const skippedOrders = [];
 
-    for (const [schoolId, data] of mapBySchool.entries()) {
-      const desiredSignature = buildItemsSignatureFromMap(data.books);
+    for (const [schoolId, bySupplier] of mapBySchool.entries()) {
+      for (const [supplierId, data] of bySupplier.entries()) {
+        const desiredSignature = buildItemsSignatureFromMap(data.books);
 
-      // ✅ Check latest existing order for same school+session
-      const latestExisting = await SchoolOrder.findOne({
-        where: {
-          school_id: schoolId,
-          academic_session: session,
-          status: { [Op.ne]: "cancelled" },
-        },
-        include: [{ model: SchoolOrderItem, as: "items" }],
-        order: [["createdAt", "DESC"]],
-        transaction: t,
-        lock: t.LOCK.UPDATE,
-      });
+        const latestExisting = await SchoolOrder.findOne({
+          where: {
+            school_id: schoolId,
+            supplier_id: supplierId,
+            academic_session: session,
+            status: { [Op.ne]: "cancelled" },
+          },
+          include: [{ model: SchoolOrderItem, as: "items" }],
+          order: [["createdAt", "DESC"]],
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
 
-      if (latestExisting) {
-        const existingSignature = buildItemsSignatureFromOrderItems(
-          latestExisting.items || []
-        );
-
-        // ✅ If signature matches, skip generating again
-        if (existingSignature === desiredSignature) {
-          skippedOrders.push({
-            order_id: latestExisting.id,
-            order_no: latestExisting.order_no,
-            school_id: latestExisting.school_id,
-            academic_session: latestExisting.academic_session,
-            status: latestExisting.status,
-          });
-          continue;
+        if (latestExisting) {
+          const existingSignature = buildItemsSignatureFromOrderItems(latestExisting.items || []);
+          if (existingSignature === desiredSignature) {
+            skippedOrders.push({
+              order_id: latestExisting.id,
+              order_no: latestExisting.order_no,
+              school_id: latestExisting.school_id,
+              supplier_id: latestExisting.supplier_id,
+              academic_session: latestExisting.academic_session,
+              status: latestExisting.status,
+            });
+            continue;
+          }
         }
-      }
 
-      // ✅ Create new order (only when changed OR no existing)
-      const orderNo = await generateUniqueOrderNo(t);
+        const orderNo = await generateUniqueOrderNo(t);
 
-      const order = await SchoolOrder.create(
-        {
-          school_id: schoolId,
-          order_no: orderNo,
-          academic_session: session,
-          order_date: new Date(),
-          status: "draft",
-        },
-        { transaction: t }
-      );
-
-      const linksToCreate = [];
-      const requirementIdsToUpdate = new Set();
-
-      for (const [bookId, totalQty] of data.books.entries()) {
-        const qty = Number(totalQty || 0);
-        if (!qty || qty <= 0) continue;
-
-        const item = await SchoolOrderItem.create(
+        const order = await SchoolOrder.create(
           {
-            school_order_id: order.id,
-            book_id: bookId,
-            total_order_qty: qty,
-            received_qty: 0,
-            unit_price: null,
-            total_amount: null,
+            school_id: schoolId,
+            supplier_id: supplierId,
+            order_no: orderNo,
+            academic_session: session,
+            order_date: new Date(),
+            status: "draft",
           },
           { transaction: t }
         );
 
-        const reqRows = data.reqRowsByBook.get(bookId) || [];
-        for (const reqRow of reqRows) {
-          const rqQty = Number(reqRow.required_copies || 0);
-          if (!rqQty || rqQty <= 0) continue;
+        const linksToCreate = [];
+        const requirementIdsToUpdate = new Set();
 
-          linksToCreate.push({
-            requirement_id: reqRow.id,
-            school_order_item_id: item.id,
-            allocated_qty: rqQty,
-          });
-          requirementIdsToUpdate.add(reqRow.id);
-        }
-      }
+        for (const [bookId, totalQty] of data.books.entries()) {
+          const q = Number(totalQty || 0);
+          if (!q || q <= 0) continue;
 
-      if (linksToCreate.length) {
-        await SchoolRequirementOrderLink.bulkCreate(linksToCreate, {
-          transaction: t,
-        });
-      }
+          const item = await SchoolOrderItem.create(
+            {
+              school_order_id: order.id,
+              book_id: bookId,
+              total_order_qty: q,
+              received_qty: 0,
+              unit_price: null,
+              total_amount: null,
+            },
+            { transaction: t }
+          );
 
-      if (requirementIdsToUpdate.size > 0) {
-        await SchoolBookRequirement.update(
-          { status: "confirmed" },
-          {
-            where: { id: Array.from(requirementIdsToUpdate) },
-            transaction: t,
+          const reqRows = data.reqRowsByBook.get(bookId) || [];
+          for (const rr of reqRows) {
+            const rqQty = Number(rr.required_copies || 0);
+            if (!rqQty || rqQty <= 0) continue;
+
+            linksToCreate.push({
+              requirement_id: rr.id,
+              school_order_item_id: item.id,
+              allocated_qty: rqQty,
+            });
+            requirementIdsToUpdate.add(rr.id);
           }
-        );
-      }
+        }
 
-      createdOrders.push(order);
+        if (linksToCreate.length) {
+          await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
+        }
+
+        if (requirementIdsToUpdate.size > 0) {
+          await SchoolBookRequirement.update(
+            { status: "confirmed" },
+            { where: { id: Array.from(requirementIdsToUpdate) }, transaction: t }
+          );
+        }
+
+        createdOrders.push(order);
+      }
     }
 
     await t.commit();
@@ -431,7 +426,7 @@ exports.generateOrdersForSession = async (request, reply) => {
     return reply.code(201).send({
       message:
         createdOrders.length > 0
-          ? "School orders generated successfully."
+          ? "Supplier-wise school orders generated successfully."
           : "No changes found — orders already up-to-date.",
       academic_session: session,
       orders_count: createdOrders.length,
@@ -446,7 +441,7 @@ exports.generateOrdersForSession = async (request, reply) => {
     console.error("Error in generateOrdersForSession:", err);
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to generate school orders.",
+      message: err.message || "Failed to generate supplier-wise orders.",
     });
   }
 };
@@ -456,18 +451,21 @@ exports.generateOrdersForSession = async (request, reply) => {
  * ============================================ */
 exports.updateSchoolOrderMeta = async (request, reply) => {
   const { orderId } = request.params;
-  const { transport_id, transport_through, notes, remarks } = request.body || {};
+  const {
+    transport_id,
+    transport_through,
+    transport_id_2,
+    transport_through_2,
+    notes,
+    remarks,
+  } = request.body || {};
 
   try {
     const order = await SchoolOrder.findOne({ where: { id: orderId } });
-    if (!order)
-      return reply.code(404).send({ message: "School order not found." });
+    if (!order) return reply.code(404).send({ message: "School order not found." });
 
     if (typeof transport_id !== "undefined") {
-      const tidNum =
-        transport_id === null || transport_id === ""
-          ? null
-          : Number(transport_id);
+      const tidNum = transport_id === null || transport_id === "" ? null : Number(transport_id);
       order.transport_id = Number.isNaN(tidNum) ? null : tidNum;
     }
 
@@ -478,13 +476,24 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
           : String(transport_through).trim();
     }
 
+    if ("transport_id_2" in order && typeof transport_id_2 !== "undefined") {
+      const tidNum2 = transport_id_2 === null || transport_id_2 === "" ? null : Number(transport_id_2);
+      order.transport_id_2 = Number.isNaN(tidNum2) ? null : tidNum2;
+    }
+
+    if ("transport_through_2" in order && typeof transport_through_2 !== "undefined") {
+      order.transport_through_2 =
+        transport_through_2 === null || transport_through_2 === ""
+          ? null
+          : String(transport_through_2).trim();
+    }
+
     if (typeof notes !== "undefined") {
       order.notes = notes === null || notes === "" ? null : String(notes).trim();
     }
 
     if (typeof remarks !== "undefined") {
-      order.remarks =
-        remarks === null || remarks === "" ? null : String(remarks).trim();
+      order.remarks = remarks === null || remarks === "" ? null : String(remarks).trim();
     }
 
     await order.save();
@@ -493,22 +502,11 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
       where: { id: orderId },
       include: [
         { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-              include: [
-                {
-                  model: Publisher,
-                  as: "publisher",
-                  attributes: ["id", "name"],
-                },
-              ],
-            },
-          ],
+          include: [{ model: Book, as: "book", include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }] }],
         },
         { model: Transport, as: "transport" },
       ],
@@ -518,13 +516,10 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
     plain.items =
       (plain.items || []).map((it) => ({
         ...it,
-        pending_qty:
-          (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
+        pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
       })) || [];
 
-    return reply
-      .code(200)
-      .send({ message: "Order meta updated successfully.", order: plain });
+    return reply.code(200).send({ message: "Order meta updated successfully.", order: plain });
   } catch (err) {
     console.error("Error in updateSchoolOrderMeta:", err);
     return reply.code(500).send({
@@ -543,24 +538,22 @@ exports.updateSchoolOrderNo = async (request, reply) => {
 
   const newNo = String(order_no || "").trim();
   if (!newNo) {
-    return reply
-      .code(400)
-      .send({ error: "ValidationError", message: "order_no is required." });
+    return reply.code(400).send({ error: "ValidationError", message: "order_no is required." });
   }
 
   try {
     const order = await SchoolOrder.findByPk(orderId);
-    if (!order)
-      return reply.code(404).send({ message: "School order not found." });
+    if (!order) return reply.code(404).send({ message: "School order not found." });
 
     const dup = await SchoolOrder.findOne({
       where: { order_no: newNo, id: { [Op.ne]: order.id } },
     });
-    if (dup)
+    if (dup) {
       return reply.code(400).send({
         error: "DuplicateOrderNo",
         message: "This order number already exists.",
       });
+    }
 
     order.order_no = newNo;
     await order.save();
@@ -587,9 +580,7 @@ exports.receiveOrderItems = async (request, reply) => {
   const { items, status = "auto" } = request.body || {};
 
   if (!items || !Array.isArray(items) || !items.length) {
-    return reply
-      .code(400)
-      .send({ error: "ValidationError", message: "items array is required." });
+    return reply.code(400).send({ error: "ValidationError", message: "items array is required." });
   }
 
   const t = await sequelize.transaction();
@@ -636,22 +627,11 @@ exports.receiveOrderItems = async (request, reply) => {
       where: { id: orderId },
       include: [
         { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-              include: [
-                {
-                  model: Publisher,
-                  as: "publisher",
-                  attributes: ["id", "name"],
-                },
-              ],
-            },
-          ],
+          include: [{ model: Book, as: "book", include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }] }],
         },
         { model: Transport, as: "transport" },
       ],
@@ -664,13 +644,10 @@ exports.receiveOrderItems = async (request, reply) => {
     plain.items =
       (plain.items || []).map((it) => ({
         ...it,
-        pending_qty:
-          (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
+        pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
       })) || [];
 
-    return reply
-      .code(200)
-      .send({ message: "Order items updated successfully.", order: plain });
+    return reply.code(200).send({ message: "Order items updated successfully.", order: plain });
   } catch (err) {
     try {
       if (!t.finished) await t.rollback();
@@ -693,10 +670,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
   try {
     const sourceOrder = await SchoolOrder.findOne({
       where: { id: orderId },
-      include: [
-        { model: School, as: "school" },
-        { model: SchoolOrderItem, as: "items" },
-      ],
+      include: [{ model: School, as: "school" }, { model: SchoolOrderItem, as: "items" }],
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -716,9 +690,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
 
     if (!pendingItems.length) {
       await t.rollback();
-      return reply.code(400).send({
-        message: "No pending quantity found to re-order for this order.",
-      });
+      return reply.code(400).send({ message: "No pending quantity found to re-order for this order." });
     }
 
     const newOrderNo = await generateUniqueOrderNo(t);
@@ -726,6 +698,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
     const newOrder = await SchoolOrder.create(
       {
         school_id: sourceOrder.school_id,
+        supplier_id: sourceOrder.supplier_id,
         order_no: newOrderNo,
         academic_session: sourceOrder.academic_session || null,
         order_date: new Date(),
@@ -753,22 +726,11 @@ exports.reorderPendingForOrder = async (request, reply) => {
       where: { id: newOrder.id },
       include: [
         { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
-          include: [
-            {
-              model: Book,
-              as: "book",
-              include: [
-                {
-                  model: Publisher,
-                  as: "publisher",
-                  attributes: ["id", "name"],
-                },
-              ],
-            },
-          ],
+          include: [{ model: Book, as: "book", include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }] }],
         },
         { model: Transport, as: "transport" },
       ],
@@ -795,20 +757,22 @@ exports.reorderPendingForOrder = async (request, reply) => {
 };
 
 /* ============================================================
- * PDF builder -> Buffer (FINAL POLISHED)
- * - Title width reduced (centered but constrained)
- * - Ordered/Received/Pending full words
- * - Publisher column removed
+ * PDF builder -> Buffer
+ * ✅ Updates:
+ * - Only ONE number: Order No (PO removed)
+ * - Order No moved to TOP before To
+ * - Transport options in horizontal single line
  * ============================================================ */
 function buildSchoolOrderPdfBuffer({
   order,
   companyProfile,
   items,
   pdfTitle,
-  publisherNameForHeader,
+  toParty,
   dateStr,
   orderDate,
   isPurchaseOrder = false,
+  showPrintDate = false,
 }) {
   return new Promise(async (resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 40 });
@@ -829,6 +793,14 @@ function buildSchoolOrderPdfBuffer({
       doc.lineWidth(0.7);
       doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
       doc.restore();
+    };
+
+    const ensureSpaceWithHeader = (neededHeight, printHeaderFn) => {
+      const bottom = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + neededHeight > bottom) {
+        doc.addPage();
+        if (typeof printHeaderFn === "function") printHeaderFn();
+      }
     };
 
     /* ---------- Header (logo + company) ---------- */
@@ -873,7 +845,7 @@ function buildSchoolOrderPdfBuffer({
 
       const lines = [];
       if (companyProfile.name)
-        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 13 });
+        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
       if (addrParts.length)
         lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
 
@@ -901,27 +873,64 @@ function buildSchoolOrderPdfBuffer({
       doc.moveDown(0.35);
     }
 
-    /* ---------- Title (reduced width) ---------- */
+    /* ---------- Title ---------- */
     doc.font("Helvetica-Bold").fontSize(isPurchaseOrder ? 16 : 14).fillColor("#000");
-    const titleBoxW = Math.floor(contentWidth * 0.72); // ✅ narrower title block
+    const titleBoxW = Math.floor(contentWidth * 0.72);
     const titleX = pageLeft + Math.floor((contentWidth - titleBoxW) / 2);
     doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
-    doc.moveDown(0.15);
+    doc.moveDown(0.5);
 
-    /* ---------- To ---------- */
-    if (publisherNameForHeader) {
-      doc.font("Helvetica").fontSize(9).text("To:", pageLeft);
-      doc.font("Helvetica-Bold").fontSize(10).text(safeText(publisherNameForHeader), pageLeft);
-      doc.moveDown(0.15);
+    /* ---------- TOP: Order No (left) + Date (right) ---------- */
+    const topY = doc.y;
+
+    const leftTopW = Math.floor(contentWidth * 0.6);
+    const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
+    const rightTopW = pageRight - rightTopX;
+
+    const orderNoText = safeText(order.order_no || order.id);
+
+    doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
+    doc.text(`Order No: ${orderNoText}`, pageLeft, topY, { width: leftTopW, align: "left" });
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(`Order Date: ${safeText(orderDate)}`, rightTopX, topY + 1, { width: rightTopW, align: "right" });
+    if (showPrintDate) {
+      doc.text(`Print Date: ${safeText(dateStr)}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
     }
 
-    /* ---------- Meta ---------- */
-    doc.font("Helvetica").fontSize(9);
-    doc.text(`Order No: ${safeText(order.order_no || order.id)}`, pageLeft);
-    doc.text(`Order Date: ${orderDate}   |   Print: ${dateStr}`, pageLeft, doc.y + 2);
-    doc.moveDown(0.3);
+    const leftH = doc.heightOfString(`Order No: ${orderNoText}`, { width: leftTopW });
+    const rightText = showPrintDate
+      ? `Order Date: ${safeText(orderDate)}\nPrint Date: ${safeText(dateStr)}`
+      : `Order Date: ${safeText(orderDate)}`;
+    const rightH = doc.heightOfString(rightText, { width: rightTopW });
+
+    doc.y = topY + Math.max(leftH, rightH) + 8;
+
     drawHR();
     doc.moveDown(0.35);
+
+    /* ---------- To (Supplier) BELOW order no ---------- */
+    if (toParty && toParty.name) {
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+      doc.text("To:", pageLeft, doc.y);
+
+      doc.font("Helvetica").fontSize(10).fillColor("#000");
+      doc.text(safeText(toParty.name), pageLeft, doc.y);
+
+      const subLines = [];
+      if (toParty.address) subLines.push(safeText(toParty.address));
+      if (toParty.phone) subLines.push(`Phone: ${safeText(toParty.phone)}`);
+      if (toParty.email) subLines.push(`Email: ${safeText(toParty.email)}`);
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      for (const ln of subLines) {
+        doc.text(ln, pageLeft, doc.y, { width: Math.floor(contentWidth * 0.72) });
+      }
+    }
+
+    doc.moveDown(0.25);
+    drawHR();
+    doc.moveDown(0.4);
 
     /* ---------- Summary (boxed) ---------- */
     const totalOrdered = items.reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
@@ -939,7 +948,7 @@ function buildSchoolOrderPdfBuffer({
     doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
     doc.text("Summary", pageLeft + 10, boxY + 8);
 
-    doc.font("Helvetica").fontSize(9);
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
     doc.text(`Total Ordered: ${totalOrdered}`, pageLeft + 10, boxY + 26, { width: contentWidth / 2 - 10 });
     doc.text(`Total Received: ${totalReceived}`, pageLeft + 10, boxY + 40, { width: contentWidth / 2 - 10 });
 
@@ -954,13 +963,14 @@ function buildSchoolOrderPdfBuffer({
 
     doc.y = boxY + boxH + 10;
 
-    /* ---------- Table (NO publisher column) ---------- */
+    /* ---------- Table (WITH publisher column) ---------- */
     const W = {
       sr: Math.max(24, Math.floor(contentWidth * 0.06)),
-      title: Math.floor(contentWidth * 0.52),
-      subject: Math.floor(contentWidth * 0.16),
-      ord: Math.floor(contentWidth * 0.09),
-      rec: Math.floor(contentWidth * 0.09),
+      title: Math.floor(contentWidth * 0.40),
+      publisher: Math.floor(contentWidth * 0.16),
+      subject: Math.floor(contentWidth * 0.14),
+      ord: Math.floor(contentWidth * 0.08),
+      rec: Math.floor(contentWidth * 0.08),
       pend: Math.floor(contentWidth * 0.08),
     };
 
@@ -971,10 +981,11 @@ function buildSchoolOrderPdfBuffer({
     const X = {
       sr: pageLeft,
       title: pageLeft + W.sr,
-      subject: pageLeft + W.sr + W.title,
-      ord: pageLeft + W.sr + W.title + W.subject,
-      rec: pageLeft + W.sr + W.title + W.subject + W.ord,
-      pend: pageLeft + W.sr + W.title + W.subject + W.ord + W.rec,
+      publisher: pageLeft + W.sr + W.title,
+      subject: pageLeft + W.sr + W.title + W.publisher,
+      ord: pageLeft + W.sr + W.title + W.publisher + W.subject,
+      rec: pageLeft + W.sr + W.title + W.publisher + W.subject + W.ord,
+      pend: pageLeft + W.sr + W.title + W.publisher + W.subject + W.ord + W.rec,
     };
 
     const printTableHeader = () => {
@@ -987,6 +998,7 @@ function buildSchoolOrderPdfBuffer({
       doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
       doc.text("Sr", X.sr, y, { width: W.sr });
       doc.text("Book Title", X.title, y, { width: W.title });
+      doc.text("Publisher", X.publisher, y, { width: W.publisher });
       doc.text("Subject", X.subject, y, { width: W.subject });
       doc.text("Ordered", X.ord, y, { width: W.ord, align: "right" });
       doc.text("Received", X.rec, y, { width: W.rec, align: "right" });
@@ -997,19 +1009,12 @@ function buildSchoolOrderPdfBuffer({
       doc.moveDown(0.25);
     };
 
-    const ensureSpaceWithHeader = (neededHeight) => {
-      const bottom = doc.page.height - doc.page.margins.bottom;
-      if (doc.y + neededHeight > bottom) {
-        doc.addPage();
-        printTableHeader();
-      }
-    };
-
     const rowHeight = (cells, fontSize = 9) => {
       doc.font("Helvetica").fontSize(fontSize);
       const h1 = doc.heightOfString(cells.title, { width: W.title });
-      const h2 = doc.heightOfString(cells.subject, { width: W.subject });
-      return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
+      const h2 = doc.heightOfString(cells.publisher, { width: W.publisher });
+      const h3 = doc.heightOfString(cells.subject, { width: W.subject });
+      return Math.ceil(Math.max(h1, h2, h3, fontSize + 2)) + 6;
     };
 
     printTableHeader();
@@ -1024,19 +1029,25 @@ function buildSchoolOrderPdfBuffer({
         const receivedQty = Number(it.received_qty) || 0;
         const pendingQty = Math.max(orderedQty - receivedQty, 0);
 
+        const pubName =
+          it.book?.publisher?.name ||
+          (it.book?.publisher_id ? `Publisher #${it.book.publisher_id}` : "-");
+
         const cells = {
           title: safeText(it.book?.title || `Book #${it.book_id}`),
+          publisher: safeText(pubName),
           subject: safeText(it.book?.subject || "-"),
         };
 
         const rh = rowHeight(cells, 9);
-        ensureSpaceWithHeader(rh);
+        ensureSpaceWithHeader(rh, printTableHeader);
 
         const y = doc.y;
 
         doc.font("Helvetica").fontSize(9).fillColor("#000");
         doc.text(String(sr), X.sr, y, { width: W.sr });
         doc.text(cells.title, X.title, y, { width: W.title });
+        doc.text(cells.publisher, X.publisher, y, { width: W.publisher });
         doc.text(cells.subject, X.subject, y, { width: W.subject });
         doc.text(String(orderedQty), X.ord, y, { width: W.ord, align: "right" });
         doc.text(String(receivedQty), X.rec, y, { width: W.rec, align: "right" });
@@ -1047,37 +1058,81 @@ function buildSchoolOrderPdfBuffer({
       }
     }
 
-    /* ---------- Transport + Notes (BOTTOM) ---------- */
-    const transportLines = [];
-    const transportThrough = order.transport_through || null;
-    const transportName = order.transport?.name || order.transport_name || null;
-    const transportCity = order.transport?.city || null;
-    const transportPhone = order.transport?.phone || null;
+    /* ---------- Transport (BOTTOM) - HORIZONTAL ---------- */
+    const t1Through = order.transport_through || null;
+    const t1Name = order.transport?.name || order.transport_name || null;
+    const t1City = order.transport?.city || null;
+    const t1Phone = order.transport?.phone || null;
 
-    if (transportThrough) transportLines.push(`Through: ${transportThrough}`);
-    else if (transportName)
-      transportLines.push(
-        `Through: ${transportName}${transportCity ? " (" + transportCity + ")" : ""}`
-      );
-    if (transportPhone) transportLines.push(`Transport Phone: ${transportPhone}`);
-    if (order.notes) transportLines.push(`Notes: ${order.notes}`);
+    let t2Obj = null;
+    if ("transport_id_2" in order && order.transport_id_2) {
+      try {
+        t2Obj = await Transport.findByPk(order.transport_id_2);
+      } catch {}
+    }
 
-    if (transportLines.length) {
-      const approx = 18 + transportLines.length * 12 + 16;
-      ensureSpaceWithHeader(approx);
+    const t2Through =
+      "transport_through_2" in order && order.transport_through_2 ? order.transport_through_2 : null;
+    const t2Name = t2Obj?.name || null;
+    const t2City = t2Obj?.city || null;
+    const t2Phone = t2Obj?.phone || null;
+
+    const opt1Parts = [];
+    if (t1Through) opt1Parts.push(t1Through);
+    else if (t1Name) opt1Parts.push(`${t1Name}${t1City ? " (" + t1City + ")" : ""}`);
+    if (t1Phone) opt1Parts.push(`Ph: ${t1Phone}`);
+
+    const opt2Parts = [];
+    if (t2Through) opt2Parts.push(t2Through);
+    else if (t2Name) opt2Parts.push(`${t2Name}${t2City ? " (" + t2City + ")" : ""}`);
+    if (t2Phone) opt2Parts.push(`Ph: ${t2Phone}`);
+
+    const transportLineParts = [];
+    if (opt1Parts.length) transportLineParts.push(`Option 1: ${opt1Parts.join(" | ")}`);
+    if (opt2Parts.length) transportLineParts.push(`OR Option 2: ${opt2Parts.join(" | ")}`);
+
+    if (transportLineParts.length) {
+      const combined = transportLineParts.join("    •    ");
+      const approxH = doc.heightOfString(combined, { width: contentWidth }) + 28;
+      ensureSpaceWithHeader(approxH, printTableHeader);
 
       doc.moveDown(0.4);
       drawHR();
       doc.moveDown(0.25);
 
       doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
-      doc.text("Transport / Notes", pageLeft);
+      doc.text("Transport", pageLeft);
 
       doc.moveDown(0.15);
       doc.font("Helvetica").fontSize(9).fillColor("#000");
-      for (const line of transportLines) {
-        doc.text(safeText(line), { width: contentWidth, align: "left" });
-      }
+      doc.text(combined, pageLeft, doc.y, { width: contentWidth, align: "left" });
+    }
+
+    /* ---------- Notes (HIGHLIGHTED FOOTER) ---------- */
+    if (order.notes) {
+      const noteText = safeText(order.notes);
+      const noteH = Math.max(38, doc.heightOfString(noteText, { width: contentWidth - 20 }) + 22);
+
+      const bottom = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + noteH + 10 > bottom) doc.addPage();
+
+      doc.moveDown(0.5);
+
+      const y = doc.y;
+      doc.save();
+      doc.rect(pageLeft, y, contentWidth, noteH).fill("#fff3cd");
+      doc.restore();
+
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+      doc.text("Notes", pageLeft + 10, y + 8);
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      doc.text(noteText, pageLeft + 10, y + 22, {
+        width: contentWidth - 20,
+        align: "left",
+      });
+
+      doc.y = y + noteH + 2;
     }
 
     doc.end();
@@ -1086,16 +1141,19 @@ function buildSchoolOrderPdfBuffer({
 
 /* ============================================
  * POST /api/school-orders/:orderId/send-email
+ * - No PO now (only Order No)
+ * - Email says: please refer PDF
+ * - Regards uses CompanyProfile
  * ============================================ */
 exports.sendOrderEmailForOrder = async (request, reply) => {
   const { orderId } = request.params;
-  const { publisher_id } = request.query || {};
 
   try {
     const order = await SchoolOrder.findOne({
       where: { id: orderId },
       include: [
         { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
@@ -1103,15 +1161,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
             {
               model: Book,
               as: "book",
-              attributes: [
-                "id",
-                "title",
-                "class_name",
-                "subject",
-                "code",
-                "isbn",
-                "publisher_id",
-              ],
+              attributes: ["id", "title", "class_name", "subject", "code", "isbn", "publisher_id"],
               include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
             },
           ],
@@ -1122,14 +1172,21 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     if (!order) return reply.code(404).send({ message: "School order not found." });
 
+    const supplier = order.supplier;
+    if (!supplier) {
+      return reply.code(400).send({
+        message: "Supplier not linked with this order. Please set school_orders.supplier_id.",
+      });
+    }
+    if (!supplier.email) {
+      return reply.code(400).send({ message: `Supplier email not set for "${supplier.name}".` });
+    }
+
     const school = order.school;
-    const items = order.items || [];
 
     const today = new Date();
     const todayStr = today.toLocaleDateString("en-IN");
-    const orderDate = order.order_date
-      ? new Date(order.order_date).toLocaleDateString("en-IN")
-      : "-";
+    const orderDate = order.order_date ? new Date(order.order_date).toLocaleDateString("en-IN") : "-";
 
     const companyProfile = await CompanyProfile.findOne({
       where: { is_active: true },
@@ -1137,198 +1194,85 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     });
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
-    const supportEmail =
-      process.env.ORDER_SUPPORT_EMAIL || process.env.SMTP_FROM || process.env.SMTP_USER;
 
-    // ---------- Publisher-wise ----------
-    if (publisher_id) {
-      const pid = Number(publisher_id);
-      if (Number.isNaN(pid)) return reply.code(400).send({ message: "Invalid publisher_id." });
+    const supplierName = supplier.name;
+    const supplierEmail = supplier.email;
+    const supplierPhone = supplier.phone || supplier.phone_primary || "";
+    const supplierAddress = supplier.address || supplier.address_line1 || supplier.full_address || "";
 
-      const itemsForPublisher = items.filter((it) => {
-        const b = it.book;
-        if (!b) return false;
-        const pbid =
-          (b.publisher && b.publisher.id) ||
-          (b.publisher_id != null ? Number(b.publisher_id) : undefined);
-        return pbid === pid;
-      });
+    const toParty = {
+      name: supplierName,
+      address: supplierAddress,
+      phone: supplierPhone,
+      email: supplierEmail,
+    };
 
-      if (!itemsForPublisher.length) {
-        return reply
-          .code(400)
-          .send({ message: "No items found for this publisher in this school order." });
-      }
+    const subject = `Purchase Order – Order No ${order.order_no || order.id} – ${supplierName}`;
 
-      let publisher = await Publisher.findByPk(pid);
-      if (!publisher) publisher = itemsForPublisher[0].book.publisher;
-      if (!publisher) return reply.code(404).send({ message: "Publisher not found for this order." });
-
-      const toEmail =
-        publisher.email || publisher.contact_email || process.env.PUBLISHER_ORDER_FALLBACK_EMAIL;
-      if (!toEmail) {
-        return reply.code(400).send({
-          message:
-            "Publisher email not set. Please update publisher master or set PUBLISHER_ORDER_FALLBACK_EMAIL.",
-        });
-      }
-
-      const subject = `Purchase Order ${order.order_no || order.id} – ${publisher.name}`;
-
-      const rowsHtml = itemsForPublisher
-        .map((it, idx) => {
-          const b = it.book || {};
-          const ordered = Number(it.total_order_qty) || 0;
-          const received = Number(it.received_qty) || 0;
-          const pending = Math.max(ordered - received, 0);
-          return `
-            <tr>
-              <td style="border:1px solid #ddd;padding:4px;">${idx + 1}</td>
-              <td style="border:1px solid #ddd;padding:4px;">${b.title || ""}</td>
-              <td style="border:1px solid #ddd;padding:4px;">${b.subject || ""}</td>
-              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${ordered}</td>
-              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${received}</td>
-              <td style="border:1px solid #ddd;padding:4px;text-align:right;">${pending}</td>
-            </tr>
-          `;
-        })
-        .join("");
-
-      const html = `
-        <p>Dear ${publisher.name},</p>
-        <p>
-          Please find below the purchase order from
-          <strong>${school?.name || "our client school"}</strong>
-          for session <strong>${order.academic_session || "-"}</strong>.
-        </p>
-
-        <h3>Order Summary</h3>
-        <div><strong>Order No:</strong> ${order.order_no || order.id}</div>
-        <div><strong>School:</strong> ${school?.name || "-"}</div>
-        <div><strong>Order Date:</strong> ${orderDate}</div>
-        <div><strong>Print Date:</strong> ${todayStr}</div>
-        <div><strong>Reply To (Query Email):</strong> ${supportEmail || "-"}</div>
-
-        <h3 style="margin-top:16px;">Items</h3>
-        <table style="border-collapse:collapse;font-size:12px;">
-          <thead>
-            <tr>
-              <th style="border:1px solid #ddd;padding:4px;">Sr</th>
-              <th style="border:1px solid #ddd;padding:4px;">Book</th>
-              <th style="border:1px solid #ddd;padding:4px;">Subject</th>
-              <th style="border:1px solid #ddd;padding:4px;">Ordered</th>
-              <th style="border:1px solid #ddd;padding:4px;">Received</th>
-              <th style="border:1px solid #ddd;padding:4px;">Pending</th>
-            </tr>
-          </thead>
-          <tbody>${rowsHtml}</tbody>
-        </table>
-
-        <p style="margin-top:16px;">
-          Regards,<br/>
-          EduBridge ERP<br/>
-          ${supportEmail ? `Email: ${supportEmail}<br/>` : ""}
-        </p>
-      `;
-
-      const pdfBuffer = await buildSchoolOrderPdfBuffer({
-        order,
-        companyProfile,
-        items: itemsForPublisher,
-        pdfTitle: "PURCHASE ORDER",
-        publisherNameForHeader: publisher.name,
-        dateStr: todayStr,
-        orderDate,
-        isPurchaseOrder: true,
-      });
-
-      const fileSuffix = `-publisher-${String(publisher.id).replace(/[^\w\-]+/g, "_")}`;
-      const filename = `school-order-${safeOrderNo}${fileSuffix}.pdf`;
-
-      const cc =
-        process.env.PUBLISHER_ORDER_CC ||
-        process.env.ORDER_EMAIL_CC ||
-        process.env.SMTP_USER;
-
-      const info = await sendMail({
-        to: toEmail,
-        cc,
-        subject,
-        html,
-        replyTo: supportEmail || undefined,
-        attachments: [{ filename, content: pdfBuffer, contentType: "application/pdf" }],
-      });
-
-      try {
-        order.status = "sent";
-        if ("email_sent_at" in order) order.email_sent_at = new Date();
-        await order.save();
-      } catch {}
-
-      return reply.code(200).send({
-        message: "Publisher order email (with PDF) sent successfully.",
-        order_id: order.id,
-        publisher_id: publisher.id,
-        to: toEmail,
-        message_id: info.messageId,
-      });
-    }
-
-    // ---------- School email ----------
-    if (!school) return reply.code(400).send({ message: "School record not linked with this order." });
-    if (!school.email) return reply.code(400).send({ message: "School does not have an email address." });
-
-    const subject = `Book Order ${order.order_no || order.id} – ${school.name}`;
-    const plainOrder = order.toJSON();
+    const cp = companyProfile ? companyProfile.toJSON?.() || companyProfile : null;
+    const cpName = cp?.name || "EduBridge ERP";
+    const cpPhone = cp?.phone_primary || "";
+    const cpEmail =
+      cp?.email ||
+      process.env.ORDER_SUPPORT_EMAIL ||
+      process.env.SMTP_FROM ||
+      process.env.SMTP_USER ||
+      "";
+    const cpGstin = cp?.gstin || "";
+    const cpAddr = [
+      cp?.address_line1,
+      cp?.address_line2,
+      [cp?.city, cp?.state, cp?.pincode].filter(Boolean).join(", "),
+    ]
+      .filter(Boolean)
+      .join(", ");
 
     const html = `
-      <p>Dear ${school.name},</p>
-      <p>Please find your book order details below:</p>
+      <p>Dear ${supplierName},</p>
 
-      <h3>Order Summary</h3>
-      <div><strong>Order No:</strong> ${order.order_no || order.id}</div>
-      <div><strong>Session:</strong> ${order.academic_session || "-"}</div>
+      <p>
+        Please find the attached <strong>Purchase Order PDF</strong>.
+        Kindly refer to the PDF for all item details, quantities, and transport information.
+      </p>
+
+      <h3>Quick Info</h3>
+      <div><strong>Order No:</strong> ${order.order_no || order.id}</div>     
       <div><strong>Order Date:</strong> ${orderDate}</div>
-      <div><strong>Print Date:</strong> ${todayStr}</div>
-      <div><strong>Status:</strong> ${order.status}</div>
-      ${supportEmail ? `<div><strong>For any query, please write to:</strong> ${supportEmail}</div>` : ""}
 
-      <h3 style="margin-top:18px;">Items</h3>
-      <pre style="font-size:11px; background:#f7f7f7; padding:8px; border-radius:4px;">
-${JSON.stringify(
-  (plainOrder.items || []).map((it) => ({
-    title: it.book?.title,
-    subject: it.book?.subject,
-    publisher: it.book?.publisher?.name,
-    ordered_qty: it.total_order_qty,
-    received_qty: it.received_qty,
-  })),
-  null,
-  2
-)}
-      </pre>
+      <p style="margin-top:16px;">
+        Regards,<br/>
+        <strong>${cpName}</strong><br/>
+        ${cpAddr ? `${cpAddr}<br/>` : ""}
+        ${cpPhone ? `Phone: ${cpPhone}<br/>` : ""}
+        ${cpEmail ? `Email: ${cpEmail}<br/>` : ""}
+        ${cpGstin ? `GSTIN: ${cpGstin}<br/>` : ""}
+      </p>
     `;
 
+    const orderForPdf = order.toJSON();
+    orderForPdf.transport = order.transport ? order.transport.toJSON?.() || order.transport : null;
+
     const pdfBuffer = await buildSchoolOrderPdfBuffer({
-      order,
+      order: orderForPdf,
       companyProfile,
-      items,
-      pdfTitle: "SCHOOL BOOK ORDER",
-      publisherNameForHeader: "",
+      items: order.items || [],
+      pdfTitle: "PURCHASE ORDER",
+      toParty,
       dateStr: todayStr,
       orderDate,
-      isPurchaseOrder: false,
+      isPurchaseOrder: true,
+      showPrintDate: false,
     });
 
-    const filename = `school-order-${safeOrderNo}.pdf`;
-    const cc = process.env.ORDER_EMAIL_CC || undefined;
+    const filename = `school-order-${safeOrderNo}-supplier-${order.supplier_id}.pdf`;
+    const cc = process.env.ORDER_EMAIL_CC || process.env.SMTP_USER;
 
     const info = await sendMail({
-      to: school.email,
+      to: supplierEmail,
       cc,
       subject,
       html,
-      replyTo: supportEmail || undefined,
+      replyTo: cpEmail || undefined,
       attachments: [{ filename, content: pdfBuffer, contentType: "application/pdf" }],
     });
 
@@ -1339,17 +1283,18 @@ ${JSON.stringify(
     } catch {}
 
     return reply.code(200).send({
-      message: "School order email (with PDF) sent successfully.",
+      message: "Supplier purchase order email (with PDF) sent successfully.",
       order_id: order.id,
-      school_id: school.id,
-      to: school.email,
+      supplier_id: order.supplier_id,
+      to: supplierEmail,
+      order_no: order.order_no || order.id,
       message_id: info.messageId,
     });
   } catch (err) {
     console.error("Error in sendOrderEmailForOrder:", err);
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to send school order email.",
+      message: err.message || "Failed to send supplier order email.",
     });
   }
 };
@@ -1359,13 +1304,13 @@ ${JSON.stringify(
  * ============================================ */
 exports.printOrderPdf = async (request, reply) => {
   const { orderId } = request.params;
-  const { publisher_id } = request.query || {};
 
   try {
     const order = await SchoolOrder.findOne({
       where: { id: orderId },
       include: [
         { model: School, as: "school", attributes: ["id", "name", "city"] },
+        { model: Supplier, as: "supplier" },
         {
           model: SchoolOrderItem,
           as: "items",
@@ -1392,61 +1337,41 @@ exports.printOrderPdf = async (request, reply) => {
       return reply.code(404).send({ error: "NotFound", message: "School order not found" });
     }
 
-    let items = order.items || [];
-    let pdfTitle = "SCHOOL BOOK ORDER";
-    let publisherNameForHeader = "";
-    let isPurchaseOrder = false;
-
-    if (publisher_id) {
-      const pid = Number(publisher_id);
-      if (!Number.isNaN(pid)) {
-        items = items.filter(
-          (it) =>
-            it.book &&
-            (Number(it.book.publisher_id) === pid || Number(it.book.publisher?.id) === pid)
-        );
-
-        if (!items.length) {
-          return reply.code(400).send({
-            error: "NoItems",
-            message: "No items found in this order for the selected publisher.",
-          });
-        }
-
-        publisherNameForHeader =
-          items[0].book?.publisher?.name || `Publisher #${pid}`;
-        pdfTitle = "PURCHASE ORDER";
-        isPurchaseOrder = true;
-      }
-    }
-
+    const items = order.items || [];
     const today = new Date();
     const dateStr = today.toLocaleDateString("en-IN");
-    const orderDate = order.order_date
-      ? new Date(order.order_date).toLocaleDateString("en-IN")
-      : "-";
+    const orderDate = order.order_date ? new Date(order.order_date).toLocaleDateString("en-IN") : "-";
+
+    const supplier = order.supplier;
+    const supplierName = supplier?.name || "Supplier";
+    const supplierAddress = supplier?.address || "";
+    const supplierPhone = supplier?.phone || "";
+    const supplierEmail = supplier?.email || "";
+
+    const toParty = { name: supplierName, address: supplierAddress, phone: supplierPhone, email: supplierEmail };
+
+    const orderForPdf = order.toJSON();
+    orderForPdf.transport = order.transport ? order.transport.toJSON?.() || order.transport : null;
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
-    const suffix = publisher_id
-      ? `-publisher-${String(publisher_id).replace(/[^\w\-]+/g, "_")}`
-      : "";
 
     const pdfBuffer = await buildSchoolOrderPdfBuffer({
-      order,
+      order: orderForPdf,
       companyProfile,
       items,
-      pdfTitle,
-      publisherNameForHeader,
+      pdfTitle: "PURCHASE ORDER",
+      toParty,
       dateStr,
       orderDate,
-      isPurchaseOrder,
+      isPurchaseOrder: true,
+      showPrintDate: false,
     });
 
     reply
       .header("Content-Type", "application/pdf")
       .header(
         "Content-Disposition",
-        `inline; filename="school-order-${safeOrderNo}${suffix}.pdf"`
+        `inline; filename="school-order-${safeOrderNo}-supplier-${order.supplier_id}.pdf"`
       )
       .send(pdfBuffer);
 
@@ -1456,7 +1381,7 @@ exports.printOrderPdf = async (request, reply) => {
     if (!reply.sent) {
       return reply.code(500).send({
         error: "InternalServerError",
-        message: err.message || "Failed to generate school order PDF",
+        message: err.message || "Failed to generate supplier order PDF",
       });
     }
   }

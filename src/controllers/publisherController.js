@@ -1,10 +1,38 @@
 // src/controllers/publisherController.js
-
 const { Publisher, sequelize } = require("../models");
 const XLSX = require("xlsx");
+const { Op } = require("sequelize");
+
+/* ---------------- Helpers ---------------- */
+
+const toBool = (v, defaultValue = false) => {
+  if (v === undefined || v === null || v === "") return defaultValue;
+
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v === 1;
+
+  const s = String(v).trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(s)) return true;
+  if (["false", "0", "no", "n"].includes(s)) return false;
+
+  return defaultValue;
+};
+
+const cleanStr = (v) => {
+  if (v === undefined || v === null) return "";
+  return String(v).trim();
+};
+
+const cleanNullable = (v) => {
+  const s = cleanStr(v);
+  return s ? s : null;
+};
 
 /* ============================================================
     GET LIST OF PUBLISHERS   → GET /api/publishers
+    Optional filters:
+      - q (search in name)
+      - is_active
 ============================================================ */
 async function getPublishers(request, reply) {
   try {
@@ -13,7 +41,7 @@ async function getPublishers(request, reply) {
 
     if (q && String(q).trim()) {
       const search = String(q).trim();
-      where.name = { [require("sequelize").Op.like]: `%${search}%` };
+      where.name = { [Op.like]: `%${search}%` };
     }
 
     if (typeof is_active !== "undefined") {
@@ -62,22 +90,29 @@ async function getPublisherById(request, reply) {
 async function createPublisher(request, reply) {
   const t = await sequelize.transaction();
   try {
-    const { name, contact_person, phone, email, address, is_active = true } =
-      request.body || {};
+    const {
+      name,
+      contact_person,
+      phone,
+      email,
+      address,
+      is_active = true,
+    } = request.body || {};
 
-    if (!name) {
+    const cleanName = cleanStr(name);
+    if (!cleanName) {
       await t.rollback();
       return reply.code(400).send({ message: "Name is required." });
     }
 
     const publisher = await Publisher.create(
       {
-        name: name.trim(),
-        contact_person: contact_person ? contact_person.trim() : null,
-        phone: phone ? phone.trim() : null,
-        email: email ? email.trim() : null,
-        address: address ? address.trim() : null,
-        is_active: Boolean(is_active),
+        name: cleanName,
+        contact_person: cleanNullable(contact_person),
+        phone: cleanNullable(phone),
+        email: cleanNullable(email),
+        address: cleanNullable(address),
+        is_active: toBool(is_active, true),
       },
       { transaction: t }
     );
@@ -111,14 +146,18 @@ async function updatePublisher(request, reply) {
     const { name, contact_person, phone, email, address, is_active } =
       request.body || {};
 
-    if (name !== undefined) publisher.name = name ? name.trim() : "";
+    // name
+    if (name !== undefined) publisher.name = cleanStr(name);
+
+    // other fields
     if (contact_person !== undefined)
-      publisher.contact_person = contact_person ? contact_person.trim() : null;
-    if (phone !== undefined) publisher.phone = phone ? phone.trim() : null;
-    if (email !== undefined) publisher.email = email ? email.trim() : null;
-    if (address !== undefined)
-      publisher.address = address ? address.trim() : null;
-    if (is_active !== undefined) publisher.is_active = Boolean(is_active);
+      publisher.contact_person = cleanNullable(contact_person);
+    if (phone !== undefined) publisher.phone = cleanNullable(phone);
+    if (email !== undefined) publisher.email = cleanNullable(email);
+    if (address !== undefined) publisher.address = cleanNullable(address);
+
+    if (is_active !== undefined)
+      publisher.is_active = toBool(is_active, publisher.is_active);
 
     await publisher.save({ transaction: t });
     await t.commit();
@@ -136,6 +175,7 @@ async function updatePublisher(request, reply) {
 
 /* ============================================================
     DELETE PUBLISHER  → DELETE /api/publishers/:id
+    (Soft delete recommended, but keeping your original destroy)
 ============================================================ */
 async function deletePublisher(request, reply) {
   const t = await sequelize.transaction();
@@ -148,9 +188,10 @@ async function deletePublisher(request, reply) {
       return reply.code(404).send({ message: "Publisher not found" });
     }
 
+    // Hard delete (your original)
     await publisher.destroy({ transaction: t });
-    await t.commit();
 
+    await t.commit();
     return reply.send({ message: "Publisher deleted successfully" });
   } catch (err) {
     await t.rollback();
@@ -164,6 +205,13 @@ async function deletePublisher(request, reply) {
 
 /* ============================================================
     BULK IMPORT  → POST /api/publishers/import
+    Accepted columns:
+      - Name / name
+      - Contact Person / contact_person
+      - Phone / phone
+      - Email / email
+      - Address / address
+      - Is Active / is_active
 ============================================================ */
 async function importPublishers(request, reply) {
   const file = await request.file();
@@ -190,23 +238,21 @@ async function importPublishers(request, reply) {
   const errors = [];
 
   for (const [index, row] of rows.entries()) {
-    const rowNumber = index + 2; // considering header in row 1
-
+    const rowNumber = index + 2; // header row is 1
     try {
       const id = row.ID || row.id || null;
-      const name = row.Name || row.name || "";
-
+      const name = cleanStr(row.Name || row.name || "");
       if (!name) continue;
 
       const payload = {
         name,
-        contact_person: row["Contact Person"] || row.contact_person || null,
-        phone: row.Phone || row.phone || null,
-        email: row.Email || row.email || null,
-        address: row.Address || row.address || null,
-        is_active:
-          String(row["Is Active"]).toLowerCase() !== "false" &&
-          String(row["Is Active"]).toLowerCase() !== "0",
+        contact_person: cleanNullable(
+          row["Contact Person"] || row.contact_person
+        ),
+        phone: cleanNullable(row.Phone || row.phone),
+        email: cleanNullable(row.Email || row.email),
+        address: cleanNullable(row.Address || row.address),
+        is_active: toBool(row["Is Active"] ?? row.is_active, true),
       };
 
       if (id) {

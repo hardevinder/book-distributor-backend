@@ -3,6 +3,7 @@
 const {
   SchoolBookRequirement,
   School,
+  Supplier, // ✅ NEW
   Book,
   Publisher,
   Class,
@@ -16,10 +17,11 @@ const PDFDocument = require("pdfkit"); // 🆕 for PDF printing
 /**
  * GET /api/requirements
  * Query params:
- *  - q: text search (school name / book title / publisher / class)
+ *  - q: text search (school name / book title)
  *  - schoolId
  *  - bookId
  *  - classId
+ *  - supplierId
  *  - academic_session
  *  - status (draft / confirmed)
  *  - publisherId (filter by book.publisher_id)
@@ -33,6 +35,7 @@ exports.getRequirements = async (request, reply) => {
       schoolId,
       bookId,
       classId,
+      supplierId,
       academic_session,
       status,
       publisherId,
@@ -45,6 +48,7 @@ exports.getRequirements = async (request, reply) => {
     if (schoolId) where.school_id = Number(schoolId);
     if (bookId) where.book_id = Number(bookId);
     if (classId) where.class_id = Number(classId);
+    if (supplierId) where.supplier_id = Number(supplierId);
     if (academic_session) where.academic_session = String(academic_session);
     if (status) where.status = String(status);
 
@@ -55,6 +59,12 @@ exports.getRequirements = async (request, reply) => {
         attributes: ["id", "name"],
       },
       {
+        model: Supplier,
+        as: "supplier",
+        attributes: ["id", "name"],
+        required: false,
+      },
+      {
         model: Book,
         as: "book",
         attributes: ["id", "title", "publisher_id"],
@@ -62,7 +72,7 @@ exports.getRequirements = async (request, reply) => {
           {
             model: Publisher,
             as: "publisher",
-            attributes: ["id", "name"],
+            attributes: ["id", "name"], // ✅ removed supplier
           },
         ],
       },
@@ -77,28 +87,26 @@ exports.getRequirements = async (request, reply) => {
     if (q && String(q).trim()) {
       const search = String(q).trim();
 
-      // school name
       include[0].where = {
         ...(include[0].where || {}),
         name: { [Op.like]: `%${search}%` },
       };
       include[0].required = false;
 
-      // book title
-      include[1].where = {
-        ...(include[1].where || {}),
+      include[2].where = {
+        ...(include[2].where || {}),
         title: { [Op.like]: `%${search}%` },
       };
-      include[1].required = false;
+      include[2].required = false;
     }
 
     // 🔹 Filter by publisher (via Book.publisher_id)
     if (publisherId) {
-      include[1].where = {
-        ...(include[1].where || {}),
+      include[2].where = {
+        ...(include[2].where || {}),
         publisher_id: Number(publisherId),
       };
-      include[1].required = true; // must match this publisher
+      include[2].required = true;
     }
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -108,7 +116,6 @@ exports.getRequirements = async (request, reply) => {
     const { rows, count } = await SchoolBookRequirement.findAndCountAll({
       where,
       include,
-      // 🆕 LATEST ON TOP for frontend list
       order: [["id", "DESC"]],
       limit: pageSize,
       offset,
@@ -143,12 +150,17 @@ exports.getRequirementById = async (request, reply) => {
     const requirement = await SchoolBookRequirement.findByPk(id, {
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
         {
           model: Book,
           as: "book",
           attributes: ["id", "title"],
           include: [
-            { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+            {
+              model: Publisher,
+              as: "publisher",
+              attributes: ["id", "name"], // ✅ removed supplier
+            },
           ],
         },
         { model: Class, as: "class", attributes: ["id", "class_name"] },
@@ -171,9 +183,9 @@ exports.getRequirementById = async (request, reply) => {
 
 /**
  * POST /api/requirements
- *  👉 Upsert-style:
- *    - If (school_id, book_id, academic_session) not present → CREATE
- *    - If exists → UPDATE existing record with latest values
+ * 👉 Upsert-style:
+ *  - If (school_id, book_id, academic_session) not present → CREATE
+ *  - If exists → UPDATE existing record with latest values
  */
 exports.createRequirement = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -181,6 +193,7 @@ exports.createRequirement = async (request, reply) => {
     const {
       school_id,
       book_id,
+      supplier_id, // ✅ NEW
       class_id,
       academic_session,
       required_copies = 0,
@@ -196,7 +209,6 @@ exports.createRequirement = async (request, reply) => {
       });
     }
 
-    // Basic validations (school / book / class must exist)
     const school = await School.findByPk(school_id, { transaction: t });
     if (!school) {
       await t.rollback();
@@ -207,6 +219,14 @@ exports.createRequirement = async (request, reply) => {
     if (!book) {
       await t.rollback();
       return reply.code(400).send({ message: "Invalid book_id." });
+    }
+
+    if (supplier_id) {
+      const sup = await Supplier.findByPk(supplier_id, { transaction: t });
+      if (!sup) {
+        await t.rollback();
+        return reply.code(400).send({ message: "Invalid supplier_id." });
+      }
     }
 
     let classObj = null;
@@ -220,7 +240,6 @@ exports.createRequirement = async (request, reply) => {
 
     const numericCopies = Number(required_copies) || 0;
 
-    // 🔑 Uniq key: (school_id, book_id, academic_session)
     const [record, created] = await SchoolBookRequirement.findOrCreate({
       where: {
         school_id,
@@ -228,6 +247,7 @@ exports.createRequirement = async (request, reply) => {
         academic_session: academic_session || null,
       },
       defaults: {
+        supplier_id: supplier_id || null, // ✅
         class_id: classObj ? class_id : null,
         required_copies: numericCopies,
         status: status || "draft",
@@ -237,19 +257,13 @@ exports.createRequirement = async (request, reply) => {
       transaction: t,
     });
 
-    // Agar record already exist tha → latest values se update
     if (!created) {
+      if (typeof supplier_id !== "undefined") record.supplier_id = supplier_id || null;
       record.class_id = classObj ? class_id : null;
       record.required_copies = numericCopies;
-      if (typeof status !== "undefined") {
-        record.status = status || "draft";
-      }
-      if (typeof remarks !== "undefined") {
-        record.remarks = remarks || null;
-      }
-      if (typeof is_locked !== "undefined") {
-        record.is_locked = Boolean(is_locked);
-      }
+      if (typeof status !== "undefined") record.status = status || "draft";
+      if (typeof remarks !== "undefined") record.remarks = remarks || null;
+      if (typeof is_locked !== "undefined") record.is_locked = Boolean(is_locked);
 
       await record.save({ transaction: t });
     }
@@ -259,17 +273,12 @@ exports.createRequirement = async (request, reply) => {
     const fullRequirement = await SchoolBookRequirement.findByPk(record.id, {
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
         {
           model: Book,
           as: "book",
           attributes: ["id", "title"],
-          include: [
-            {
-              model: Publisher,
-              as: "publisher",
-              attributes: ["id", "name"],
-            },
-          ],
+          include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
         },
         { model: Class, as: "class", attributes: ["id", "class_name"] },
       ],
@@ -280,7 +289,6 @@ exports.createRequirement = async (request, reply) => {
     await t.rollback();
     request.log.error({ err }, "Error in createRequirement");
 
-    // Agar fir bhi unique error aaye to clean message
     if (err.name === "SequelizeUniqueConstraintError") {
       return reply.code(400).send({
         error:
@@ -312,6 +320,7 @@ exports.updateRequirement = async (request, reply) => {
     const {
       school_id,
       book_id,
+      supplier_id, // ✅ NEW
       class_id,
       academic_session,
       required_copies,
@@ -320,7 +329,6 @@ exports.updateRequirement = async (request, reply) => {
       is_locked,
     } = request.body || {};
 
-    // Validate school if changed
     if (school_id) {
       const school = await School.findByPk(school_id);
       if (!school) {
@@ -330,7 +338,6 @@ exports.updateRequirement = async (request, reply) => {
       requirement.school_id = school_id;
     }
 
-    // Validate book if changed
     if (book_id) {
       const book = await Book.findByPk(book_id);
       if (!book) {
@@ -338,6 +345,19 @@ exports.updateRequirement = async (request, reply) => {
         return reply.code(400).send({ message: "Invalid book_id." });
       }
       requirement.book_id = book_id;
+    }
+
+    if (typeof supplier_id !== "undefined") {
+      if (supplier_id) {
+        const sup = await Supplier.findByPk(supplier_id);
+        if (!sup) {
+          await t.rollback();
+          return reply.code(400).send({ message: "Invalid supplier_id." });
+        }
+        requirement.supplier_id = supplier_id;
+      } else {
+        requirement.supplier_id = null;
+      }
     }
 
     if (typeof class_id !== "undefined") {
@@ -353,50 +373,33 @@ exports.updateRequirement = async (request, reply) => {
       }
     }
 
-    if (typeof academic_session !== "undefined") {
+    if (typeof academic_session !== "undefined")
       requirement.academic_session = academic_session || null;
-    }
 
-    if (typeof required_copies !== "undefined") {
+    if (typeof required_copies !== "undefined")
       requirement.required_copies = Number(required_copies) || 0;
-    }
 
-    if (typeof status !== "undefined") {
-      requirement.status = status;
-    }
-
-    if (typeof remarks !== "undefined") {
-      requirement.remarks = remarks || null;
-    }
-
-    if (typeof is_locked !== "undefined") {
+    if (typeof status !== "undefined") requirement.status = status;
+    if (typeof remarks !== "undefined") requirement.remarks = remarks || null;
+    if (typeof is_locked !== "undefined")
       requirement.is_locked = Boolean(is_locked);
-    }
 
     await requirement.save({ transaction: t });
     await t.commit();
 
-    const fullRequirement = await SchoolBookRequirement.findByPk(
-      requirement.id,
-      {
-        include: [
-          { model: School, as: "school", attributes: ["id", "name"] },
-          {
-            model: Book,
-            as: "book",
-            attributes: ["id", "title"],
-            include: [
-              {
-                model: Publisher,
-                as: "publisher",
-                attributes: ["id", "name"],
-              },
-            ],
-          },
-          { model: Class, as: "class", attributes: ["id", "class_name"] },
-        ],
-      }
-    );
+    const fullRequirement = await SchoolBookRequirement.findByPk(requirement.id, {
+      include: [
+        { model: School, as: "school", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
+        {
+          model: Book,
+          as: "book",
+          attributes: ["id", "title"],
+          include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+        },
+        { model: Class, as: "class", attributes: ["id", "class_name"] },
+      ],
+    });
 
     return reply.send(fullRequirement);
   } catch (err) {
@@ -438,20 +441,6 @@ exports.deleteRequirement = async (request, reply) => {
 };
 
 /* ------------ BULK IMPORT: POST /api/requirements/import ------------ */
-/**
- * Expected Excel columns (case-insensitive, flexible):
- *  - ID
- *  - School ID / SchoolId (optional now)
- *  - School Name
- *  - Book ID / BookId (optional now)
- *  - Book Title
- *  - Class / Class Name
- *  - Session / Academic Session
- *  - Required Copies
- *  - Status
- *  - Remarks
- *  - Is Locked
- */
 exports.importRequirements = async (request, reply) => {
   const file = await request.file();
 
@@ -461,9 +450,7 @@ exports.importRequirements = async (request, reply) => {
   }
 
   const chunks = [];
-  for await (const chunk of file.file) {
-    chunks.push(chunk);
-  }
+  for await (const chunk of file.file) chunks.push(chunk);
   const buffer = Buffer.concat(chunks);
 
   let workbook;
@@ -484,58 +471,42 @@ exports.importRequirements = async (request, reply) => {
   const errors = [];
 
   for (const [index, row] of rows.entries()) {
-    const rowNumber = index + 2; // header at row 1
+    const rowNumber = index + 2;
     const t = await sequelize.transaction();
     try {
       const id = row.ID || row.Id || row.id || null;
 
-      const schoolIdRaw =
-        row["School ID"] || row.school_id || row.SchoolId || "";
-      const schoolName =
-        row["School Name"] || row.school || row.SchoolName || "";
+      const schoolIdRaw = row["School ID"] || row.school_id || row.SchoolId || "";
+      const schoolName = row["School Name"] || row.school || row.SchoolName || "";
 
       const bookIdRaw = row["Book ID"] || row.book_id || row.BookId || "";
-      const bookTitle =
-        row["Book Title"] || row.book || row.title || row.BookTitle || "";
+      const bookTitle = row["Book Title"] || row.book || row.title || row.BookTitle || "";
 
-      const className =
-        row.Class || row["Class Name"] || row.class_name || "";
+      const supplierName = row["Supplier Name"] || row.supplier || row.supplier_name || ""; // ✅ NEW
 
-      const sessionRaw =
-        row["Session"] || row["Academic Session"] || row.academic_session || "";
-
-      const copiesRaw =
-        row["Required Copies"] || row.required_copies || row.Copies || "";
+      const className = row.Class || row["Class Name"] || row.class_name || "";
+      const sessionRaw = row["Session"] || row["Academic Session"] || row.academic_session || "";
+      const copiesRaw = row["Required Copies"] || row.required_copies || row.Copies || "";
 
       const statusRaw = row.Status || row.status || "";
       const remarks = row.Remarks || row.remarks || "";
-      const isLockedRaw =
-        row["Is Locked"] || row.is_locked || row.IsLocked || false;
+      const isLockedRaw = row["Is Locked"] || row.is_locked || row.IsLocked || false;
 
       // Resolve school
       let school_id = null;
       if (schoolIdRaw) {
         school_id = Number(schoolIdRaw);
       } else if (schoolName) {
-        const school = await School.findOne({
-          where: { name: schoolName },
-        });
+        const school = await School.findOne({ where: { name: schoolName } });
         if (!school) {
-          errors.push({
-            row: rowNumber,
-            error: `School "${schoolName}" not found.`,
-          });
+          errors.push({ row: rowNumber, error: `School "${schoolName}" not found.` });
           await t.rollback();
           continue;
         }
         school_id = school.id;
       }
-
       if (!school_id) {
-        errors.push({
-          row: rowNumber,
-          error: "School ID/Name is required.",
-        });
+        errors.push({ row: rowNumber, error: "School ID/Name is required." });
         await t.rollback();
         continue;
       }
@@ -545,40 +516,40 @@ exports.importRequirements = async (request, reply) => {
       if (bookIdRaw) {
         book_id = Number(bookIdRaw);
       } else if (bookTitle) {
-        const book = await Book.findOne({
-          where: { title: bookTitle },
-        });
+        const book = await Book.findOne({ where: { title: bookTitle } });
         if (!book) {
-          errors.push({
-            row: rowNumber,
-            error: `Book "${bookTitle}" not found.`,
-          });
+          errors.push({ row: rowNumber, error: `Book "${bookTitle}" not found.` });
           await t.rollback();
           continue;
         }
         book_id = book.id;
       }
-
       if (!book_id) {
-        errors.push({
-          row: rowNumber,
-          error: "Book ID/Title is required.",
-        });
+        errors.push({ row: rowNumber, error: "Book ID/Title is required." });
         await t.rollback();
         continue;
+      }
+
+      // Resolve supplier (optional)
+      let supplier_id = null;
+      if (supplierName && String(supplierName).trim()) {
+        const sup = await Supplier.findOne({
+          where: { name: String(supplierName).trim() },
+        });
+        if (!sup) {
+          errors.push({ row: rowNumber, error: `Supplier "${supplierName}" not found.` });
+          await t.rollback();
+          continue;
+        }
+        supplier_id = sup.id;
       }
 
       // Resolve class
       let class_id = null;
       if (className) {
-        const cls = await Class.findOne({
-          where: { class_name: className },
-        });
+        const cls = await Class.findOne({ where: { class_name: className } });
         if (!cls) {
-          errors.push({
-            row: rowNumber,
-            error: `Class "${className}" not found.`,
-          });
+          errors.push({ row: rowNumber, error: `Class "${className}" not found.` });
           await t.rollback();
           continue;
         }
@@ -587,19 +558,11 @@ exports.importRequirements = async (request, reply) => {
 
       const academic_session = sessionRaw || null;
 
-      // 🔒 Required Copies must be numeric
       let required_copies = 0;
-      if (
-        copiesRaw === "" ||
-        copiesRaw === null ||
-        typeof copiesRaw === "undefined"
-      ) {
+      if (copiesRaw === "" || copiesRaw === null || typeof copiesRaw === "undefined") {
         required_copies = 0;
       } else if (isNaN(Number(copiesRaw))) {
-        errors.push({
-          row: rowNumber,
-          error: "Required Copies must be numeric.",
-        });
+        errors.push({ row: rowNumber, error: "Required Copies must be numeric." });
         await t.rollback();
         continue;
       } else {
@@ -609,21 +572,18 @@ exports.importRequirements = async (request, reply) => {
       let status = "draft";
       if (statusRaw) {
         const s = String(statusRaw).toLowerCase().trim();
-        if (["draft", "confirmed"].includes(s)) {
-          status = s;
-        }
+        if (["draft", "confirmed"].includes(s)) status = s;
       }
 
       const is_locked =
         typeof isLockedRaw === "string"
-          ? ["1", "true", "yes", "locked"].includes(
-              isLockedRaw.toLowerCase().trim()
-            )
+          ? ["1", "true", "yes", "locked"].includes(isLockedRaw.toLowerCase().trim())
           : Boolean(isLockedRaw);
 
       const payload = {
         school_id,
         book_id,
+        supplier_id,
         class_id,
         academic_session,
         required_copies,
@@ -647,10 +607,7 @@ exports.importRequirements = async (request, reply) => {
       await t.commit();
     } catch (err) {
       await t.rollback();
-      errors.push({
-        row: rowNumber,
-        error: err.message,
-      });
+      errors.push({ row: rowNumber, error: err.message });
     }
   }
 
@@ -663,72 +620,51 @@ exports.importRequirements = async (request, reply) => {
 };
 
 /* ------------ BULK EXPORT: GET /api/requirements/export ------------ */
-/**
- * Excel:
- *  - School ID & Book ID columns removed.
- *  - Publisher auto from Book Title (VLOOKUP).
- *  - Session dropdown list: 2025-26 (first in list) + next 5 sessions.
- *  - Required Copies: numeric-only (whole number, >= 0).
- */
 exports.exportRequirements = async (request, reply) => {
   try {
-    const { schoolId, academic_session, status, publisherId } =
-      request.query || {};
+    const { schoolId, academic_session, status, publisherId } = request.query || {};
 
     const where = {};
     if (schoolId) where.school_id = Number(schoolId);
     if (academic_session) where.academic_session = String(academic_session);
     if (status) where.status = String(status);
-
-    if (publisherId) {
-      where["$book.publisher_id$"] = Number(publisherId);
-    }
+    if (publisherId) where["$book.publisher_id$"] = Number(publisherId);
 
     // ---------- REF DATA ----------
     const schools = await School.findAll({
       where: { is_active: true },
-      order: [
-        ["sort_order", "ASC"],
-        ["name", "ASC"],
-      ],
+      order: [["sort_order", "ASC"], ["name", "ASC"]],
     });
 
     const classes = await Class.findAll({
       where: { is_active: true },
-      order: [
-        ["sort_order", "ASC"],
-        ["class_name", "ASC"],
-      ],
+      order: [["sort_order", "ASC"], ["class_name", "ASC"]],
+    });
+
+    const suppliers = await Supplier.findAll({
+      attributes: ["id", "name"],
+      order: [["name", "ASC"]],
     });
 
     const booksWhere = {};
-    if (publisherId) {
-      booksWhere.publisher_id = Number(publisherId);
-    }
+    if (publisherId) booksWhere.publisher_id = Number(publisherId);
 
     const books = await Book.findAll({
       where: booksWhere,
-      include: [
-        { model: Publisher, as: "publisher", attributes: ["id", "name"] },
-      ],
-      order: [
-        ["class_name", "ASC"],
-        ["subject", "ASC"],
-        ["title", "ASC"],
-      ],
+      include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+      order: [["class_name", "ASC"], ["subject", "ASC"], ["title", "ASC"]],
     });
 
     const requirements = await SchoolBookRequirement.findAll({
       where,
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
         {
           model: Book,
           as: "book",
           attributes: ["id", "title", "publisher_id"],
-          include: [
-            { model: Publisher, as: "publisher", attributes: ["id", "name"] },
-          ],
+          include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
         },
         { model: Class, as: "class", attributes: ["id", "class_name"] },
       ],
@@ -744,11 +680,11 @@ exports.exportRequirements = async (request, reply) => {
     // ---------- Sheet 1: Requirements ----------
     const reqSheet = workbook.addWorksheet("Requirements");
 
-    // NOTE: School ID & Book ID removed
     reqSheet.columns = [
-      { header: "ID", key: "id", width: 8 }, // DB auto if blank for new rows
+      { header: "ID", key: "id", width: 8 },
       { header: "School Name", key: "school_name", width: 35 },
       { header: "Book Title", key: "book_title", width: 40 },
+      { header: "Supplier Name", key: "supplier_name", width: 28 }, // ✅ from requirement
       { header: "Publisher Name", key: "publisher_name", width: 30 },
       { header: "Class", key: "class_name", width: 20 },
       { header: "Session", key: "academic_session", width: 15 },
@@ -759,20 +695,16 @@ exports.exportRequirements = async (request, reply) => {
     ];
 
     reqSheet.getRow(1).font = { bold: true };
-    reqSheet.getRow(1).alignment = {
-      vertical: "middle",
-      horizontal: "center",
-    };
+    reqSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
 
     requirements.forEach((r) => {
       reqSheet.addRow({
         id: r.id,
         school_name: r.school ? r.school.name : "",
         book_title: r.book ? r.book.title : "",
-        publisher_name:
-          r.book && r.book.publisher ? r.book.publisher.name : "",
+        supplier_name: r.supplier?.name || "",
+        publisher_name: r.book?.publisher?.name || "",
         class_name: r.class ? r.class.class_name : "",
-        // don't force-fill session; keep existing or blank
         academic_session: r.academic_session || "",
         required_copies: r.required_copies,
         status: r.status,
@@ -787,26 +719,25 @@ exports.exportRequirements = async (request, reply) => {
     const schoolsSheet = workbook.addWorksheet("Schools");
     schoolsSheet.getCell("A1").value = "School Name";
     schoolsSheet.getRow(1).font = { bold: true };
-
     schools.forEach((s, index) => {
       schoolsSheet.getCell(index + 2, 1).value = s.name;
     });
+    const schoolRange = `Schools!$A$2:$A$${schools.length + 1}`;
 
-    const schoolListStartRow = 2;
-    const schoolListEndRow = schools.length + 1;
-    const schoolRange = `Schools!$A$${schoolListStartRow}:$A$${schoolListEndRow}`;
+    // ---------- Sheet 3: Suppliers ----------
+    const suppliersSheet = workbook.addWorksheet("Suppliers");
+    suppliersSheet.getCell("A1").value = "Supplier Name";
+    suppliersSheet.getRow(1).font = { bold: true };
+    suppliers.forEach((s, idx) => {
+      suppliersSheet.getCell(idx + 2, 1).value = s.name;
+    });
+    const supplierRange =
+      suppliers.length > 0 ? `Suppliers!$A$2:$A$${suppliers.length + 1}` : `Suppliers!$A$2:$A$2`;
 
-    // ---------- Sheet 3: Books ----------
+    // ---------- Sheet 4: Books ----------
     const booksSheet = workbook.addWorksheet("Books");
-    booksSheet.getRow(1).values = [
-      "Book ID",
-      "Book Title",
-      "Publisher Name",
-      "Class",
-      "Subject",
-    ];
+    booksSheet.getRow(1).values = ["Book ID", "Book Title", "Publisher Name", "Class", "Subject"];
     booksSheet.getRow(1).font = { bold: true };
-
     books.forEach((b, index) => {
       booksSheet.getRow(index + 2).values = [
         b.id,
@@ -816,121 +747,66 @@ exports.exportRequirements = async (request, reply) => {
         b.subject || "",
       ];
     });
+    const bookTitleRange = `Books!$B$2:$B$${books.length + 1}`;
+    const bookLookupRange = `Books!$B$2:$C$${books.length + 1}`; // Title->Publisher
 
-    const bookTitleStartRow = 2;
-    const bookTitleEndRow = books.length + 1;
-    const bookTitleRange = `Books!$B$${bookTitleStartRow}:$B$${bookTitleEndRow}`;
-    const bookLookupRange = `Books!$B$${bookTitleStartRow}:$C$${bookTitleEndRow}`; // B:Title, C:Publisher
-
-    // ---------- Sheet 4: Classes ----------
+    // ---------- Sheet 5: Classes ----------
     const classesSheet = workbook.addWorksheet("Classes");
     classesSheet.getCell("A1").value = "Class Name";
     classesSheet.getRow(1).font = { bold: true };
-
     classes.forEach((c, index) => {
       classesSheet.getCell(index + 2, 1).value = c.class_name;
     });
+    const classRange = `Classes!$A$2:$A$${classes.length + 1}`;
 
-    const classListStartRow = 2;
-    const classListEndRow = classes.length + 1;
-    const classRange = `Classes!$A$${classListStartRow}:$A$${classListEndRow}`;
-
-    // ---------- Session dropdown values ----------
-    // 2025-26 (default in list) + next 5: 2026-27 ... 2030-31
-    const baseSessionStart = 2025; // 2025-26
+    // ---------- Session dropdown ----------
+    const baseSessionStart = 2025;
     const sessionOptions = [];
     for (let i = 0; i <= 5; i++) {
       const y1 = baseSessionStart + i;
       const y2Short = String((y1 + 1) % 100).padStart(2, "0");
-      // e.g. 2025-26, 2026-27
       sessionOptions.push(`${y1}-${y2Short}`);
     }
     const sessionFormula = `"${sessionOptions.join(",")}"`;
 
-    // ---------- Apply dropdown validations + auto publisher + numeric copies ----------
+    // ---------- Validations + autofill Publisher only ----------
     const maxRows = Math.max(requirements.length + 50, 200);
 
     for (let row = 2; row <= maxRows; row++) {
-      // School Name → column 2
-      const schoolCell = reqSheet.getCell(row, 2);
-      schoolCell.dataValidation = {
-        type: "list",
-        allowBlank: true,
-        formulae: [schoolRange],
-        showErrorMessage: true,
-        errorStyle: "error",
-        errorTitle: "Invalid School",
-        error: "Please select a school from the dropdown list (Schools sheet).",
-      };
+      // School Name → col 2
+      reqSheet.getCell(row, 2).dataValidation = { type: "list", allowBlank: true, formulae: [schoolRange] };
 
-      // Book Title → column 3
-      const bookCell = reqSheet.getCell(row, 3);
-      bookCell.dataValidation = {
-        type: "list",
-        allowBlank: true,
-        formulae: [bookTitleRange],
-        showErrorMessage: true,
-        errorStyle: "error",
-        errorTitle: "Invalid Book",
-        error: "Please select a book from the dropdown list (Books sheet).",
-      };
+      // Book Title → col 3
+      reqSheet.getCell(row, 3).dataValidation = { type: "list", allowBlank: true, formulae: [bookTitleRange] };
 
-      // 👉 Publisher Name auto from Book Title → column 4
-      const publisherCell = reqSheet.getCell(row, 4);
-      publisherCell.value = {
+      // Supplier Name → col 4 (manual dropdown)
+      reqSheet.getCell(row, 4).dataValidation = { type: "list", allowBlank: true, formulae: [supplierRange] };
+
+      // Publisher Name → col 5 auto from Book Title
+      reqSheet.getCell(row, 5).value = {
         formula: `IFERROR(VLOOKUP($C${row},${bookLookupRange},2,FALSE),"")`,
       };
 
-      // Class → column 5
-      const classCell = reqSheet.getCell(row, 5);
-      classCell.dataValidation = {
-        type: "list",
-        allowBlank: true,
-        formulae: [classRange],
-        showErrorMessage: true,
-        errorStyle: "error",
-        errorTitle: "Invalid Class",
-        error: "Please select a class from the dropdown list (Classes sheet).",
-      };
+      // Class → col 6
+      reqSheet.getCell(row, 6).dataValidation = { type: "list", allowBlank: true, formulae: [classRange] };
 
-      // Session → column 6 (dropdown only, no pre-fill from backend)
-      const sessionCell = reqSheet.getCell(row, 6);
-      sessionCell.dataValidation = {
-        type: "list",
-        allowBlank: true,
-        formulae: [sessionFormula],
-        showErrorMessage: true,
-        errorStyle: "error",
-        errorTitle: "Invalid Session",
-        error: "Please select a session from the dropdown list.",
-      };
+      // Session → col 7
+      reqSheet.getCell(row, 7).dataValidation = { type: "list", allowBlank: true, formulae: [sessionFormula] };
 
-      // 🔒 Required Copies → column 7 must be numeric (whole number >= 0)
-      const copiesCell = reqSheet.getCell(row, 7);
-      copiesCell.dataValidation = {
+      // Required Copies → col 8
+      reqSheet.getCell(row, 8).dataValidation = {
         type: "whole",
         operator: "greaterThanOrEqual",
         allowBlank: true,
         formulae: [0],
-        showErrorMessage: true,
-        errorStyle: "error",
-        errorTitle: "Invalid Required Copies",
-        error:
-          "Required Copies must be a numeric value (whole number 0 or more).",
       };
     }
 
     const buffer = await workbook.xlsx.writeBuffer();
 
     reply
-      .header(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      )
-      .header(
-        "Content-Disposition",
-        'attachment; filename="school-book-requirements.xlsx"'
-      )
+      .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+      .header("Content-Disposition", 'attachment; filename="school-book-requirements.xlsx"')
       .send(Buffer.from(buffer));
   } catch (err) {
     request.log.error({ err }, "Error in exportRequirements");
@@ -942,14 +818,8 @@ exports.exportRequirements = async (request, reply) => {
 };
 
 /* ------------ PDF EXPORT: GET /api/requirements/print-pdf ------------ */
-/**
- * Pretty PDF:
- *  - If schoolId filter → single school, heading on top + table of books.
- *  - If no schoolId → group by school, each school on separate page.
- */
 exports.printRequirementsPdf = (request, reply) => {
-  const { schoolId, academic_session, status, publisherId } =
-    request.query || {};
+  const { schoolId, academic_session, status, publisherId } = request.query || {};
 
   const where = {};
   if (schoolId) where.school_id = Number(schoolId);
@@ -961,19 +831,14 @@ exports.printRequirementsPdf = (request, reply) => {
     where,
     include: [
       { model: School, as: "school", attributes: ["id", "name"] },
+      { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
       {
         model: Book,
         as: "book",
         attributes: ["id", "title", "publisher_id"],
-        include: [
-          { model: Publisher, as: "publisher", attributes: ["id", "name"] },
-        ],
+        include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
       },
-      {
-        model: Class,
-        as: "class",
-        attributes: ["id", "class_name", "sort_order"],
-      },
+      { model: Class, as: "class", attributes: ["id", "class_name", "sort_order"] },
     ],
     order: [
       [sequelize.literal("`school`.`name`"), "ASC"],
@@ -982,35 +847,23 @@ exports.printRequirementsPdf = (request, reply) => {
     ],
   })
     .then((requirements) => {
-      // Group by school
       const groups = new Map();
       for (const r of requirements) {
         const sid = r.school ? r.school.id : 0;
-        if (!groups.has(sid)) {
-          groups.set(sid, { school: r.school, items: [] });
-        }
+        if (!groups.has(sid)) groups.set(sid, { school: r.school, items: [] });
         groups.get(sid).items.push(r);
       }
 
-      // 🔹 Build PDF fully in memory
       const doc = new PDFDocument({ size: "A4", margin: 40 });
-
       const chunks = [];
-      doc.on("data", (chunk) => {
-        chunks.push(chunk);
-      });
+      doc.on("data", (chunk) => chunks.push(chunk));
 
       doc.on("end", () => {
         const pdfBuffer = Buffer.concat(chunks);
-
-        if (reply.sent) return; // safety
-
+        if (reply.sent) return;
         reply
           .header("Content-Type", "application/pdf")
-          .header(
-            "Content-Disposition",
-            'attachment; filename="school-book-requirements.pdf"'
-          )
+          .header("Content-Disposition", 'attachment; filename="school-book-requirements.pdf"')
           .send(pdfBuffer);
       });
 
@@ -1024,40 +877,21 @@ exports.printRequirementsPdf = (request, reply) => {
         }
       });
 
-      // ---------- Helpers to draw ----------
       const printHeader = (schoolName) => {
         const title = "School Book Requirements";
         const today = new Date();
 
-        doc
-          .font("Helvetica-Bold")
-          .fontSize(16)
-          .text(title, { align: "center" });
+        doc.font("Helvetica-Bold").fontSize(16).text(title, { align: "center" });
         doc.moveDown(0.3);
 
-        if (schoolName) {
-          doc
-            .font("Helvetica-Bold")
-            .fontSize(13)
-            .text(schoolName, { align: "center" });
-        } else {
-          doc
-            .font("Helvetica-Bold")
-            .fontSize(13)
-            .text("All Schools", { align: "center" });
-        }
+        doc.font("Helvetica-Bold").fontSize(13).text(schoolName || "All Schools", { align: "center" });
 
         const dateStr = today.toLocaleDateString("en-IN");
         doc.moveDown(0.2);
-        doc.font("Helvetica").fontSize(9).text(`Date: ${dateStr}`, {
-          align: "center",
-        });
+        doc.font("Helvetica").fontSize(9).text(`Date: ${dateStr}`, { align: "center" });
 
         if (academic_session) {
-          doc
-            .font("Helvetica")
-            .fontSize(9)
-            .text(`Session: ${academic_session}`, { align: "center" });
+          doc.font("Helvetica").fontSize(9).text(`Session: ${academic_session}`, { align: "center" });
         }
 
         doc.moveDown(0.7);
@@ -1068,13 +902,18 @@ exports.printRequirementsPdf = (request, reply) => {
         doc.moveDown(0.5);
       };
 
-      const printTableHeader = () => {
+      const printClassHeading = (className) => {
+        doc.font("Helvetica-Bold").fontSize(12).text(`Class: ${className || "-"}`, { align: "left" });
+        doc.moveDown(0.3);
+      };
+
+      const printTableHeader = (withClassCol) => {
         const y = doc.y;
         doc.font("Helvetica-Bold").fontSize(9);
 
         doc.text("Sr", 40, y, { width: 20 });
-        doc.text("Class", 65, y, { width: 45 });
-        doc.text("Book Title", 115, y, { width: 230 });
+        if (withClassCol) doc.text("Class", 65, y, { width: 45 });
+        doc.text("Book Title", withClassCol ? 115 : 65, y, { width: withClassCol ? 230 : 270 });
         doc.text("Publisher", 350, y, { width: 120 });
         doc.text("Sess", 475, y, { width: 40 });
         doc.text("Qty", 515, y, { width: 40, align: "right" });
@@ -1087,56 +926,101 @@ exports.printRequirementsPdf = (request, reply) => {
         doc.moveDown(0.3);
       };
 
-      const ensureSpaceForRow = (approxHeight = 16, schoolName) => {
+      const ensureSpaceForRow = (approxHeight = 16, schoolName, className, withClassCol) => {
         const bottom = doc.page.height - doc.page.margins.bottom;
         if (doc.y + approxHeight > bottom) {
           doc.addPage();
           printHeader(schoolName);
-          printTableHeader();
+          if (className) printClassHeading(className);
+          printTableHeader(withClassCol);
         }
       };
 
-      // ---------- No data case ----------
       if (!requirements.length) {
         printHeader(null);
-        doc.font("Helvetica").fontSize(11).text("No requirements found.", {
-          align: "left",
-        });
+        doc.font("Helvetica").fontSize(11).text("No requirements found.", { align: "left" });
         doc.end();
         return;
       }
 
-      // ---------- Draw all groups ----------
       const groupEntries = Array.from(groups.values());
 
       groupEntries.forEach((group, idx) => {
         const schoolName = group.school?.name || "Unknown School";
+        if (idx > 0) doc.addPage();
 
-        if (idx > 0) {
-          doc.addPage();
+        // ✅ If single school download: each class on a new page
+        if (schoolId) {
+          const classMap = new Map();
+          for (const r of group.items) {
+            const key = r.class?.id || 0;
+            if (!classMap.has(key)) {
+              classMap.set(key, {
+                className: r.class?.class_name || "-",
+                sort: r.class?.sort_order ?? 9999,
+                items: [],
+              });
+            }
+            classMap.get(key).items.push(r);
+          }
+
+          const classesArr = Array.from(classMap.values()).sort((a, b) => {
+            if (a.sort !== b.sort) return a.sort - b.sort;
+            return String(a.className).localeCompare(String(b.className));
+          });
+
+          classesArr.forEach((clsGroup, cIdx) => {
+            if (cIdx > 0) doc.addPage();
+
+            printHeader(schoolName);
+            printClassHeading(clsGroup.className);
+            printTableHeader(false);
+
+            let sr = 1;
+            for (const r of clsGroup.items) {
+              ensureSpaceForRow(18, schoolName, clsGroup.className, false);
+
+              const y = doc.y;
+              doc.font("Helvetica").fontSize(9);
+
+              const bookTitle = r.book?.title || "-";
+              const publisherName = r.book?.publisher?.name || "-";
+              const session = r.academic_session || "-";
+              const qty = r.required_copies != null ? String(r.required_copies) : "0";
+
+              doc.text(String(sr), 40, y, { width: 20 });
+              doc.text(bookTitle, 65, y, { width: 270 });
+              doc.text(publisherName, 350, y, { width: 120 });
+              doc.text(session, 475, y, { width: 40 });
+              doc.text(qty, 515, y, { width: 40, align: "right" });
+
+              doc.moveDown(0.7);
+              sr++;
+            }
+          });
+
+          return;
         }
 
+        // ✅ All-schools mode
         printHeader(schoolName);
-        printTableHeader();
+        printTableHeader(true);
 
         let sr = 1;
         for (const r of group.items) {
-          ensureSpaceForRow(18, schoolName);
+          ensureSpaceForRow(18, schoolName, null, true);
 
           const y = doc.y;
           doc.font("Helvetica").fontSize(9);
 
-          const className = r.class?.class_name || "-";
+          const clsName = r.class?.class_name || "-";
           const bookTitle = r.book?.title || "-";
           const publisherName = r.book?.publisher?.name || "-";
           const session = r.academic_session || "-";
-          const qty =
-            r.required_copies !== null && r.required_copies !== undefined
-              ? String(r.required_copies)
-              : "0";
+          const qty = r.required_copies != null ? String(r.required_copies) : "0";
 
           doc.text(String(sr), 40, y, { width: 20 });
-          doc.text(className, 65, y, { width: 45 });
+          doc.text(clsName, 65, y, { width: 45 });
           doc.text(bookTitle, 115, y, { width: 230 });
           doc.text(publisherName, 350, y, { width: 120 });
           doc.text(session, 475, y, { width: 40 });
@@ -1147,7 +1031,6 @@ exports.printRequirementsPdf = (request, reply) => {
         }
       });
 
-      // ✅ Finish PDF (triggers "end" → buffer → reply.send)
       doc.end();
     })
     .catch((err) => {
@@ -1160,4 +1043,3 @@ exports.printRequirementsPdf = (request, reply) => {
       }
     });
 };
-

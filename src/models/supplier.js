@@ -1,7 +1,7 @@
-// src/models/publisher.js
+// src/models/supplier.js
 module.exports = (sequelize, DataTypes) => {
-  const Publisher = sequelize.define(
-    "Publisher",
+  const Supplier = sequelize.define(
+    "Supplier",
     {
       id: {
         type: DataTypes.INTEGER.UNSIGNED,
@@ -12,15 +12,14 @@ module.exports = (sequelize, DataTypes) => {
       name: {
         type: DataTypes.STRING(150),
         allowNull: false,
+        unique: true,
       },
 
-      // Optional / informational only
       contact_person: {
         type: DataTypes.STRING(100),
         allowNull: true,
       },
 
-      // Optional (can be empty)
       phone: {
         type: DataTypes.STRING(30),
         allowNull: true,
@@ -43,10 +42,22 @@ module.exports = (sequelize, DataTypes) => {
       },
     },
     {
-      tableName: "publishers",
+      tableName: "suppliers",
       timestamps: true,
     }
   );
 
-  return Publisher;
+  // ✅ Associations
+  Supplier.associate = (models) => {
+    // Supplier -> SchoolOrders
+    Supplier.hasMany(models.SchoolOrder, {
+      foreignKey: "supplier_id",
+      as: "schoolOrders",
+    });
+
+    // (Optional) if you ever link supplier on publisher:
+    // Supplier.hasMany(models.Publisher, { foreignKey: "supplier_id", as: "publishers" });
+  };
+
+  return Supplier;
 };
