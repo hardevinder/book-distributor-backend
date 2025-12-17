@@ -877,29 +877,31 @@ exports.printRequirementsPdf = (request, reply) => {
         }
       });
 
+      // ✅ Header (Session removed completely)
       const printHeader = (schoolName) => {
         const title = "School Book Requirements";
         const today = new Date();
 
         doc.font("Helvetica-Bold").fontSize(16).text(title, { align: "center" });
-        doc.moveDown(0.3);
+        doc.moveDown(0.25);
 
-        doc.font("Helvetica-Bold").fontSize(13).text(schoolName || "All Schools", { align: "center" });
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(13)
+          .text(schoolName || "All Schools", { align: "center" });
 
         const dateStr = today.toLocaleDateString("en-IN");
         doc.moveDown(0.2);
         doc.font("Helvetica").fontSize(9).text(`Date: ${dateStr}`, { align: "center" });
 
-        if (academic_session) {
-          doc.font("Helvetica").fontSize(9).text(`Session: ${academic_session}`, { align: "center" });
-        }
+        // ❌ No Session line
 
-        doc.moveDown(0.7);
+        doc.moveDown(0.6);
         doc
           .moveTo(doc.page.margins.left, doc.y)
           .lineTo(doc.page.width - doc.page.margins.right, doc.y)
           .stroke();
-        doc.moveDown(0.5);
+        doc.moveDown(0.4);
       };
 
       const printClassHeading = (className) => {
@@ -907,16 +909,25 @@ exports.printRequirementsPdf = (request, reply) => {
         doc.moveDown(0.3);
       };
 
+      // ✅ Table header (Session column removed, Publisher width increased)
       const printTableHeader = (withClassCol) => {
         const y = doc.y;
         doc.font("Helvetica-Bold").fontSize(9);
 
         doc.text("Sr", 40, y, { width: 20 });
+
         if (withClassCol) doc.text("Class", 65, y, { width: 45 });
-        doc.text("Book Title", withClassCol ? 115 : 65, y, { width: withClassCol ? 230 : 270 });
-        doc.text("Publisher", 350, y, { width: 120 });
-        doc.text("Sess", 475, y, { width: 40 });
-        doc.text("Qty", 515, y, { width: 40, align: "right" });
+
+        // Book title reduced
+        doc.text("Book Title", withClassCol ? 115 : 65, y, {
+          width: withClassCol ? 200 : 240,
+        });
+
+        // Publisher increased (prevents line break)
+        doc.text("Publisher", withClassCol ? 325 : 305, y, { width: 170 });
+
+        // Qty shifted right
+        doc.text("Qty", 505, y, { width: 50, align: "right" });
 
         doc.moveDown(0.4);
         doc
@@ -985,14 +996,17 @@ exports.printRequirementsPdf = (request, reply) => {
 
               const bookTitle = r.book?.title || "-";
               const publisherName = r.book?.publisher?.name || "-";
-              const session = r.academic_session || "-";
               const qty = r.required_copies != null ? String(r.required_copies) : "0";
 
               doc.text(String(sr), 40, y, { width: 20 });
-              doc.text(bookTitle, 65, y, { width: 270 });
-              doc.text(publisherName, 350, y, { width: 120 });
-              doc.text(session, 475, y, { width: 40 });
-              doc.text(qty, 515, y, { width: 40, align: "right" });
+
+              // Book title reduced
+              doc.text(bookTitle, 65, y, { width: 240 });
+
+              // Publisher increased
+              doc.text(publisherName, 305, y, { width: 170 });
+
+              doc.text(qty, 505, y, { width: 50, align: "right" });
 
               doc.moveDown(0.7);
               sr++;
@@ -1016,15 +1030,18 @@ exports.printRequirementsPdf = (request, reply) => {
           const clsName = r.class?.class_name || "-";
           const bookTitle = r.book?.title || "-";
           const publisherName = r.book?.publisher?.name || "-";
-          const session = r.academic_session || "-";
           const qty = r.required_copies != null ? String(r.required_copies) : "0";
 
           doc.text(String(sr), 40, y, { width: 20 });
           doc.text(clsName, 65, y, { width: 45 });
-          doc.text(bookTitle, 115, y, { width: 230 });
-          doc.text(publisherName, 350, y, { width: 120 });
-          doc.text(session, 475, y, { width: 40 });
-          doc.text(qty, 515, y, { width: 40, align: "right" });
+
+          // Book title reduced
+          doc.text(bookTitle, 115, y, { width: 200 });
+
+          // Publisher increased
+          doc.text(publisherName, 325, y, { width: 170 });
+
+          doc.text(qty, 505, y, { width: 50, align: "right" });
 
           doc.moveDown(0.7);
           sr++;
@@ -1043,3 +1060,4 @@ exports.printRequirementsPdf = (request, reply) => {
       }
     });
 };
+

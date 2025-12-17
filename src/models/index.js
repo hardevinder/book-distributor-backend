@@ -31,7 +31,14 @@ const RequirementOrderLink = require("./requirementOrderLink")(sequelize, DataTy
 // School Orders models
 const SchoolOrder = require("./schoolOrder")(sequelize, DataTypes);
 const SchoolOrderItem = require("./schoolOrderItem")(sequelize, DataTypes);
-const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(sequelize, DataTypes);
+const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(
+  sequelize,
+  DataTypes
+);
+
+// ✅ Module-2 Inventory models
+const InventoryBatch = require("./inventoryBatch")(sequelize, DataTypes);
+const InventoryTxn = require("./inventoryTxn")(sequelize, DataTypes);
 
 /* ======================
         ASSOCIATIONS
@@ -53,6 +60,20 @@ Publisher.hasMany(Book, {
 Book.belongsTo(Publisher, {
   foreignKey: "publisher_id",
   as: "publisher",
+});
+
+/* ------------------------------------------------
+   ✅ NEW: Supplier ↔ Books (1:N)  (THIS FIXES YOUR ERROR)
+   ------------------------------------------------ */
+
+Supplier.hasMany(Book, {
+  foreignKey: "supplier_id",
+  as: "books",
+});
+
+Book.belongsTo(Supplier, {
+  foreignKey: "supplier_id",
+  as: "supplier",
 });
 
 /* ============================
@@ -185,7 +206,7 @@ SchoolOrder.belongsTo(School, {
 });
 
 /* ---------------------------------------------------
-   ✅ FIX: Supplier ↔ SchoolOrder (1:N)  (MISSING EARLIER)
+   ✅ Supplier ↔ SchoolOrder (1:N)
    --------------------------------------------------- */
 
 Supplier.hasMany(SchoolOrder, {
@@ -271,6 +292,76 @@ SchoolOrder.belongsTo(Transport, {
   as: "transport2",
 });
 
+/* ============================
+   ✅ Module-2 Inventory Relations
+   ============================ */
+
+// Book ↔ InventoryBatch (1:N)
+Book.hasMany(InventoryBatch, {
+  foreignKey: "book_id",
+  as: "inventory_batches",
+});
+
+InventoryBatch.belongsTo(Book, {
+  foreignKey: "book_id",
+  as: "book",
+});
+
+// Supplier ↔ InventoryBatch (1:N)
+Supplier.hasMany(InventoryBatch, {
+  foreignKey: "supplier_id",
+  as: "inventory_batches",
+});
+
+InventoryBatch.belongsTo(Supplier, {
+  foreignKey: "supplier_id",
+  as: "supplier",
+});
+
+// SchoolOrder ↔ InventoryBatch (1:N) (optional reference)
+SchoolOrder.hasMany(InventoryBatch, {
+  foreignKey: "school_order_id",
+  as: "inventory_batches",
+});
+
+InventoryBatch.belongsTo(SchoolOrder, {
+  foreignKey: "school_order_id",
+  as: "schoolOrder",
+});
+
+// SchoolOrderItem ↔ InventoryBatch (1:N) (optional reference)
+SchoolOrderItem.hasMany(InventoryBatch, {
+  foreignKey: "school_order_item_id",
+  as: "inventory_batches",
+});
+
+InventoryBatch.belongsTo(SchoolOrderItem, {
+  foreignKey: "school_order_item_id",
+  as: "schoolOrderItem",
+});
+
+// InventoryBatch ↔ InventoryTxn (1:N)
+InventoryBatch.hasMany(InventoryTxn, {
+  foreignKey: "batch_id",
+  as: "txns",
+});
+
+InventoryTxn.belongsTo(InventoryBatch, {
+  foreignKey: "batch_id",
+  as: "batch",
+});
+
+// Book ↔ InventoryTxn (1:N)
+Book.hasMany(InventoryTxn, {
+  foreignKey: "book_id",
+  as: "inventory_txns",
+});
+
+InventoryTxn.belongsTo(Book, {
+  foreignKey: "book_id",
+  as: "book",
+});
+
 // No associations required for CompanyProfile yet (stand-alone master)
 
 /* ============================
@@ -290,10 +381,16 @@ module.exports = {
   Transport,
   CompanyProfile,
   SchoolBookRequirement,
+
   PublisherOrder,
   PublisherOrderItem,
   RequirementOrderLink,
+
   SchoolOrder,
   SchoolOrderItem,
   SchoolRequirementOrderLink,
+
+  // ✅ Module-2 Inventory exports
+  InventoryBatch,
+  InventoryTxn,
 };

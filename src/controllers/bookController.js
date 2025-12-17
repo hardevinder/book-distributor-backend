@@ -1,15 +1,41 @@
 // controllers/bookController.js
 
-const { Book, Publisher, Class, sequelize } = require("../models");
+const { Book, Publisher, Supplier, Class, sequelize } = require("../models");
 const { Op } = require("sequelize");
 const XLSX = require("xlsx"); // ⭐ for Excel import/export (import)
 const ExcelJS = require("exceljs"); // ⭐ for Excel export with dropdown
+
+/* ---------------- Helpers ---------------- */
+
+function toNumberOrNull(v) {
+  if (v === "" || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeBool(v, defaultVal = true) {
+  if (typeof v === "undefined" || v === null || v === "") return defaultVal;
+  if (typeof v === "boolean") return v;
+  const s = String(v).toLowerCase().trim();
+  return !["0", "false", "no", "inactive"].includes(s);
+}
+
+// auto-calc rate from mrp & discount%
+function calcRateFromMrp(mrp, discount_percent) {
+  const m = toNumberOrNull(mrp);
+  const d = toNumberOrNull(discount_percent);
+  if (m === null || d === null) return null;
+  const rate = m - (m * d) / 100;
+  // keep 2 decimals
+  return Math.round(rate * 100) / 100;
+}
 
 /**
  * GET /api/books
  * Query params:
  *  - q: search text (title / code / subject / isbn)
  *  - publisherId
+ *  - supplierId ✅
  *  - className
  *  - is_active (true/false)
  *  - page (default 1)
@@ -20,6 +46,7 @@ exports.getBooks = async (request, reply) => {
     const {
       q,
       publisherId,
+      supplierId,
       className,
       is_active,
       page = 1,
@@ -35,19 +62,18 @@ exports.getBooks = async (request, reply) => {
         { title: { [Op.like]: `%${search}%` } },
         { code: { [Op.like]: `%${search}%` } },
         { subject: { [Op.like]: `%${search}%` } },
-        { isbn: { [Op.like]: `%${search}%` } }, // search by ISBN too
+        { isbn: { [Op.like]: `%${search}%` } },
       ];
     }
 
     // Filter by publisher
-    if (publisherId) {
-      where.publisher_id = Number(publisherId);
-    }
+    if (publisherId) where.publisher_id = Number(publisherId);
 
-    // Filter by class (string, as stored in books.class_name)
-    if (className) {
-      where.class_name = className;
-    }
+    // ✅ Filter by supplier
+    if (supplierId) where.supplier_id = Number(supplierId);
+
+    // Filter by class
+    if (className) where.class_name = className;
 
     // Filter by active status
     if (typeof is_active !== "undefined") {
@@ -62,11 +88,8 @@ exports.getBooks = async (request, reply) => {
     const { rows, count } = await Book.findAndCountAll({
       where,
       include: [
-        {
-          model: Publisher,
-          as: "publisher",
-          attributes: ["id", "name"],
-        },
+        { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"] },
       ],
       order: [
         ["class_name", "ASC"],
@@ -104,17 +127,12 @@ exports.getBookById = async (request, reply) => {
 
     const book = await Book.findByPk(id, {
       include: [
-        {
-          model: Publisher,
-          as: "publisher",
-          attributes: ["id", "name"],
-        },
+        { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"] },
       ],
     });
 
-    if (!book) {
-      return reply.code(404).send({ message: "Book not found" });
-    }
+    if (!book) return reply.code(404).send({ message: "Book not found" });
 
     return reply.send(book);
   } catch (err) {
@@ -128,17 +146,6 @@ exports.getBookById = async (request, reply) => {
 
 /**
  * POST /api/books
- * Body:
- *  - title*          (string)
- *  - code            (string, optional – internal book code)
- *  - isbn            (string, optional – ISBN-10 / ISBN-13)
- *  - publisher_id*   (number)
- *  - class_name      (string, e.g. "Class 1")
- *  - subject         (string)
- *  - medium          (string, e.g. "English")
- *  - mrp             (number)
- *  - selling_price   (number)
- *  - is_active       (boolean, default true)
  */
 exports.createBook = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -148,10 +155,13 @@ exports.createBook = async (request, reply) => {
       code,
       isbn,
       publisher_id,
+      supplier_id, // ✅ NEW
       class_name,
       subject,
       medium,
       mrp,
+      discount_percent, // ✅ NEW
+      rate, // ✅ NEW
       selling_price,
       is_active = true,
     } = request.body || {};
@@ -170,16 +180,45 @@ exports.createBook = async (request, reply) => {
       return reply.code(400).send({ message: "Invalid publisher_id." });
     }
 
+    // ✅ Validate supplier if provided
+    let supplierIdToSave = null;
+    if (
+      typeof supplier_id !== "undefined" &&
+      supplier_id !== null &&
+      supplier_id !== "" &&
+      supplier_id !== 0 &&
+      supplier_id !== "0"
+    ) {
+      const supplier = await Supplier.findByPk(Number(supplier_id));
+      if (!supplier) {
+        await t.rollback();
+        return reply.code(400).send({ message: "Invalid supplier_id." });
+      }
+      supplierIdToSave = Number(supplier_id);
+    }
+
+    const mrpVal = mrp ?? null;
+    const discountVal = discount_percent ?? null;
+
+    // ✅ Auto-calc rate if missing
+    const rateVal =
+      typeof rate !== "undefined" && rate !== null && rate !== ""
+        ? rate
+        : calcRateFromMrp(mrpVal, discountVal);
+
     const book = await Book.create(
       {
         title: title.trim(),
         code: code ? code.trim() : null,
         isbn: isbn ? isbn.trim() : null,
         publisher_id,
+        supplier_id: supplierIdToSave,
         class_name: class_name ? class_name.trim() : null,
         subject: subject ? subject.trim() : null,
         medium: medium ? medium.trim() : null,
-        mrp: mrp ?? null,
+        mrp: mrpVal,
+        discount_percent: discountVal,
+        rate: rateVal,
         selling_price: selling_price ?? null,
         is_active: Boolean(is_active),
       },
@@ -191,6 +230,7 @@ exports.createBook = async (request, reply) => {
     const fullBook = await Book.findByPk(book.id, {
       include: [
         { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"] },
       ],
     });
 
@@ -207,7 +247,6 @@ exports.createBook = async (request, reply) => {
 
 /**
  * PUT /api/books/:id
- * Body: same as createBook (all fields optional, only send what you want to update)
  */
 exports.updateBook = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -225,10 +264,13 @@ exports.updateBook = async (request, reply) => {
       code,
       isbn,
       publisher_id,
+      supplier_id, // ✅ NEW
       class_name,
       subject,
       medium,
       mrp,
+      discount_percent, // ✅ NEW
+      rate, // ✅ NEW
       selling_price,
       is_active,
     } = request.body || {};
@@ -243,41 +285,49 @@ exports.updateBook = async (request, reply) => {
       book.publisher_id = publisher_id;
     }
 
-    if (typeof title !== "undefined") {
-      book.title = title ? title.trim() : "";
+    // ✅ Validate & set supplier_id if provided
+    if (typeof supplier_id !== "undefined") {
+      if (
+        supplier_id === null ||
+        supplier_id === "" ||
+        supplier_id === 0 ||
+        supplier_id === "0"
+      ) {
+        book.supplier_id = null;
+      } else {
+        const supplier = await Supplier.findByPk(Number(supplier_id));
+        if (!supplier) {
+          await t.rollback();
+          return reply.code(400).send({ message: "Invalid supplier_id." });
+        }
+        book.supplier_id = Number(supplier_id);
+      }
     }
 
-    if (typeof code !== "undefined") {
-      book.code = code ? code.trim() : null;
-    }
-
-    if (typeof isbn !== "undefined") {
-      book.isbn = isbn ? isbn.trim() : null;
-    }
-
-    if (typeof class_name !== "undefined") {
+    if (typeof title !== "undefined") book.title = title ? title.trim() : "";
+    if (typeof code !== "undefined") book.code = code ? code.trim() : null;
+    if (typeof isbn !== "undefined") book.isbn = isbn ? isbn.trim() : null;
+    if (typeof class_name !== "undefined")
       book.class_name = class_name ? class_name.trim() : null;
-    }
-
-    if (typeof subject !== "undefined") {
+    if (typeof subject !== "undefined")
       book.subject = subject ? subject.trim() : null;
-    }
-
-    if (typeof medium !== "undefined") {
+    if (typeof medium !== "undefined")
       book.medium = medium ? medium.trim() : null;
+
+    if (typeof mrp !== "undefined") book.mrp = mrp;
+    if (typeof discount_percent !== "undefined")
+      book.discount_percent = discount_percent;
+
+    if (typeof rate !== "undefined") {
+      book.rate = rate;
+    } else {
+      // ✅ if rate not sent, but mrp/discount changed, auto-calc when possible
+      const auto = calcRateFromMrp(book.mrp, book.discount_percent);
+      if (auto !== null) book.rate = auto;
     }
 
-    if (typeof mrp !== "undefined") {
-      book.mrp = mrp;
-    }
-
-    if (typeof selling_price !== "undefined") {
-      book.selling_price = selling_price;
-    }
-
-    if (typeof is_active !== "undefined") {
-      book.is_active = Boolean(is_active);
-    }
+    if (typeof selling_price !== "undefined") book.selling_price = selling_price;
+    if (typeof is_active !== "undefined") book.is_active = Boolean(is_active);
 
     await book.save({ transaction: t });
     await t.commit();
@@ -285,6 +335,7 @@ exports.updateBook = async (request, reply) => {
     const fullBook = await Book.findByPk(book.id, {
       include: [
         { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"] },
       ],
     });
 
@@ -301,7 +352,6 @@ exports.updateBook = async (request, reply) => {
 
 /**
  * DELETE /api/books/:id
- * (Hard delete. If you want soft delete, change to is_active = false instead.)
  */
 exports.deleteBook = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -338,9 +388,7 @@ exports.importBooks = async (request, reply) => {
   }
 
   const chunks = [];
-  for await (const chunk of file.file) {
-    chunks.push(chunk);
-  }
+  for await (const chunk of file.file) chunks.push(chunk);
   const buffer = Buffer.concat(chunks);
 
   let workbook;
@@ -377,7 +425,17 @@ exports.importBooks = async (request, reply) => {
       const publisherName =
         row["Publisher Name"] || row.publisher || row.PublisherName || "";
 
+      // ✅ Supplier
+      const supplierIdRaw =
+        row["Supplier ID"] || row.supplier_id || row.SupplierId || "";
+      const supplierName =
+        row["Supplier Name"] || row.supplier || row.SupplierName || "";
+
       const mrpRaw = row.MRP || row.mrp || "";
+      const discountRaw =
+        row["Discount %"] || row.discount_percent || row.DiscountPercent || "";
+      const rateRaw = row.Rate || row.rate || row["Unit Price"] || "";
+
       const sellingPriceRaw =
         row["Selling Price"] || row.selling_price || row.SellingPrice || "";
 
@@ -412,33 +470,55 @@ exports.importBooks = async (request, reply) => {
         continue;
       }
 
-      const is_active =
-        typeof isActiveRaw === "string"
-          ? !["0", "false", "no", "inactive"].includes(
-              isActiveRaw.toLowerCase().trim()
-            )
-          : Boolean(isActiveRaw);
+      // ✅ resolve supplier (optional)
+      let supplier_id = null;
+      if (supplierIdRaw) {
+        supplier_id = Number(supplierIdRaw);
+        const s = await Supplier.findByPk(supplier_id);
+        if (!s) {
+          errors.push({
+            row: rowNumber,
+            error: `Invalid supplier_id "${supplier_id}".`,
+          });
+          continue;
+        }
+      } else if (supplierName) {
+        const s = await Supplier.findOne({ where: { name: supplierName } });
+        if (!s) {
+          errors.push({
+            row: rowNumber,
+            error: `Supplier "${supplierName}" not found.`,
+          });
+          continue;
+        }
+        supplier_id = s.id;
+      }
 
-      const mrp =
-        mrpRaw === "" || mrpRaw === null || mrpRaw === undefined
-          ? null
-          : Number(mrpRaw);
-      const selling_price =
-        sellingPriceRaw === "" ||
-        sellingPriceRaw === null ||
-        sellingPriceRaw === undefined
-          ? null
-          : Number(sellingPriceRaw);
+      const is_active = normalizeBool(isActiveRaw, true);
+
+      const mrp = toNumberOrNull(mrpRaw);
+      const discount_percent = toNumberOrNull(discountRaw);
+      const selling_price = toNumberOrNull(sellingPriceRaw);
+
+      // ✅ rate: take from file if present else auto-calc if possible
+      let rate = toNumberOrNull(rateRaw);
+      if (rate === null) {
+        const auto = calcRateFromMrp(mrp, discount_percent);
+        if (auto !== null) rate = auto;
+      }
 
       const payload = {
         title,
         code: code || null,
         isbn: isbn || null,
         publisher_id,
+        supplier_id,
         class_name: class_name || null,
         subject: subject || null,
         medium: medium || null,
         mrp,
+        discount_percent,
+        rate,
         selling_price,
         is_active,
       };
@@ -455,10 +535,7 @@ exports.importBooks = async (request, reply) => {
       await Book.create(payload);
       createdCount++;
     } catch (err) {
-      errors.push({
-        row: rowNumber,
-        error: err.message,
-      });
+      errors.push({ row: rowNumber, error: err.message });
     }
   }
 
@@ -471,23 +548,11 @@ exports.importBooks = async (request, reply) => {
 };
 
 /* ------------ BULK EXPORT: GET /api/books/export ------------ */
-/**
- * Export with:
- *  - Sheet "Books": data rows
- *  - Sheet "Publishers": list of publisher names (for dropdown)
- *  - Sheet "Classes": list of class names (for dropdown)
- *  - Data validation (dropdown) on:
- *      - "Publisher Name" column in Books sheet
- *      - "Class" column in Books sheet
- */
 exports.exportBooks = async (request, reply) => {
   try {
-    // 🔹 Fetch all publishers for dropdown
-    const publishers = await Publisher.findAll({
-      order: [["name", "ASC"]],
-    });
+    const publishers = await Publisher.findAll({ order: [["name", "ASC"]] });
+    const suppliers = await Supplier.findAll({ order: [["name", "ASC"]] });
 
-    // 🔹 Fetch all classes for dropdown
     const classes = await Class.findAll({
       where: { is_active: true },
       order: [
@@ -496,14 +561,10 @@ exports.exportBooks = async (request, reply) => {
       ],
     });
 
-    // 🔹 Fetch all books with publisher relations
     const books = await Book.findAll({
       include: [
-        {
-          model: Publisher,
-          as: "publisher",
-          attributes: ["id", "name"],
-        },
+        { model: Publisher, as: "publisher", attributes: ["id", "name"] },
+        { model: Supplier, as: "supplier", attributes: ["id", "name"] },
       ],
       order: [["id", "ASC"]],
     });
@@ -513,29 +574,46 @@ exports.exportBooks = async (request, reply) => {
     // Sheet 1: Books
     const booksSheet = workbook.addWorksheet("Books");
 
+    // Column Order (IMPORTANT for dropdown index):
+    // 1 ID
+    // 2 Title
+    // 3 Code
+    // 4 ISBN
+    // 5 Class
+    // 6 Subject
+    // 7 Medium
+    // 8 Publisher ID
+    // 9 Publisher Name  (dropdown)
+    // 10 Supplier ID
+    // 11 Supplier Name  (dropdown)
+    // 12 MRP
+    // 13 Discount %
+    // 14 Rate
+    // 15 Selling Price
+    // 16 Is Active
     booksSheet.columns = [
       { header: "ID", key: "id", width: 8 },
       { header: "Title", key: "title", width: 40 },
       { header: "Code", key: "code", width: 15 },
       { header: "ISBN", key: "isbn", width: 20 },
-      { header: "Class", key: "class_name", width: 20 }, // widened for full name
+      { header: "Class", key: "class_name", width: 20 },
       { header: "Subject", key: "subject", width: 20 },
       { header: "Medium", key: "medium", width: 12 },
       { header: "Publisher ID", key: "publisher_id", width: 12 },
       { header: "Publisher Name", key: "publisher_name", width: 30 },
+      { header: "Supplier ID", key: "supplier_id", width: 12 },
+      { header: "Supplier Name", key: "supplier_name", width: 30 },
       { header: "MRP", key: "mrp", width: 10 },
+      { header: "Discount %", key: "discount_percent", width: 12 },
+      { header: "Rate", key: "rate", width: 12 },
       { header: "Selling Price", key: "selling_price", width: 12 },
       { header: "Is Active", key: "is_active", width: 10 },
     ];
 
     // Header styling
     booksSheet.getRow(1).font = { bold: true };
-    booksSheet.getRow(1).alignment = {
-      vertical: "middle",
-      horizontal: "center",
-    };
+    booksSheet.getRow(1).alignment = { vertical: "middle", horizontal: "center" };
 
-    // Add book rows
     books.forEach((b) => {
       booksSheet.addRow({
         id: b.id,
@@ -547,46 +625,50 @@ exports.exportBooks = async (request, reply) => {
         medium: b.medium,
         publisher_id: b.publisher_id,
         publisher_name: b.publisher ? b.publisher.name : "",
+        supplier_id: b.supplier_id,
+        supplier_name: b.supplier ? b.supplier.name : "",
         mrp: b.mrp,
+        discount_percent: b.discount_percent,
+        rate: b.rate,
         selling_price: b.selling_price,
         is_active: b.is_active ? "TRUE" : "FALSE",
       });
     });
 
-    // Freeze header row
     booksSheet.views = [{ state: "frozen", xSplit: 0, ySplit: 1 }];
 
-    // Sheet 2: Publishers (for dropdown source)
+    // Sheet 2: Publishers
     const publishersSheet = workbook.addWorksheet("Publishers");
     publishersSheet.getCell("A1").value = "Publisher Name";
     publishersSheet.getRow(1).font = { bold: true };
-
     publishers.forEach((p, index) => {
       publishersSheet.getCell(index + 2, 1).value = p.name;
     });
+    const publisherRange = `Publishers!$A$2:$A$${publishers.length + 1}`;
 
-    const publisherListStartRow = 2;
-    const publisherListEndRow = publishers.length + 1;
-    const publisherRange = `Publishers!$A$${publisherListStartRow}:$A$${publisherListEndRow}`;
+    // Sheet 3: Suppliers
+    const suppliersSheet = workbook.addWorksheet("Suppliers");
+    suppliersSheet.getCell("A1").value = "Supplier Name";
+    suppliersSheet.getRow(1).font = { bold: true };
+    suppliers.forEach((s, index) => {
+      suppliersSheet.getCell(index + 2, 1).value = s.name;
+    });
+    const supplierRange = `Suppliers!$A$2:$A$${suppliers.length + 1}`;
 
-    // Sheet 3: Classes (for dropdown source)
+    // Sheet 4: Classes
     const classesSheet = workbook.addWorksheet("Classes");
     classesSheet.getCell("A1").value = "Class Name";
     classesSheet.getRow(1).font = { bold: true };
-
     classes.forEach((c, index) => {
       classesSheet.getCell(index + 2, 1).value = c.class_name;
     });
+    const classRange = `Classes!$A$2:$A$${classes.length + 1}`;
 
-    const classListStartRow = 2;
-    const classListEndRow = classes.length + 1;
-    const classRange = `Classes!$A$${classListStartRow}:$A$${classListEndRow}`;
-
-    // Apply dropdowns in Books sheet
-    const maxRows = Math.max(books.length + 50, 200); // allow extra empty rows also
+    // Apply dropdowns
+    const maxRows = Math.max(books.length + 50, 200);
 
     for (let row = 2; row <= maxRows; row++) {
-      // Publisher dropdown → column 9
+      // Publisher Name dropdown → column 9
       const publisherCell = booksSheet.getCell(row, 9);
       publisherCell.dataValidation = {
         type: "list",
@@ -595,8 +677,19 @@ exports.exportBooks = async (request, reply) => {
         showErrorMessage: true,
         errorStyle: "error",
         errorTitle: "Invalid Publisher",
-        error:
-          "Please select a publisher from the dropdown list (Publishers sheet).",
+        error: "Please select a publisher from the dropdown list (Publishers sheet).",
+      };
+
+      // Supplier Name dropdown → column 11
+      const supplierCell = booksSheet.getCell(row, 11);
+      supplierCell.dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [supplierRange],
+        showErrorMessage: true,
+        errorStyle: "error",
+        errorTitle: "Invalid Supplier",
+        error: "Please select a supplier from the dropdown list (Suppliers sheet).",
       };
 
       // Class dropdown → column 5
@@ -608,12 +701,10 @@ exports.exportBooks = async (request, reply) => {
         showErrorMessage: true,
         errorStyle: "error",
         errorTitle: "Invalid Class",
-        error:
-          "Please select a class from the dropdown list (Classes sheet).",
+        error: "Please select a class from the dropdown list (Classes sheet).",
       };
     }
 
-    // Generate buffer & send
     const buffer = await workbook.xlsx.writeBuffer();
 
     reply

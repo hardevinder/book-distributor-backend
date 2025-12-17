@@ -55,6 +55,12 @@ module.exports = (sequelize, DataTypes) => {
       as: "schoolOrders",
     });
 
+    // ✅ Supplier -> Books (Catalogue)
+    Supplier.hasMany(models.Book, {
+      foreignKey: "supplier_id",
+      as: "books",
+    });
+
     // (Optional) if you ever link supplier on publisher:
     // Supplier.hasMany(models.Publisher, { foreignKey: "supplier_id", as: "publishers" });
   };
