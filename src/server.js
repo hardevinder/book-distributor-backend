@@ -106,8 +106,7 @@ const buildServer = () => {
 
       // Auto detect base URL
       const baseUrl =
-        process.env.APP_BASE_URL ||
-        `${request.protocol}://${request.headers.host}`;
+        process.env.APP_BASE_URL || `${request.protocol}://${request.headers.host}`;
 
       const logoUrl = `${baseUrl}${publicPath}`;
 
@@ -131,7 +130,7 @@ const buildServer = () => {
     prefix: "/api/publishers",
   });
 
-  // ✅ NEW: Suppliers CRUD (create auto-creates publisher inside controller)
+  // ✅ Suppliers CRUD
   fastify.register(require("./routes/supplierRoutes"), {
     prefix: "/api/suppliers",
   });
@@ -152,6 +151,16 @@ const buildServer = () => {
   fastify.register(require("./routes/schoolOrderRoutes"), {
     prefix: "/api/school-orders",
   });
+
+  // ✅ Step-2 Bundles/Kits (Reserve / Unreserve / List)
+  // routes file should define:
+  // POST /api/bundles
+  // GET  /api/bundles
+  // POST /api/bundles/:id/cancel
+  fastify.register(require("./routes/bundleRoutes"), {
+    prefix: "/api/bundles",
+  });
+
   fastify.register(require("./routes/stockRoutes"), { prefix: "/api/stock" });
   fastify.register(require("./routes/companyProfileRoutes"), {
     prefix: "/api",

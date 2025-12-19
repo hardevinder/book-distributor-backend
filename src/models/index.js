@@ -40,6 +40,10 @@ const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(
 const InventoryBatch = require("./inventoryBatch")(sequelize, DataTypes);
 const InventoryTxn = require("./inventoryTxn")(sequelize, DataTypes);
 
+// ✅ Step-2 Bundles/Kits models
+const Bundle = require("./bundle")(sequelize, DataTypes);
+const BundleItem = require("./bundleItem")(sequelize, DataTypes);
+
 /* ======================
         ASSOCIATIONS
    ====================== */
@@ -63,7 +67,7 @@ Book.belongsTo(Publisher, {
 });
 
 /* ------------------------------------------------
-   ✅ NEW: Supplier ↔ Books (1:N)  (THIS FIXES YOUR ERROR)
+   ✅ Supplier ↔ Books (1:N)
    ------------------------------------------------ */
 
 Supplier.hasMany(Book, {
@@ -362,6 +366,43 @@ InventoryTxn.belongsTo(Book, {
   as: "book",
 });
 
+/* ============================
+   ✅ Step-2 Bundles / Kits Relations
+   ============================ */
+
+// School ↔ Bundle (1:N)
+School.hasMany(Bundle, {
+  foreignKey: "school_id",
+  as: "bundles",
+});
+
+Bundle.belongsTo(School, {
+  foreignKey: "school_id",
+  as: "school",
+});
+
+// Bundle ↔ BundleItem (1:N)
+Bundle.hasMany(BundleItem, {
+  foreignKey: "bundle_id",
+  as: "items",
+});
+
+BundleItem.belongsTo(Bundle, {
+  foreignKey: "bundle_id",
+  as: "bundle",
+});
+
+// Book ↔ BundleItem (1:N)
+Book.hasMany(BundleItem, {
+  foreignKey: "book_id",
+  as: "bundle_items",
+});
+
+BundleItem.belongsTo(Book, {
+  foreignKey: "book_id",
+  as: "book",
+});
+
 // No associations required for CompanyProfile yet (stand-alone master)
 
 /* ============================
@@ -370,6 +411,7 @@ InventoryTxn.belongsTo(Book, {
 
 module.exports = {
   sequelize,
+
   User,
 
   Supplier,
@@ -393,4 +435,8 @@ module.exports = {
   // ✅ Module-2 Inventory exports
   InventoryBatch,
   InventoryTxn,
+
+  // ✅ Step-2 Bundles exports
+  Bundle,
+  BundleItem,
 };
