@@ -1,4 +1,5 @@
 // src/models/index.js
+"use strict";
 
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/db");
@@ -43,6 +44,11 @@ const InventoryTxn = require("./inventoryTxn")(sequelize, DataTypes);
 // ✅ Step-2 Bundles/Kits models
 const Bundle = require("./bundle")(sequelize, DataTypes);
 const BundleItem = require("./bundleItem")(sequelize, DataTypes);
+
+// ✅ NEW: Distributors + Issue + Dispatch models
+const Distributor = require("./distributor")(sequelize, DataTypes);
+const BundleIssue = require("./bundleIssue")(sequelize, DataTypes);
+const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
 
 /* ======================
         ASSOCIATIONS
@@ -403,7 +409,87 @@ BundleItem.belongsTo(Book, {
   as: "book",
 });
 
-// No associations required for CompanyProfile yet (stand-alone master)
+/* ============================
+   ✅ NEW: Distributor / Issue / Dispatch Relations
+   ============================ */
+
+// Bundle ↔ BundleIssue (1:N)
+Bundle.hasMany(BundleIssue, {
+  foreignKey: "bundle_id",
+  as: "issues",
+});
+
+BundleIssue.belongsTo(Bundle, {
+  foreignKey: "bundle_id",
+  as: "bundle",
+});
+
+// Issue ↔ Dispatch (1:N)
+BundleIssue.hasMany(BundleDispatch, {
+  foreignKey: "bundle_issue_id",
+  as: "dispatches",
+});
+
+BundleDispatch.belongsTo(BundleIssue, {
+  foreignKey: "bundle_issue_id",
+  as: "issue",
+});
+
+// Bundle ↔ Dispatch (1:N) (still keep direct link for easy reporting)
+Bundle.hasMany(BundleDispatch, {
+  foreignKey: "bundle_id",
+  as: "dispatches",
+});
+
+BundleDispatch.belongsTo(Bundle, {
+  foreignKey: "bundle_id",
+  as: "bundle",
+});
+
+// Transport ↔ BundleDispatch (1:N)
+Transport.hasMany(BundleDispatch, {
+  foreignKey: "transport_id",
+  as: "bundle_dispatches",
+});
+
+BundleDispatch.belongsTo(Transport, {
+  foreignKey: "transport_id",
+  as: "transport",
+});
+
+/**
+ * Polymorphic "issued to":
+ * bundle_issues.issued_to_type = SCHOOL/DISTRIBUTOR
+ * bundle_issues.issued_to_id   = schools.id or distributors.id
+ */
+
+// School → Issues (issued_to_type = SCHOOL)
+School.hasMany(BundleIssue, {
+  foreignKey: "issued_to_id",
+  constraints: false,
+  scope: { issued_to_type: "SCHOOL" },
+  as: "issued_bundles",
+});
+
+BundleIssue.belongsTo(School, {
+  foreignKey: "issued_to_id",
+  constraints: false,
+  as: "issuedSchool",
+});
+
+// Distributor → Issues (issued_to_type = DISTRIBUTOR)
+Distributor.hasMany(BundleIssue, {
+  foreignKey: "issued_to_id",
+  constraints: false,
+  scope: { issued_to_type: "DISTRIBUTOR" },
+  as: "issues",
+});
+
+BundleIssue.belongsTo(Distributor, {
+  foreignKey: "issued_to_id",
+  constraints: false,
+  as: "issuedDistributor",
+});
 
 /* ============================
          EXPORT MODELS
@@ -439,4 +525,9 @@ module.exports = {
   // ✅ Step-2 Bundles exports
   Bundle,
   BundleItem,
+
+  // ✅ NEW exports
+  Distributor,
+  BundleIssue,
+  BundleDispatch,
 };

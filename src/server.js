@@ -1,4 +1,6 @@
 // src/server.js
+"use strict";
+
 const fastifyFactory = require("fastify");
 const cors = require("@fastify/cors");
 const jwt = require("@fastify/jwt");
@@ -20,10 +22,7 @@ const buildServer = () => {
         process.env.NODE_ENV === "development"
           ? {
               target: "pino-pretty",
-              options: {
-                colorize: true,
-                translateTime: "HH:MM:ss",
-              },
+              options: { colorize: true, translateTime: "HH:MM:ss" },
             }
           : undefined,
     },
@@ -39,13 +38,13 @@ const buildServer = () => {
 
   /* ---------------- Multipart Uploads ---------------- */
   fastify.register(multipart, {
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+    limits: { fileSize: 25 * 1024 * 1024 }, // ✅ 25MB (logos/pdfs etc)
   });
 
   /* ---------------- Serve Static Uploads ---------------- */
   fastify.register(fastifyStatic, {
     root: path.join(__dirname, "../uploads"),
-    prefix: "/uploads/", // http://server/uploads/<file>
+    prefix: "/uploads/",
   });
 
   /* ---------------- JWT ---------------- */
@@ -61,20 +60,16 @@ const buildServer = () => {
   });
 
   /* ---------------- BASIC ROUTES ---------------- */
-  fastify.get("/", async () => {
-    return {
-      status: "ok",
-      service: "books-distribution-api",
-      message: "Books Distribution API is running",
-    };
-  });
+  fastify.get("/", async () => ({
+    status: "ok",
+    service: "books-distribution-api",
+    message: "Books Distribution API is running",
+  }));
 
-  fastify.get("/api/health", async () => {
-    return {
-      status: "ok",
-      service: "books-distribution-api",
-    };
-  });
+  fastify.get("/api/health", async () => ({
+    status: "ok",
+    service: "books-distribution-api",
+  }));
 
   /* ----------------------------------------------------------
      LOGO UPLOAD ROUTE
@@ -84,9 +79,7 @@ const buildServer = () => {
   fastify.post("/api/company-profile/logo-upload", async (request, reply) => {
     try {
       const file = await request.file();
-      if (!file) {
-        return reply.code(400).send({ message: "No file uploaded" });
-      }
+      if (!file) return reply.code(400).send({ message: "No file uploaded" });
 
       const uploadDir = path.join(__dirname, "../uploads/company-logos");
       await fsp.mkdir(uploadDir, { recursive: true });
@@ -104,16 +97,13 @@ const buildServer = () => {
 
       const publicPath = `/uploads/company-logos/${filename}`;
 
-      // Auto detect base URL
       const baseUrl =
         process.env.APP_BASE_URL || `${request.protocol}://${request.headers.host}`;
 
-      const logoUrl = `${baseUrl}${publicPath}`;
-
       return reply.send({
         message: "Logo uploaded successfully",
-        logo_url: logoUrl, // full URL
-        logo_path: publicPath, // optional relative path
+        logo_url: `${baseUrl}${publicPath}`,
+        logo_path: publicPath,
       });
     } catch (err) {
       request.log.error(err);
@@ -138,30 +128,54 @@ const buildServer = () => {
   fastify.register(require("./routes/transportRoutes"), {
     prefix: "/api/transports",
   });
+
   fastify.register(require("./routes/classRoutes"), { prefix: "/api/classes" });
+
   fastify.register(require("./routes/schoolRoutes"), {
     prefix: "/api/schools",
   });
+
   fastify.register(require("./routes/schoolBookRequirementRoutes"), {
     prefix: "/api/requirements",
   });
+
   fastify.register(require("./routes/publisherOrderRoutes"), {
     prefix: "/api/publisher-orders",
   });
+
   fastify.register(require("./routes/schoolOrderRoutes"), {
     prefix: "/api/school-orders",
   });
 
   // ✅ Step-2 Bundles/Kits (Reserve / Unreserve / List)
-  // routes file should define:
-  // POST /api/bundles
-  // GET  /api/bundles
-  // POST /api/bundles/:id/cancel
   fastify.register(require("./routes/bundleRoutes"), {
     prefix: "/api/bundles",
   });
 
+  // ✅ NEW: Distributors
+  // routes: GET/POST/PUT/DELETE under /api/distributors
+  fastify.register(require("./routes/distributorRoutes"), {
+    prefix: "/api/distributors",
+  });
+
+  // ✅ NEW: Bundle Issue (Issue to School/Distributor) + list issues
+  // routes:
+  // POST /api/bundle-issues/bundles/:id/issue
+  // GET  /api/bundle-issues/bundles/:id/issues
+  fastify.register(require("./routes/bundleIssueRoutes"), {
+    prefix: "/api/bundle-issues",
+  });
+
+  // ✅ NEW: Bundle Dispatch (dispatch + delivered)
+  // routes:
+  // POST /api/bundle-dispatches
+  // PATCH /api/bundle-dispatches/:id/status
+  fastify.register(require("./routes/bundleDispatchRoutes"), {
+    prefix: "/api/bundle-dispatches",
+  });
+
   fastify.register(require("./routes/stockRoutes"), { prefix: "/api/stock" });
+
   fastify.register(require("./routes/companyProfileRoutes"), {
     prefix: "/api",
   });
@@ -194,8 +208,11 @@ const start = async () => {
     await sequelize.authenticate();
     fastify.log.info("✅ Database connected");
 
-    await sequelize.sync();
-    fastify.log.info("✅ Models synced");
+    // ✅ safer sync: do NOT alter prod tables accidentally
+    // In dev you can do ALTER via migrations / manual SQL (recommended)
+    const isProd = process.env.NODE_ENV === "production";
+    await sequelize.sync({ alter: !isProd });
+    fastify.log.info(`✅ Models synced (alter=${!isProd})`);
 
     await fastify.listen({ port: config.port, host: "0.0.0.0" });
     fastify.log.info(`🚀 Server running on port ${config.port}`);

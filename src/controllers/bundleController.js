@@ -27,6 +27,7 @@ async function getAvailableMap(t) {
     raw: true,
     transaction: t,
   });
+
   const map = new Map();
   rows.forEach((r) => map.set(Number(r.book_id), num(r.available_qty)));
   return map;
@@ -59,6 +60,7 @@ async function getReservedMapForBundles(t) {
 /* =========================================================
    POST /api/bundles
    Create bundle + reserve items (NO stock deduction)
+   Body: { schoolId, academic_session, notes, items:[{book_id, qty}] }
    ========================================================= */
 exports.createBundle = async (request, reply) => {
   const body = request.body || {};
@@ -71,31 +73,19 @@ exports.createBundle = async (request, reply) => {
   if (!academic_session) return reply.code(400).send({ message: "academic_session is required" });
   if (!items.length) return reply.code(400).send({ message: "items are required" });
 
-  // sanitize items (aggregate same book_id) ✅ include free_qty
+  // ✅ sanitize items (aggregate same book_id)
   const agg = new Map();
   for (const it of items) {
     const book_id = num(it.book_id);
+    const qty = Math.max(0, num(it.qty)); // incoming still "qty" from frontend
+    if (!book_id || qty <= 0) continue;
 
-    const qty = num(it.qty);
-    const free_qty = num(it.free_qty ?? it.free ?? 0); // ✅ accept both keys
-
-    if (!book_id) continue;
-
-    // allow row if either qty or free_qty is > 0
-    if (qty <= 0 && free_qty <= 0) continue;
-
-    const prev = agg.get(book_id) || { qty: 0, free_qty: 0 };
-    agg.set(book_id, {
-      qty: prev.qty + Math.max(0, qty),
-      free_qty: prev.free_qty + Math.max(0, free_qty),
-    });
+    agg.set(book_id, (agg.get(book_id) || 0) + qty);
   }
 
-  const cleanItems = Array.from(agg.entries()).map(([book_id, v]) => ({
+  const cleanItems = Array.from(agg.entries()).map(([book_id, qty]) => ({
     book_id,
-    qty: v.qty,
-    free_qty: v.free_qty,
-    total_qty: v.qty + v.free_qty, // ✅ stock impact
+    required_qty: qty, // ✅ DB column
   }));
 
   if (!cleanItems.length) return reply.code(400).send({ message: "valid items are required" });
@@ -116,6 +106,7 @@ exports.createBundle = async (request, reply) => {
       raw: true,
       transaction: t,
     });
+
     const bookSet = new Set(books.map((b) => Number(b.id)));
     const missing = bookIds.filter((id) => !bookSet.has(Number(id)));
     if (missing.length) {
@@ -133,13 +124,12 @@ exports.createBundle = async (request, reply) => {
       const res = reservedMap.get(it.book_id) || 0;
       const free = Math.max(0, avl - res);
 
-      // ✅ check against total_qty (qty + free_qty)
-      if (free < it.total_qty) {
+      if (free < it.required_qty) {
         shortages.push({
           book_id: it.book_id,
-          requested: it.total_qty,
+          requested: it.required_qty,
           free,
-          shortBy: it.total_qty - free,
+          shortBy: it.required_qty - free,
         });
       }
     }
@@ -163,22 +153,23 @@ exports.createBundle = async (request, reply) => {
       { transaction: t }
     );
 
-    // create bundle items ✅ save free_qty
+    // create bundle items ✅ using new columns
     const bundleItemsPayload = cleanItems.map((it) => ({
       bundle_id: bundle.id,
       book_id: it.book_id,
-      qty: it.qty,
-      free_qty: it.free_qty, // ✅ IMPORTANT
+      required_qty: it.required_qty,
+      reserved_qty: it.required_qty, // ✅ reserve same as required at creation
+      issued_qty: 0,
     }));
 
     await BundleItem.bulkCreate(bundleItemsPayload, { transaction: t });
 
-    // create RESERVE txns ✅ reserve total_qty
+    // create RESERVE txns (reserve required_qty)
     const txnPayload = cleanItems.map((it) => ({
       txn_type: "RESERVE",
       book_id: it.book_id,
       batch_id: null,
-      qty: it.total_qty, // ✅ IMPORTANT
+      qty: it.required_qty,
       ref_type: "BUNDLE",
       ref_id: bundle.id,
       notes: `Reserve for bundle #${bundle.id} (school ${schoolId}, ${academic_session})`,
@@ -206,9 +197,8 @@ exports.createBundle = async (request, reply) => {
   }
 };
 
-
 /* =========================================================
-   GET /api/bundles?schoolId=&academic_session=
+   GET /api/bundles?schoolId=&academic_session=&status=
    List bundles (with items)
    ========================================================= */
 exports.listBundles = async (request, reply) => {
@@ -264,27 +254,38 @@ exports.cancelBundle = async (request, reply) => {
       await t.rollback();
       return reply.send({ message: "Already cancelled", bundleId });
     }
-    if (bundle.status === "ISSUED") {
+
+    // ✅ don’t allow cancel once issued/dispatched/delivered
+    if (["ISSUED", "DISPATCHED", "DELIVERED"].includes(bundle.status)) {
       await t.rollback();
-      return reply.code(400).send({ message: "Cannot cancel an ISSUED bundle" });
+      return reply.code(400).send({ message: `Cannot cancel a ${bundle.status} bundle` });
     }
 
     const items = (bundle.items || []).map((it) => ({
       book_id: num(it.book_id),
-      qty: num(it.qty),
+      reserved_qty: num(it.reserved_qty), // ✅ new column
     }));
 
-    if (items.length) {
-      const txnPayload = items.map((it) => ({
+    const toUnreserve = items.filter((x) => x.book_id && x.reserved_qty > 0);
+
+    if (toUnreserve.length) {
+      const txnPayload = toUnreserve.map((it) => ({
         txn_type: "UNRESERVE",
         book_id: it.book_id,
         batch_id: null,
-        qty: it.qty,
+        qty: it.reserved_qty,
         ref_type: "BUNDLE",
         ref_id: bundle.id,
         notes: `Unreserve for cancelled bundle #${bundle.id}`,
       }));
       await InventoryTxn.bulkCreate(txnPayload, { transaction: t });
+    }
+
+    // also zero reserved_qty in bundle_items (optional but clean)
+    if (bundle.items?.length) {
+      for (const it of bundle.items) {
+        await it.update({ reserved_qty: 0 }, { transaction: t });
+      }
     }
 
     await bundle.update({ status: "CANCELLED" }, { transaction: t });
