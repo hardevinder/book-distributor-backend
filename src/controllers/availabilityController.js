@@ -6,6 +6,8 @@ const {
   SchoolBookRequirement,
   School,
   Book,
+  Publisher,
+  Supplier,
   InventoryBatch,
   InventoryTxn,
   Bundle,
@@ -29,26 +31,47 @@ exports.schoolAvailability = async (request, reply) => {
     if (!school) return reply.code(404).send({ message: "School not found" });
 
     /* =========================
-       1) Requirements (school-wise)
+       1) Requirements (school-wise) - grouped
        ========================= */
     const reqWhere = { school_id: sId };
     if (academic_session) reqWhere.academic_session = String(academic_session);
 
-    const reqRows = await SchoolBookRequirement.findAll({
+    // 1a) aggregate requirement qty per book_id (RAW)
+    const reqAggRows = await SchoolBookRequirement.findAll({
       where: reqWhere,
       attributes: [
         "book_id",
         [sequelize.fn("SUM", sequelize.col("required_copies")), "required_qty"],
       ],
-      include: [
-        {
-          model: Book,
-          as: "book",
-          attributes: ["id", "title", "class_name", "subject", "code"],
-        },
-      ],
-      group: ["book_id", "book.id", "book.title", "book.class_name", "book.subject", "book.code"],
+      group: ["book_id"],
+      raw: true,
     });
+
+    const reqBookIds = reqAggRows.map((r) => Number(r.book_id)).filter(Boolean);
+
+    // 1b) fetch book details + publisher + supplier
+    const books = reqBookIds.length
+      ? await Book.findAll({
+          where: { id: { [Op.in]: reqBookIds } },
+          attributes: ["id", "title", "class_name", "subject", "code"],
+          include: [
+            {
+              model: Publisher,
+              as: "publisher",
+              attributes: ["id", "name"],
+              required: false,
+            },
+            {
+              model: Supplier,
+              as: "supplier",
+              attributes: ["id", "name"],
+              required: false,
+            },
+          ],
+        })
+      : [];
+
+    const bookMap = new Map(books.map((b) => [Number(b.id), b]));
 
     /* =========================
        2) Inventory available (global)
@@ -66,8 +89,6 @@ exports.schoolAvailability = async (request, reply) => {
 
     /* =========================
        3) Reserved
-       - Bundles reserve globally (ref_type=BUNDLE)
-       - School reserve (if you ever use it) (ref_type=SCHOOL)
        ========================= */
 
     // 3a) School reserved (optional / legacy)
@@ -112,7 +133,6 @@ exports.schoolAvailability = async (request, reply) => {
       bundleReservedRows.map((r) => [Number(r.book_id), Math.max(0, num(r.reserved_qty))])
     );
 
-    // Final reserved = bundle reserved + school reserved (keep this behavior)
     const reservedMap = new Map();
     for (const [bookId, qty] of bundleReservedMap.entries()) reservedMap.set(bookId, qty);
     for (const [bookId, qty] of schoolReservedMap.entries()) {
@@ -120,17 +140,9 @@ exports.schoolAvailability = async (request, reply) => {
     }
 
     /* =========================
-       4) Issued Qty ✅ FIX
-       We issued stock with:
-         InventoryTxn: txn_type=OUT, ref_type=BUNDLE_ISSUE, ref_id=bundle_issue.id
-
-       So to get school issued:
-       - Find bundles for this school (+ session)
-       - Find bundle issues for those bundles that are NOT cancelled
-       - Sum InventoryTxn OUT for those issue IDs
+       4) Issued Qty
        ========================= */
 
-    // 4a) bundles of this school (and session if provided)
     const bundleWhere = { school_id: sId };
     if (academic_session) bundleWhere.academic_session = String(academic_session);
 
@@ -141,19 +153,15 @@ exports.schoolAvailability = async (request, reply) => {
     });
     const bundleIds = bundleRows.map((b) => Number(b.id)).filter(Boolean);
 
-    // issuedMap final
     const issuedMap = new Map();
 
     if (bundleIds.length) {
-      // 4b) issue IDs for those bundles (exclude cancelled)
-      // NOTE: Your API response shows issue.status exists in DB.
-      // If model is missing status column, still works if DB has it, but best to add it in model.
       const issueRows = await BundleIssue.findAll({
         where: {
           bundle_id: { [Op.in]: bundleIds },
           [Op.or]: [
             { status: { [Op.ne]: "CANCELLED" } },
-            { status: { [Op.is]: null } }, // safety if old rows have null
+            { status: { [Op.is]: null } },
           ],
         },
         attributes: ["id"],
@@ -169,10 +177,7 @@ exports.schoolAvailability = async (request, reply) => {
             ref_id: { [Op.in]: issueIds },
             txn_type: "OUT",
           },
-          attributes: [
-            "book_id",
-            [sequelize.fn("SUM", sequelize.col("qty")), "issued_qty"],
-          ],
+          attributes: ["book_id", [sequelize.fn("SUM", sequelize.col("qty")), "issued_qty"]],
           group: ["book_id"],
           raw: true,
         });
@@ -183,7 +188,6 @@ exports.schoolAvailability = async (request, reply) => {
       }
     }
 
-    // 4c) OPTIONAL: if you also have direct SCHOOL OUT txns, add them too
     const schoolIssuedRows = await InventoryTxn.findAll({
       where: { ref_type: "SCHOOL", ref_id: sId, txn_type: "OUT" },
       attributes: ["book_id", [sequelize.fn("SUM", sequelize.col("qty")), "issued_qty"]],
@@ -197,23 +201,21 @@ exports.schoolAvailability = async (request, reply) => {
     }
 
     /* =========================
-       5) Build class-wise response
+       5) Build class-wise response (+ publisher/supplier)
        ========================= */
     const classMap = new Map();
 
-    for (const row of reqRows) {
-      const book = row.book;
+    for (const row of reqAggRows) {
+      const bookId = Number(row.book_id);
+      const book = bookMap.get(bookId);
       if (!book) continue;
 
-      const bookId = Number(book.id);
       const className = book.class_name || "Unknown";
-
       if (!classMap.has(className)) classMap.set(className, []);
 
       const availableQty = invMap.get(bookId) || 0;
       const reservedQty = reservedMap.get(bookId) || 0;
       const issuedQty = issuedMap.get(bookId) || 0;
-
       const freeQty = Math.max(0, availableQty - reservedQty);
 
       classMap.get(className).push({
@@ -222,11 +224,18 @@ exports.schoolAvailability = async (request, reply) => {
         subject: book.subject || null,
         code: book.code || null,
 
-        required_qty: num(row.get("required_qty")),
+        publisher: book.publisher
+          ? { id: book.publisher.id, name: book.publisher.name }
+          : null,
+
+        supplier: book.supplier
+          ? { id: book.supplier.id, name: book.supplier.name }
+          : null,
+
+        required_qty: num(row.required_qty),
         available_qty: availableQty,
         reserved_qty: reservedQty,
         issued_qty: issuedQty,
-
         free_qty: freeQty,
       });
     }
