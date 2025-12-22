@@ -18,7 +18,7 @@ module.exports = (sequelize, DataTypes) => {
       order_no: {
         type: DataTypes.STRING(50),
         allowNull: false,
-        unique: true, // e.g. PUB-2025-0001
+        // unique: true, // e.g. PUB-2025-0001
       },
 
       academic_session: {

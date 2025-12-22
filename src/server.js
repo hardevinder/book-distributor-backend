@@ -115,16 +115,37 @@ const buildServer = () => {
   fastify.register(require("./routes/authRoutes"), { prefix: "/api/auth" });
   fastify.register(require("./routes/bookRoutes"), { prefix: "/api/books" });
 
-  // Publishers CRUD (independent)
+  // Publishers CRUD (master)
   fastify.register(require("./routes/publisherRoutes"), {
     prefix: "/api/publishers",
   });
 
-  // ✅ Suppliers CRUD
+  /* =========================================================
+     ✅ Supplier-focused Ledger + Receipts (NEW)
+     ========================================================= */
+
+  // Supplier ledger & balance
+  // GET /api/suppliers/:supplierId/ledger
+  // GET /api/suppliers/:supplierId/balance
+  fastify.register(require("./routes/supplierLedgerRoutes"), {
+    prefix: "/api/suppliers",
+  });
+
+  // Supplier Receipts (Receiving / Purchase Invoices from Supplier)
+  // POST  /api/supplier-receipts
+  // GET   /api/supplier-receipts
+  // GET   /api/supplier-receipts/:id
+  // PATCH /api/supplier-receipts/:id/status
+  fastify.register(require("./routes/supplierReceiptsRoutes"), {
+    prefix: "/api/supplier-receipts",
+  });
+
+  /* ---------------- Suppliers CRUD ---------------- */
   fastify.register(require("./routes/supplierRoutes"), {
     prefix: "/api/suppliers",
   });
 
+  /* ---------------- Other Masters ---------------- */
   fastify.register(require("./routes/transportRoutes"), {
     prefix: "/api/transports",
   });
@@ -139,6 +160,7 @@ const buildServer = () => {
     prefix: "/api/requirements",
   });
 
+  /* ---------------- Orders ---------------- */
   fastify.register(require("./routes/publisherOrderRoutes"), {
     prefix: "/api/publisher-orders",
   });
@@ -147,33 +169,29 @@ const buildServer = () => {
     prefix: "/api/school-orders",
   });
 
+  /* ---------------- Module-2 ---------------- */
+
   // ✅ Step-2 Bundles/Kits (Reserve / Unreserve / List)
   fastify.register(require("./routes/bundleRoutes"), {
     prefix: "/api/bundles",
   });
 
-  // ✅ NEW: Distributors
-  // routes: GET/POST/PUT/DELETE under /api/distributors
+  // ✅ Distributors
   fastify.register(require("./routes/distributorRoutes"), {
     prefix: "/api/distributors",
   });
 
-  // ✅ NEW: Bundle Issue (Issue to School/Distributor) + list issues
-  // routes:
-  // POST /api/bundle-issues/bundles/:id/issue
-  // GET  /api/bundle-issues/bundles/:id/issues
+  // ✅ Bundle Issue
   fastify.register(require("./routes/bundleIssueRoutes"), {
     prefix: "/api/bundle-issues",
   });
 
-  // ✅ NEW: Bundle Dispatch (dispatch + delivered)
-  // routes:
-  // POST /api/bundle-dispatches
-  // PATCH /api/bundle-dispatches/:id/status
+  // ✅ Bundle Dispatch
   fastify.register(require("./routes/bundleDispatchRoutes"), {
     prefix: "/api/bundle-dispatches",
   });
 
+  /* ---------------- Stock / Profile ---------------- */
   fastify.register(require("./routes/stockRoutes"), { prefix: "/api/stock" });
 
   fastify.register(require("./routes/companyProfileRoutes"), {
@@ -209,7 +227,6 @@ const start = async () => {
     fastify.log.info("✅ Database connected");
 
     // ✅ safer sync: do NOT alter prod tables accidentally
-    // In dev you can do ALTER via migrations / manual SQL (recommended)
     const isProd = process.env.NODE_ENV === "production";
     await sequelize.sync({ alter: !isProd });
     fastify.log.info(`✅ Models synced (alter=${!isProd})`);

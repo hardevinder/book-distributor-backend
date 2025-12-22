@@ -7,6 +7,8 @@ const http = require("http");
 const https = require("https");
 const PDFDocument = require("pdfkit");
 
+const { Op } = require("sequelize");
+
 const {
   SchoolBookRequirement,
   Book,
@@ -19,6 +21,10 @@ const {
   CompanyProfile,
   Transport,
 
+  // ✅ Option A: Supplier Receipt (auto-create on receive)
+  SupplierReceipt,
+  SupplierReceiptItem,
+
   // ✅ Module-2 inventory
   InventoryBatch,
   InventoryTxn,
@@ -27,11 +33,33 @@ const {
 } = require("../models");
 
 const { sendMail } = require("../config/email");
-const { Op, Sequelize } = require("sequelize");
 
 /* ============================================
  * Helpers
  * ============================================ */
+
+const num = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+const num2 = (v) => {
+  const n = num(v);
+  return n;
+};
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+
+const toNullIfEmpty = (v) => {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s ? s : null;
+};
+
+// ✅ Receipt status (must match SupplierReceipt model ENUM)
+const RECEIPT_STATUS = Object.freeze({
+  DRAFT: "draft",
+  RECEIVED: "received",
+  CANCELLED: "cancelled",
+});
 
 // ✅ SUPER SHORT order no (ONLY code)
 function generateOrderNo() {
@@ -76,6 +104,83 @@ function buildItemsSignatureFromOrderItems(orderItems = []) {
     .map((it) => `${Number(it.book_id)}:${Number(it.total_order_qty) || 0}`)
     .sort();
   return pairs.join("|");
+}
+
+/* ============================================================
+ * ✅ Option A: Supplier Receipt helpers
+ * - Auto-create receipt when receiving
+ * ============================================================ */
+
+function makeSupplierReceiptNo() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const suf = Math.random()
+    .toString(36)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6);
+  return `SR-${y}${m}-${suf}`;
+}
+
+/**
+ * Creates (or reuses) ONE receipt per order.
+ * Also links back to SchoolOrder.supplier_receipt_id + supplier_receipt_no + received_at
+ *
+ * NOTE: column names must match your models:
+ * SupplierReceipt: supplier_id, school_order_id, receipt_no, receipt_date, status
+ */
+async function getOrCreateSupplierReceiptForOrder({ order, t }) {
+  if (!SupplierReceipt) return null;
+
+  // already linked?
+  if (order.supplier_receipt_id) {
+    const existing = await SupplierReceipt.findByPk(order.supplier_receipt_id, {
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+    if (existing) return existing;
+  }
+
+  // safety: find by school_order_id
+  const found = await SupplierReceipt.findOne({
+    where: { school_order_id: order.id },
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+  if (found) {
+    // link back if missing
+    try {
+      if (!order.supplier_receipt_id) order.supplier_receipt_id = found.id;
+      if (!order.supplier_receipt_no) order.supplier_receipt_no = found.receipt_no || null;
+      if (!order.received_at) order.received_at = new Date();
+      await order.save({ transaction: t });
+    } catch {}
+    return found;
+  }
+
+  const receiptNo = makeSupplierReceiptNo();
+
+  const receipt = await SupplierReceipt.create(
+    {
+      supplier_id: order.supplier_id,
+      school_order_id: order.id,
+      receipt_no: receiptNo,
+      receipt_date: new Date(),
+
+      // ✅ FIX: must match ENUM('draft','received','cancelled')
+      status: RECEIPT_STATUS.DRAFT,
+    },
+    { transaction: t }
+  );
+
+  // link back to order
+  order.supplier_receipt_id = receipt.id;
+  order.supplier_receipt_no = receipt.receipt_no || receiptNo;
+  if (!order.received_at) order.received_at = new Date();
+  await order.save({ transaction: t });
+
+  return receipt;
 }
 
 /* ============================================================
@@ -164,14 +269,8 @@ async function recomputeOrderStatus(order, t) {
     return fresh;
   }
 
-  const totalOrdered = items.reduce(
-    (sum, it) => sum + (Number(it.total_order_qty) || 0),
-    0
-  );
-  const totalReceived = items.reduce(
-    (sum, it) => sum + (Number(it.received_qty) || 0),
-    0
-  );
+  const totalOrdered = items.reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
+  const totalReceived = items.reduce((sum, it) => sum + (Number(it.received_qty) || 0), 0);
 
   if (fresh.status === "cancelled") return fresh;
 
@@ -185,6 +284,57 @@ async function recomputeOrderStatus(order, t) {
 
   await fresh.save({ transaction: t });
   return fresh;
+}
+
+/* ============================================
+ * Pricing helpers
+ * ============================================ */
+function computeLinePricing({ qtyReceived, unitPrice, discountPct, discountAmt }) {
+  const up = clamp(num2(unitPrice), 0, 999999999);
+  const q = clamp(num(qtyReceived), 0, 999999999);
+  const dp = clamp(num2(discountPct), 0, 100);
+
+  // if discount_amt is provided use it; else compute from pct
+  let da = num2(discountAmt);
+  if (!Number.isFinite(da) || da < 0) da = 0;
+
+  const pctAmt = (up * dp) / 100;
+  if (!da && dp > 0) da = pctAmt;
+
+  // net unit price cannot be negative
+  const net = Math.max(up - da, 0);
+  const line = net * q;
+
+  return {
+    unit_price: up,
+    discount_pct: dp,
+    discount_amt: da,
+    net_unit_price: net,
+    line_amount: line,
+  };
+}
+
+function computeOrderTotals({ items = [], charges = {} }) {
+  const itemsTotal = (items || []).reduce((sum, it) => sum + num2(it.line_amount), 0);
+
+  const freight = num2(charges.freight_charges);
+  const packing = num2(charges.packing_charges);
+  const other = num2(charges.other_charges);
+  const overall = num2(charges.overall_discount);
+  const roundOff = num2(charges.round_off);
+
+  const sub = itemsTotal + freight + packing + other;
+  const grand = sub - overall + roundOff;
+
+  return {
+    items_total: itemsTotal,
+    freight_charges: freight,
+    packing_charges: packing,
+    other_charges: other,
+    overall_discount: overall,
+    round_off: roundOff,
+    grand_total: grand,
+  };
 }
 
 /* ============================================
@@ -305,9 +455,7 @@ exports.generateOrdersForSession = async (request, reply) => {
       if (!qty || qty <= 0) continue;
 
       // supplier_id is on requirement table
-      const supplierId =
-        Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
-
+      const supplierId = Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
       if (!supplierId) continue;
 
       if (!mapBySchool.has(schoolId)) mapBySchool.set(schoolId, new Map());
@@ -383,6 +531,14 @@ exports.generateOrdersForSession = async (request, reply) => {
             academic_session: session,
             order_date: new Date(),
             status: "draft",
+
+            // totals/charges defaults
+            freight_charges: 0,
+            packing_charges: 0,
+            other_charges: 0,
+            overall_discount: 0,
+            round_off: 0,
+            grand_total: 0,
           },
           { transaction: t }
         );
@@ -400,7 +556,15 @@ exports.generateOrdersForSession = async (request, reply) => {
               book_id: bookId,
               total_order_qty: q,
               received_qty: 0,
+
+              // commercial
               unit_price: null,
+              discount_pct: null,
+              discount_amt: null,
+              net_unit_price: null,
+              line_amount: null,
+
+              // legacy
               total_amount: null,
             },
             { transaction: t }
@@ -424,6 +588,7 @@ exports.generateOrdersForSession = async (request, reply) => {
           await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
         }
 
+        // (kept as-is)
         if (requirementIdsToUpdate.size > 0) {
           await SchoolBookRequirement.update(
             { status: "confirmed" },
@@ -465,14 +630,8 @@ exports.generateOrdersForSession = async (request, reply) => {
  * ============================================ */
 exports.updateSchoolOrderMeta = async (request, reply) => {
   const { orderId } = request.params;
-  const {
-    transport_id,
-    transport_through,
-    transport_id_2,
-    transport_through_2,
-    notes,
-    remarks,
-  } = request.body || {};
+  const { transport_id, transport_through, transport_id_2, transport_through_2, notes, remarks } =
+    request.body || {};
 
   try {
     const order = await SchoolOrder.findOne({ where: { id: orderId } });
@@ -485,14 +644,11 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
 
     if (typeof transport_through !== "undefined") {
       order.transport_through =
-        transport_through === null || transport_through === ""
-          ? null
-          : String(transport_through).trim();
+        transport_through === null || transport_through === "" ? null : String(transport_through).trim();
     }
 
     if ("transport_id_2" in order && typeof transport_id_2 !== "undefined") {
-      const tidNum2 =
-        transport_id_2 === null || transport_id_2 === "" ? null : Number(transport_id_2);
+      const tidNum2 = transport_id_2 === null || transport_id_2 === "" ? null : Number(transport_id_2);
       order.transport_id_2 = Number.isNaN(tidNum2) ? null : tidNum2;
     }
 
@@ -595,18 +751,28 @@ exports.updateSchoolOrderNo = async (request, reply) => {
 
 /* ============================================
  * POST /api/school-orders/:orderId/receive
+ *
+ * ✅ No duplicate saving:
+ * - If frontend sends same request again => delta becomes 0 => no InventoryTxn created.
+ * - If items array contains duplicate item_id rows in SAME request => we normalize (one per item_id).
+ *
  * ✅ ALSO pushes Inventory (delta-based)
  * ✅ BLOCK decrease (delta < 0)
  * ✅ IF cancelled => no inventory add
+ *
+ * ✅ NEW:
+ * - saves item commercial fields (unit_price/discount/net/line)
+ * - saves order charges (freight/packing/other/overall_discount/round_off/grand_total)
+ * - ✅ Option A: auto-create SupplierReceipt + SupplierReceiptItems
  * ============================================ */
 exports.receiveOrderItems = async (request, reply) => {
   const { orderId } = request.params;
-  const { items, status = "auto" } = request.body || {};
+
+  // accept charges in payload
+  const { items, status = "auto", charges } = request.body || {};
 
   if (!items || !Array.isArray(items) || !items.length) {
-    return reply
-      .code(400)
-      .send({ error: "ValidationError", message: "items array is required." });
+    return reply.code(400).send({ error: "ValidationError", message: "items array is required." });
   }
 
   const isCancelled = status === "cancelled";
@@ -625,20 +791,42 @@ exports.receiveOrderItems = async (request, reply) => {
       return reply.code(404).send({ message: "School order not found." });
     }
 
-    // ✅ Safety: supplier_id must exist for inventory
+    // ✅ Safety: supplier_id must exist for inventory + receipt
     if (!order.supplier_id) {
       await t.rollback();
       return reply.code(400).send({
         error: "ValidationError",
-        message: "Order supplier_id missing. Cannot push inventory.",
+        message: "Order supplier_id missing. Cannot receive.",
       });
     }
+
+    // ✅ Option A: Auto-create/attach SupplierReceipt when receiving (not cancelled)
+    let supplierReceipt = null;
+    if (!isCancelled) {
+      supplierReceipt = await getOrCreateSupplierReceiptForOrder({ order, t });
+    }
+
+    // ✅ Normalize payload to avoid duplicate item_id rows in same request
+    // strategy: keep the last row per item_id (usually latest typed values)
+    const normalizedMap = new Map();
+    for (const row of items) {
+      const itemId = Number(row?.item_id || 0);
+      if (!itemId) continue;
+      normalizedMap.set(itemId, row);
+    }
+    const normalizedItems = Array.from(normalizedMap.entries()).map(([item_id, row]) => ({
+      ...row,
+      item_id,
+    }));
 
     const itemById = new Map();
     for (const it of order.items || []) itemById.set(it.id, it);
 
-    for (const row of items) {
-      const itemId = row.item_id;
+    // Track updated items for totals
+    const updatedItemsForTotals = [];
+
+    for (const row of normalizedItems) {
+      const itemId = Number(row.item_id || 0);
       let newReceived = Number(row.received_qty ?? 0);
 
       if (!itemId || Number.isNaN(newReceived) || newReceived < 0) continue;
@@ -647,7 +835,7 @@ exports.receiveOrderItems = async (request, reply) => {
       if (!item) continue;
 
       const ordered = Number(item.total_order_qty) || 0;
-      if (newReceived > ordered) newReceived = ordered;
+      newReceived = clamp(newReceived, 0, ordered);
 
       const oldReceived = Number(item.received_qty || 0);
       const delta = newReceived - oldReceived;
@@ -659,12 +847,72 @@ exports.receiveOrderItems = async (request, reply) => {
         );
       }
 
-      // Save the new received qty
+      // If no change, still allow price updates (optional) but DO NOT create inventory txn
+      const pricing = computeLinePricing({
+        qtyReceived: newReceived,
+        unitPrice: row.unit_price ?? row.rate ?? item.unit_price ?? null,
+        discountPct: row.discount_pct ?? row.discountPercent ?? item.discount_pct ?? null,
+        discountAmt: row.discount_amt ?? row.discountAmount ?? item.discount_amt ?? null,
+      });
+
       item.received_qty = newReceived;
+
+      item.unit_price = pricing.unit_price;
+      if ("discount_pct" in item) item.discount_pct = pricing.discount_pct;
+      if ("discount_amt" in item) item.discount_amt = pricing.discount_amt;
+      if ("net_unit_price" in item) item.net_unit_price = pricing.net_unit_price;
+      if ("line_amount" in item) item.line_amount = pricing.line_amount;
+
+      // legacy field (keep in sync if exists)
+      if ("total_amount" in item) item.total_amount = pricing.line_amount;
+
       await item.save({ transaction: t });
+
+      updatedItemsForTotals.push(item);
+
+      // ✅ Option A: Upsert SupplierReceiptItem (idempotent)
+      if (!isCancelled && supplierReceipt && SupplierReceiptItem) {
+        const [rItem, created] = await SupplierReceiptItem.findOrCreate({
+          where: {
+            supplier_receipt_id: supplierReceipt.id,
+            book_id: item.book_id,
+          },
+          defaults: {
+            supplier_receipt_id: supplierReceipt.id,
+            book_id: item.book_id,
+
+            ordered_qty: ordered,
+            received_qty: newReceived,
+
+            // pricing snapshot (if columns exist)
+            unit_price: item.unit_price ?? null,
+            discount_pct: item.discount_pct ?? null,
+            discount_amt: item.discount_amt ?? null,
+            net_unit_price: item.net_unit_price ?? null,
+            line_amount: item.line_amount ?? null,
+          },
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+
+        if (!created) {
+          rItem.ordered_qty = ordered;
+          rItem.received_qty = newReceived;
+
+          if ("unit_price" in rItem) rItem.unit_price = item.unit_price ?? rItem.unit_price ?? null;
+          if ("discount_pct" in rItem) rItem.discount_pct = item.discount_pct ?? rItem.discount_pct ?? null;
+          if ("discount_amt" in rItem) rItem.discount_amt = item.discount_amt ?? rItem.discount_amt ?? null;
+          if ("net_unit_price" in rItem)
+            rItem.net_unit_price = item.net_unit_price ?? rItem.net_unit_price ?? null;
+          if ("line_amount" in rItem) rItem.line_amount = item.line_amount ?? rItem.line_amount ?? null;
+
+          await rItem.save({ transaction: t });
+        }
+      }
 
       // ✅ If cancelled => do not add inventory
       if (!isCancelled && delta > 0) {
+        // Find a stable batch per order+item+book+supplier (idempotent)
         let batch = await InventoryBatch.findOne({
           where: {
             school_order_id: order.id,
@@ -683,19 +931,38 @@ exports.receiveOrderItems = async (request, reply) => {
               supplier_id: order.supplier_id,
               school_order_id: order.id,
               school_order_item_id: item.id,
-              purchase_price: item.unit_price || null,
+
+              // ✅ Use net_unit_price if available else unit_price
+              purchase_price:
+                item.net_unit_price != null
+                  ? item.net_unit_price
+                  : item.unit_price != null
+                  ? item.unit_price
+                  : null,
+
               received_qty: 0,
               available_qty: 0,
             },
             { transaction: t }
           );
+        } else {
+          // keep latest purchase price (optional)
+          try {
+            const pp =
+              item.net_unit_price != null
+                ? item.net_unit_price
+                : item.unit_price != null
+                ? item.unit_price
+                : null;
+            if (pp != null) batch.purchase_price = pp;
+          } catch {}
         }
 
         batch.received_qty = Number(batch.received_qty || 0) + delta;
         batch.available_qty = Number(batch.available_qty || 0) + delta;
         await batch.save({ transaction: t });
 
-        // ✅ delta-based IN txn
+        // ✅ delta-based IN txn (idempotent by design due to delta)
         await InventoryTxn.create(
           {
             txn_type: "IN",
@@ -711,11 +978,56 @@ exports.receiveOrderItems = async (request, reply) => {
       }
     }
 
+    // --- save order-level charges/totals (only when not cancelled) ---
+    if (!isCancelled) {
+      const totals = computeOrderTotals({
+        items: updatedItemsForTotals.length ? updatedItemsForTotals : order.items || [],
+        charges: charges || {},
+      });
+
+      if ("freight_charges" in order) order.freight_charges = totals.freight_charges;
+      if ("packing_charges" in order) order.packing_charges = totals.packing_charges;
+      if ("other_charges" in order) order.other_charges = totals.other_charges;
+      if ("overall_discount" in order) order.overall_discount = totals.overall_discount;
+      if ("round_off" in order) order.round_off = totals.round_off;
+      if ("grand_total" in order) order.grand_total = totals.grand_total;
+
+      // stamp received_at once
+      if ("received_at" in order && !order.received_at) order.received_at = new Date();
+
+      await order.save({ transaction: t });
+    }
+
     if (isCancelled) {
       order.status = "cancelled";
       await order.save({ transaction: t });
+
+      // optional: cancel receipt too (only if it exists)
+      if (supplierReceipt && "status" in supplierReceipt) {
+        supplierReceipt.status = RECEIPT_STATUS.CANCELLED;
+        await supplierReceipt.save({ transaction: t });
+      }
     } else {
       await recomputeOrderStatus(order, t);
+    }
+
+    // ✅ Option A: update receipt totals/status
+    if (!isCancelled && supplierReceipt && SupplierReceiptItem) {
+      const rItems = await SupplierReceiptItem.findAll({
+        where: { supplier_receipt_id: supplierReceipt.id },
+        transaction: t,
+      });
+
+      const itemsTotal = rItems.reduce((s, x) => s + num2(x.line_amount), 0);
+
+      // NOTE: model has sub_total + grand_total (not items_total)
+      if ("sub_total" in supplierReceipt) supplierReceipt.sub_total = itemsTotal;
+      if ("grand_total" in supplierReceipt) supplierReceipt.grand_total = itemsTotal;
+
+      // ✅ FIX: must match ENUM('draft','received','cancelled')
+      if ("status" in supplierReceipt) supplierReceipt.status = RECEIPT_STATUS.RECEIVED;
+
+      await supplierReceipt.save({ transaction: t });
     }
 
     const updated = await SchoolOrder.findOne({
@@ -748,7 +1060,16 @@ exports.receiveOrderItems = async (request, reply) => {
         pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
       })) || [];
 
-    return reply.code(200).send({ message: "Order items updated successfully.", order: plain });
+    // include receipt info in response (handy for frontend)
+    if (supplierReceipt) {
+      plain.supplier_receipt_id = supplierReceipt.id;
+      plain.supplier_receipt_no = supplierReceipt.receipt_no || plain.supplier_receipt_no || null;
+    }
+
+    return reply.code(200).send({
+      message: "Order items updated successfully.",
+      order: plain,
+    });
   } catch (err) {
     try {
       if (!t.finished) await t.rollback();
@@ -791,9 +1112,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
 
     if (!pendingItems.length) {
       await t.rollback();
-      return reply
-        .code(400)
-        .send({ message: "No pending quantity found to re-order for this order." });
+      return reply.code(400).send({ message: "No pending quantity found to re-order for this order." });
     }
 
     const newOrderNo = await generateUniqueOrderNo(t);
@@ -807,6 +1126,13 @@ exports.reorderPendingForOrder = async (request, reply) => {
         order_date: new Date(),
         status: "draft",
         remarks: `Re-order for pending quantity of ${sourceOrder.order_no}`,
+
+        freight_charges: 0,
+        packing_charges: 0,
+        other_charges: 0,
+        overall_discount: 0,
+        round_off: 0,
+        grand_total: 0,
       },
       { transaction: t }
     );
@@ -818,7 +1144,13 @@ exports.reorderPendingForOrder = async (request, reply) => {
           book_id: row.book_id,
           total_order_qty: row.pending_qty,
           received_qty: 0,
+
           unit_price: null,
+          discount_pct: null,
+          discount_amt: null,
+          net_unit_price: null,
+          line_amount: null,
+
           total_amount: null,
         },
         { transaction: t }
@@ -1035,8 +1367,7 @@ function buildSchoolOrderPdfBuffer({
       const lines = [];
       if (companyProfile.name)
         lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
-      if (addrParts.length)
-        lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
+      if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
 
       const contactParts = [];
       if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
@@ -1164,17 +1495,16 @@ function buildSchoolOrderPdfBuffer({
 
     /* ---------- Table (NO publisher) — FIXED WIDE OR/RC/PD ---------- */
     const W = {
-        sr: 26,
-        title: 0,     // auto
-        subject: 70,  // thoda kam
-        ord: 85,      // ✅ zyada
-        rec: 85,      // ✅ zyada
-        pend: 85,     // ✅ zyada
-      };
+      sr: 26,
+      title: 0, // auto
+      subject: 70,
+      ord: 85,
+      rec: 85,
+      pend: 85,
+    };
 
     W.title = contentWidth - (W.sr + W.subject + W.ord + W.rec + W.pend);
 
-    // Safety: if margins/font make it too tight, shrink subject a bit
     if (W.title < 140) {
       const need = 140 - W.title;
       W.subject = Math.max(60, W.subject - need);
@@ -1190,6 +1520,13 @@ function buildSchoolOrderPdfBuffer({
       pend: pageLeft + W.sr + W.title + W.subject + W.ord + W.rec,
     };
 
+    const drawHR2 = () => {
+      doc.save();
+      doc.lineWidth(0.6);
+      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+      doc.restore();
+    };
+
     const printTableHeader = () => {
       const y = doc.y;
 
@@ -1202,34 +1539,13 @@ function buildSchoolOrderPdfBuffer({
       doc.text("Book Title", X.title, y, { width: W.title });
       doc.text("Subject", X.subject, y, { width: W.subject });
 
-    // ✅ numeric column HEADINGS – CENTER aligned
       doc.font("Helvetica-Bold").fontSize(10);
-
-      doc.text("Ordered", X.ord, y - 1, {
-        width: W.ord,
-        align: "center",
-        lineBreak: false,
-        height: 14,
-      });
-
-      doc.text("Received", X.rec, y - 1, {
-        width: W.rec,
-        align: "center",
-        lineBreak: false,
-        height: 14,
-      });
-
-      doc.text("Pending", X.pend, y - 1, {
-        width: W.pend,
-        align: "center",
-        lineBreak: false,
-        height: 14,
-      });
-
-
+      doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false, height: 14 });
+      doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false, height: 14 });
+      doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false, height: 14 });
 
       doc.moveDown(1.1);
-      drawHR();
+      drawHR2();
       doc.moveDown(0.25);
     };
 
@@ -1267,26 +1583,10 @@ function buildSchoolOrderPdfBuffer({
         doc.text(cells.title, X.title, y, { width: W.title });
         doc.text(cells.subject, X.subject, y, { width: W.subject });
 
-        // ✅ bold + CENTER aligned values
         doc.font("Helvetica-Bold").fontSize(10);
-        doc.text(String(orderedQty), X.ord, y - 1, {
-          width: W.ord,
-          align: "center",
-          lineBreak: false,
-        });
-
-        doc.text(String(receivedQty), X.rec, y - 1, {
-          width: W.rec,
-          align: "center",
-          lineBreak: false,
-        });
-
-        doc.text(String(pendingQty), X.pend, y - 1, {
-          width: W.pend,
-          align: "center",
-          lineBreak: false,
-        });
-
+        doc.text(String(orderedQty), X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
+        doc.text(String(receivedQty), X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
+        doc.text(String(pendingQty), X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
 
         doc.y = y + rh - 3;
         sr++;
@@ -1332,7 +1632,7 @@ function buildSchoolOrderPdfBuffer({
       ensureSpaceWithHeader(approxH, printTableHeader);
 
       doc.moveDown(0.4);
-      drawHR();
+      drawHR2();
       doc.moveDown(0.25);
 
       doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
@@ -1420,7 +1720,10 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     const companyProfile = await CompanyProfile.findOne({
       where: { is_active: true },
-      order: [["is_default", "DESC"], ["id", "ASC"]],
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
     });
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
@@ -1466,7 +1769,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       </p>
 
       <h3>Quick Info</h3>
-      <div><strong>Order No:</strong> ${order.order_no || order.id}</div>     
+      <div><strong>Order No:</strong> ${order.order_no || order.id}</div>
       <div><strong>Order Date:</strong> ${orderDate}</div>
 
       <p style="margin-top:16px;">
@@ -1560,7 +1863,10 @@ exports.printOrderPdf = async (request, reply) => {
 
     const companyProfile = await CompanyProfile.findOne({
       where: { is_active: true },
-      order: [["is_default", "DESC"], ["id", "ASC"]],
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
     });
 
     if (!order) {
@@ -1578,7 +1884,12 @@ exports.printOrderPdf = async (request, reply) => {
     const supplierPhone = supplier?.phone || "";
     const supplierEmail = supplier?.email || "";
 
-    const toParty = { name: supplierName, address: supplierAddress, phone: supplierPhone, email: supplierEmail };
+    const toParty = {
+      name: supplierName,
+      address: supplierAddress,
+      phone: supplierPhone,
+      email: supplierEmail,
+    };
 
     const orderForPdf = order.toJSON();
     orderForPdf.transport = order.transport ? order.transport.toJSON?.() || order.transport : null;

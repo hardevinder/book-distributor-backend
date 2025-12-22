@@ -32,12 +32,29 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
       },
 
+      // 🔥 COMMERCIAL FIELDS (RECEIVE TIME)
+
       unit_price: {
         type: DataTypes.DECIMAL(10, 2),
         allowNull: true,
       },
 
-      total_amount: {
+      discount_pct: {
+        type: DataTypes.DECIMAL(5, 2),
+        allowNull: true,
+      },
+
+      discount_amt: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+      },
+
+      net_unit_price: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+      },
+
+      line_amount: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: true,
       },
@@ -59,7 +76,6 @@ module.exports = (sequelize, DataTypes) => {
       as: "book",
     });
 
-    // 🔹 new link table specific to school orders
     SchoolOrderItem.hasMany(models.SchoolRequirementOrderLink, {
       foreignKey: "school_order_item_id",
       as: "requirement_links",
