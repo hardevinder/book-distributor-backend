@@ -25,6 +25,9 @@ const {
   SupplierReceipt,
   SupplierReceiptItem,
 
+  // ✅ Supplier Ledger
+  SupplierLedgerTxn,
+
   // ✅ Module-2 inventory
   InventoryBatch,
   InventoryTxn,
@@ -455,7 +458,8 @@ exports.generateOrdersForSession = async (request, reply) => {
       if (!qty || qty <= 0) continue;
 
       // supplier_id is on requirement table
-      const supplierId = Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
+      const supplierId =
+        Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
       if (!supplierId) continue;
 
       if (!mapBySchool.has(schoolId)) mapBySchool.set(schoolId, new Map());
@@ -764,6 +768,7 @@ exports.updateSchoolOrderNo = async (request, reply) => {
  * - saves item commercial fields (unit_price/discount/net/line)
  * - saves order charges (freight/packing/other/overall_discount/round_off/grand_total)
  * - ✅ Option A: auto-create SupplierReceipt + SupplierReceiptItems
+ * - ✅ NEW: SupplierLedgerTxn posting on RECEIVED (idempotent) + delete on CANCELLED
  * ============================================ */
 exports.receiveOrderItems = async (request, reply) => {
   const { orderId } = request.params;
@@ -791,7 +796,7 @@ exports.receiveOrderItems = async (request, reply) => {
       return reply.code(404).send({ message: "School order not found." });
     }
 
-    // ✅ Safety: supplier_id must exist for inventory + receipt
+    // ✅ Safety: supplier_id must exist for inventory + receipt + ledger
     if (!order.supplier_id) {
       await t.rollback();
       return reply.code(400).send({
@@ -800,10 +805,26 @@ exports.receiveOrderItems = async (request, reply) => {
       });
     }
 
-    // ✅ Option A: Auto-create/attach SupplierReceipt when receiving (not cancelled)
+    // ✅ Load/attach receipt:
+    // - If NOT cancelled => create/attach
+    // - If cancelled => try to load existing (so we can cancel + delete ledger)
     let supplierReceipt = null;
     if (!isCancelled) {
       supplierReceipt = await getOrCreateSupplierReceiptForOrder({ order, t });
+    } else if (SupplierReceipt) {
+      if (order.supplier_receipt_id) {
+        supplierReceipt = await SupplierReceipt.findByPk(order.supplier_receipt_id, {
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+      }
+      if (!supplierReceipt) {
+        supplierReceipt = await SupplierReceipt.findOne({
+          where: { school_order_id: order.id },
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        });
+      }
     }
 
     // ✅ Normalize payload to avoid duplicate item_id rows in same request
@@ -1007,11 +1028,24 @@ exports.receiveOrderItems = async (request, reply) => {
         supplierReceipt.status = RECEIPT_STATUS.CANCELLED;
         await supplierReceipt.save({ transaction: t });
       }
+
+      // ✅ NEW: remove ledger posting for this receipt (if any)
+      if (supplierReceipt && SupplierLedgerTxn) {
+        await SupplierLedgerTxn.destroy({
+          where: {
+            supplier_id: order.supplier_id,
+            txn_type: "PURCHASE_RECEIVE",
+            ref_table: "supplier_receipts",
+            ref_id: supplierReceipt.id,
+          },
+          transaction: t,
+        });
+      }
     } else {
       await recomputeOrderStatus(order, t);
     }
 
-    // ✅ Option A: update receipt totals/status
+    // ✅ Option A: update receipt totals/status + ✅ NEW: LEDGER POSTING
     if (!isCancelled && supplierReceipt && SupplierReceiptItem) {
       const rItems = await SupplierReceiptItem.findAll({
         where: { supplier_receipt_id: supplierReceipt.id },
@@ -1028,6 +1062,42 @@ exports.receiveOrderItems = async (request, reply) => {
       if ("status" in supplierReceipt) supplierReceipt.status = RECEIPT_STATUS.RECEIVED;
 
       await supplierReceipt.save({ transaction: t });
+
+      // ✅ NEW: Ledger posting (idempotent + update-safe)
+      if (SupplierLedgerTxn) {
+        const txnDate =
+          supplierReceipt.receipt_date ||
+          supplierReceipt.received_date ||
+          supplierReceipt.invoice_date ||
+          order.received_at ||
+          new Date();
+
+        // delete then create => safe if amount/date changed
+        await SupplierLedgerTxn.destroy({
+          where: {
+            supplier_id: order.supplier_id,
+            txn_type: "PURCHASE_RECEIVE",
+            ref_table: "supplier_receipts",
+            ref_id: supplierReceipt.id,
+          },
+          transaction: t,
+        });
+
+        await SupplierLedgerTxn.create(
+          {
+            supplier_id: order.supplier_id,
+            txn_date: txnDate,
+            txn_type: "PURCHASE_RECEIVE",
+            ref_table: "supplier_receipts",
+            ref_id: supplierReceipt.id,
+            ref_no: supplierReceipt.receipt_no || order.supplier_receipt_no || null,
+            debit: num2(supplierReceipt.grand_total),
+            credit: 0,
+            narration: `Purchase received against Order ${order.order_no || order.id}`,
+          },
+          { transaction: t }
+        );
+      }
     }
 
     const updated = await SchoolOrder.findOne({
@@ -1167,8 +1237,7 @@ exports.reorderPendingForOrder = async (request, reply) => {
           as: "items",
           include: [
             {
-              model: Book,
-              as: "book",
+              model: Book, as: "book",
               include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
             },
           ],

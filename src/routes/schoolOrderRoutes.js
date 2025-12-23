@@ -1,4 +1,5 @@
 // src/routes/schoolOrderRoutes.js
+"use strict";
 
 const schoolOrderController = require("../controllers/schoolOrderController");
 const availabilityController = require("../controllers/availabilityController");
@@ -8,6 +9,7 @@ module.exports = async function (fastify, opts) {
   fastify.addHook("onRequest", fastify.authenticate);
 
   // ✅ STATIC ROUTES FIRST (avoid conflict with /:orderId)
+
   // GET /api/school-orders
   fastify.get("/", schoolOrderController.listSchoolOrders);
 
@@ -15,9 +17,8 @@ module.exports = async function (fastify, opts) {
   fastify.post("/generate", schoolOrderController.generateOrdersForSession);
 
   /**
-   * ✅ NEW (Today): School → Class → Book availability (Requirement vs Global Stock)
+   * ✅ School → Class → Book availability
    * GET /api/school-orders/availability?schoolId=&academic_session=
-   * (future-proof fields reserved_qty/issued_qty come as 0)
    */
   fastify.get("/availability", availabilityController.schoolAvailability);
 
@@ -41,8 +42,16 @@ module.exports = async function (fastify, opts) {
   );
 
   // POST /api/school-orders/:orderId/send-email
-  fastify.post("/:orderId/send-email", schoolOrderController.sendOrderEmailForOrder);
+  fastify.post(
+    "/:orderId/send-email",
+    schoolOrderController.sendOrderEmailForOrder
+  );
 
   // GET /api/school-orders/:orderId/pdf
   fastify.get("/:orderId/pdf", schoolOrderController.printOrderPdf);
+
+  /**
+   * ✅ OPTIONAL (if you later add receipt PDF endpoint in schoolOrderController)
+   * fastify.get("/:orderId/receipt-pdf", schoolOrderController.printSupplierReceiptPdf);
+   */
 };

@@ -121,17 +121,33 @@ const buildServer = () => {
   });
 
   /* =========================================================
-     ✅ Supplier-focused Ledger + Receipts (NEW)
+     ✅ Supplier-focused (Ledger + Receipts + Payments)
      ========================================================= */
 
-  // Supplier ledger & balance
+  /**
+   * IMPORTANT:
+   * Keep these BEFORE supplierRoutes if your supplierRoutes has param routes like "/:id"
+   * so that "/:supplierId/ledger" etc doesn't get hijacked by "/:id"
+   */
+
+  // ✅ Supplier ledger & balance
   // GET /api/suppliers/:supplierId/ledger
   // GET /api/suppliers/:supplierId/balance
   fastify.register(require("./routes/supplierLedgerRoutes"), {
     prefix: "/api/suppliers",
   });
 
-  // Supplier Receipts (Receiving / Purchase Invoices from Supplier)
+  // ✅ Supplier payments (CREDIT entries)
+  // POST  /api/suppliers/:supplierId/payments
+  // GET   /api/suppliers/:supplierId/payments
+  // GET   /api/suppliers/:supplierId/payments/:paymentId
+  // PATCH /api/suppliers/:supplierId/payments/:paymentId
+  // DELETE /api/suppliers/:supplierId/payments/:paymentId
+  fastify.register(require("./routes/supplierPaymentRoutes"), {
+    prefix: "/api/suppliers",
+  });
+
+  // ✅ Supplier Receipts (Receiving / Purchase Invoices from Supplier)
   // POST  /api/supplier-receipts
   // GET   /api/supplier-receipts
   // GET   /api/supplier-receipts/:id

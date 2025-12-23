@@ -10,9 +10,30 @@ const num = (v) => {
 
 const round2 = (n) => Math.round(num(n) * 100) / 100;
 
-const safeDate = (v) => {
+/**
+ * Expect YYYY-MM-DD, convert to start/end of that day
+ * so date filter includes full day properly.
+ */
+const parseDateStart = (v) => {
   if (!v) return null;
-  const d = new Date(String(v));
+  const s = String(v).trim();
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T00:00:00.000`);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+};
+
+const parseDateEnd = (v) => {
+  if (!v) return null;
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T23:59:59.999`);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 };
 
@@ -29,12 +50,26 @@ exports.balance = async (request, reply) => {
     const supplier = await Supplier.findByPk(supplierId);
     if (!supplier) return reply.code(404).send({ error: "Supplier not found" });
 
-    // faster than fetching all rows, uses SQL SUM
+    // SQL SUM (fast)
     const agg = await SupplierLedgerTxn.findAll({
       where: { supplier_id: supplierId },
       attributes: [
-        [SupplierLedgerTxn.sequelize.fn("COALESCE", SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("debit")), 0), "debit_total"],
-        [SupplierLedgerTxn.sequelize.fn("COALESCE", SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("credit")), 0), "credit_total"],
+        [
+          SupplierLedgerTxn.sequelize.fn(
+            "COALESCE",
+            SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("debit")),
+            0
+          ),
+          "debit_total",
+        ],
+        [
+          SupplierLedgerTxn.sequelize.fn(
+            "COALESCE",
+            SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("credit")),
+            0
+          ),
+          "credit_total",
+        ],
       ],
       raw: true,
     });
@@ -55,6 +90,9 @@ exports.balance = async (request, reply) => {
  * GET /api/suppliers/:supplierId/ledger
  * Query: from?, to?, limit?
  * Returns: { supplier, txns, debit_total, credit_total, balance }
+ *
+ * ✅ Totals are calculated using SQL SUM for the SAME date range
+ * ✅ txns list is still limited by `limit`
  */
 exports.ledger = async (request, reply) => {
   try {
@@ -68,8 +106,8 @@ exports.ledger = async (request, reply) => {
 
     const where = { supplier_id: supplierId };
 
-    const fromD = safeDate(from);
-    const toD = safeDate(to);
+    const fromD = parseDateStart(from);
+    const toD = parseDateEnd(to);
 
     if (fromD || toD) {
       where.txn_date = {};
@@ -77,17 +115,47 @@ exports.ledger = async (request, reply) => {
       if (toD) where.txn_date[Op.lte] = toD;
     }
 
+    const safeLimit = Math.min(500, Math.max(1, num(limit) || 200));
+
+    // 1) Get txns (limited)
     const txns = await SupplierLedgerTxn.findAll({
       where,
-      order: [["txn_date", "ASC"], ["id", "ASC"]],
-      limit: Math.min(500, Math.max(1, num(limit) || 200)),
+      order: [
+        ["txn_date", "ASC"],
+        ["id", "ASC"],
+      ],
+      limit: safeLimit,
     });
 
-    const debit_total = round2(txns.reduce((s, r) => s + num(r.debit), 0));
-    const credit_total = round2(txns.reduce((s, r) => s + num(r.credit), 0));
+    // 2) Totals for same filters (NOT affected by limit)
+    const agg = await SupplierLedgerTxn.findAll({
+      where,
+      attributes: [
+        [
+          SupplierLedgerTxn.sequelize.fn(
+            "COALESCE",
+            SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("debit")),
+            0
+          ),
+          "debit_total",
+        ],
+        [
+          SupplierLedgerTxn.sequelize.fn(
+            "COALESCE",
+            SupplierLedgerTxn.sequelize.fn("SUM", SupplierLedgerTxn.sequelize.col("credit")),
+            0
+          ),
+          "credit_total",
+        ],
+      ],
+      raw: true,
+    });
+
+    const debit_total = round2(agg?.[0]?.debit_total);
+    const credit_total = round2(agg?.[0]?.credit_total);
     const balance = round2(debit_total - credit_total);
 
-    // Running balance
+    // Running balance (based on returned list)
     let running = 0;
     const txnsWithRunning = txns.map((t) => {
       running = round2(running + num(t.debit) - num(t.credit));
