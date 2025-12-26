@@ -32,6 +32,14 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
       },
 
+      // ✅ NEW: qty shifted to re-order (do NOT delete history)
+      reordered_qty: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: false,
+        defaultValue: 0,
+        comment: "Quantity transferred to re-order orders",
+      },
+
       // 🔥 COMMERCIAL FIELDS (RECEIVE TIME)
 
       unit_price: {

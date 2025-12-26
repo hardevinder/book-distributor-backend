@@ -383,10 +383,17 @@ exports.listSchoolOrders = async (request, reply) => {
     const plainOrders = orders.map((order) => {
       const o = order.toJSON();
       o.items =
-        (o.items || []).map((it) => ({
-          ...it,
-          pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
-        })) || [];
+        (o.items || []).map((it) => {
+          const ordered = Number(it.total_order_qty) || 0;
+          const received = Number(it.received_qty) || 0;
+          const reordered = Number(it.reordered_qty) || 0;
+          const pending = Math.max(ordered - received - reordered, 0);
+
+          return {
+            ...it,
+            pending_qty: pending,
+          };
+        }) || [];
       return o;
     });
 
@@ -400,10 +407,11 @@ exports.listSchoolOrders = async (request, reply) => {
   }
 };
 
+
 /* ============================================
  * POST /api/school-orders/generate
- * one order per (school + supplier + session)
- * ✅ If nothing changed, do NOT create again
+ * ✅ Creates OR updates (sync) one ORIGINAL order per (school + supplier + session)
+ * - avoids uniq_school_session_supplier_type crash
  * ============================================ */
 exports.generateOrdersForSession = async (request, reply) => {
   const { academic_session } = request.body || {};
@@ -439,27 +447,28 @@ exports.generateOrdersForSession = async (request, reply) => {
       return reply.code(200).send({
         message: "No confirmed requirements found for this session.",
         academic_session: session,
-        orders_count: 0,
+        created_count: 0,
+        updated_count: 0,
         skipped_count: 0,
-        orders: [],
+        created_orders: [],
+        updated_orders: [],
         skipped_orders: [],
       });
     }
 
-    // schoolId -> supplierId -> { books: Map(bookId -> totalQty), reqRowsByBook: Map(bookId -> [reqRow]) }
+    // schoolId -> supplierId -> { books: Map(bookId->qty), reqRowsByBook: Map(bookId->[reqRow]) }
     const mapBySchool = new Map();
 
-    for (const reqRow of requirements) {
-      const schoolId = reqRow.school_id;
-      const book = reqRow.book;
+    for (const rr of requirements) {
+      const schoolId = rr.school_id;
+      const book = rr.book;
       if (!schoolId || !book) continue;
 
-      const qty = Number(reqRow.required_copies || 0);
+      const qty = Number(rr.required_copies || 0);
       if (!qty || qty <= 0) continue;
 
-      // supplier_id is on requirement table
-      const supplierId =
-        Number(reqRow.supplier_id || 0) || Number(book?.publisher?.supplier_id || 0);
+      // supplier_id should come from requirement (best)
+      const supplierId = Number(rr.supplier_id || 0);
       if (!supplierId) continue;
 
       if (!mapBySchool.has(schoolId)) mapBySchool.set(schoolId, new Map());
@@ -475,34 +484,26 @@ exports.generateOrdersForSession = async (request, reply) => {
       bucket.books.set(bookId, (Number(bucket.books.get(bookId)) || 0) + qty);
 
       if (!bucket.reqRowsByBook.has(bookId)) bucket.reqRowsByBook.set(bookId, []);
-      bucket.reqRowsByBook.get(bookId).push(reqRow);
-    }
-
-    if (!mapBySchool.size) {
-      await t.rollback();
-      return reply.code(200).send({
-        message: "No valid supplier-linked items found to generate orders for this session.",
-        academic_session: session,
-        orders_count: 0,
-        skipped_count: 0,
-        orders: [],
-        skipped_orders: [],
-      });
+      bucket.reqRowsByBook.get(bookId).push(rr);
     }
 
     const createdOrders = [];
+    const updatedOrders = [];
     const skippedOrders = [];
 
     for (const [schoolId, bySupplier] of mapBySchool.entries()) {
       for (const [supplierId, data] of bySupplier.entries()) {
+        // desired signature
         const desiredSignature = buildItemsSignatureFromMap(data.books);
 
-        const latestExisting = await SchoolOrder.findOne({
+        // ✅ find existing ORIGINAL (order_type 'original' OR NULL)
+        const existing = await SchoolOrder.findOne({
           where: {
             school_id: schoolId,
             supplier_id: supplierId,
             academic_session: session,
             status: { [Op.ne]: "cancelled" },
+            [Op.or]: [{ order_type: "original" }, { order_type: null }],
           },
           include: [{ model: SchoolOrderItem, as: "items" }],
           order: [["createdAt", "DESC"]],
@@ -510,21 +511,134 @@ exports.generateOrdersForSession = async (request, reply) => {
           lock: t.LOCK.UPDATE,
         });
 
-        if (latestExisting) {
-          const existingSignature = buildItemsSignatureFromOrderItems(latestExisting.items || []);
-          if (existingSignature === desiredSignature) {
+        // if exists, decide update/skip
+        if (existing) {
+          const existingSig = buildItemsSignatureFromOrderItems(existing.items || []);
+
+          // ✅ already same => skip
+          if (existingSig === desiredSignature) {
             skippedOrders.push({
-              order_id: latestExisting.id,
-              order_no: latestExisting.order_no,
-              school_id: latestExisting.school_id,
-              supplier_id: latestExisting.supplier_id,
-              academic_session: latestExisting.academic_session,
-              status: latestExisting.status,
+              order_id: existing.id,
+              order_no: existing.order_no,
+              school_id: existing.school_id,
+              supplier_id: existing.supplier_id,
+              academic_session: existing.academic_session,
+              status: existing.status,
+              reason: "No changes",
             });
             continue;
           }
+
+          // ✅ safety: if any received > 0, don't modify original (would break history)
+          const hasReceived = (existing.items || []).some((it) => Number(it.received_qty || 0) > 0);
+          if (hasReceived) {
+            skippedOrders.push({
+              order_id: existing.id,
+              order_no: existing.order_no,
+              school_id: existing.school_id,
+              supplier_id: existing.supplier_id,
+              academic_session: existing.academic_session,
+              status: existing.status,
+              reason: "Has received qty; not auto-updating original",
+            });
+            continue;
+          }
+
+          // ✅ SYNC items (update qty / add missing / remove extra)
+          const existingItemsByBook = new Map();
+          for (const it of existing.items || []) existingItemsByBook.set(Number(it.book_id), it);
+
+          // --- update & create items, and prepare links ---
+          const linksToCreate = [];
+
+          // We'll clear old links for this order (safe because received=0)
+          // (delete by order items ids)
+          const oldItemIds = (existing.items || []).map((x) => x.id);
+          if (oldItemIds.length) {
+            await SchoolRequirementOrderLink.destroy({
+              where: { school_order_item_id: oldItemIds },
+              transaction: t,
+            });
+          }
+
+          // update/create each desired book
+          for (const [bookIdRaw, totalQtyRaw] of data.books.entries()) {
+            const bookId = Number(bookIdRaw);
+            const qty = Number(totalQtyRaw || 0);
+
+            let item = existingItemsByBook.get(bookId);
+
+            if (item) {
+              item.total_order_qty = qty;
+              item.received_qty = 0; // keep 0
+              await item.save({ transaction: t });
+            } else {
+              item = await SchoolOrderItem.create(
+                {
+                  school_order_id: existing.id,
+                  book_id: bookId,
+                  total_order_qty: qty,
+                  received_qty: 0,
+
+                  unit_price: null,
+                  discount_pct: null,
+                  discount_amt: null,
+                  net_unit_price: null,
+                  line_amount: null,
+                  total_amount: null,
+                },
+                { transaction: t }
+              );
+            }
+
+            // links: allocate per requirement rows
+            const reqRows = data.reqRowsByBook.get(bookId) || [];
+            for (const rr of reqRows) {
+              const rqQty = Number(rr.required_copies || 0);
+              if (!rqQty || rqQty <= 0) continue;
+
+              linksToCreate.push({
+                requirement_id: rr.id,
+                school_order_item_id: item.id,
+                allocated_qty: rqQty,
+              });
+            }
+          }
+
+          // remove extra items which are not in desired map (received=0 already confirmed)
+          for (const it of existing.items || []) {
+            const bId = Number(it.book_id);
+            if (!data.books.has(bId)) {
+              // also delete its links (already cleared above by oldItemIds, but safe)
+              await SchoolRequirementOrderLink.destroy({
+                where: { school_order_item_id: it.id },
+                transaction: t,
+              });
+              await it.destroy({ transaction: t });
+            }
+          }
+
+          if (linksToCreate.length) {
+            await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
+          }
+
+          // ensure order_type is set
+          if (!existing.order_type) existing.order_type = "original";
+          await existing.save({ transaction: t });
+
+          updatedOrders.push({
+            order_id: existing.id,
+            order_no: existing.order_no,
+            school_id: existing.school_id,
+            supplier_id: existing.supplier_id,
+            academic_session: existing.academic_session,
+            status: existing.status,
+          });
+
+          continue;
         }
 
+        // ✅ no existing original => create new original
         const orderNo = await generateUniqueOrderNo(t);
 
         const order = await SchoolOrder.create(
@@ -535,8 +649,9 @@ exports.generateOrdersForSession = async (request, reply) => {
             academic_session: session,
             order_date: new Date(),
             status: "draft",
+            order_type: "original",
+            source_order_id: null,
 
-            // totals/charges defaults
             freight_charges: 0,
             packing_charges: 0,
             other_charges: 0,
@@ -548,27 +663,23 @@ exports.generateOrdersForSession = async (request, reply) => {
         );
 
         const linksToCreate = [];
-        const requirementIdsToUpdate = new Set();
 
-        for (const [bookId, totalQty] of data.books.entries()) {
-          const q = Number(totalQty || 0);
-          if (!q || q <= 0) continue;
+        for (const [bookIdRaw, totalQtyRaw] of data.books.entries()) {
+          const bookId = Number(bookIdRaw);
+          const qty = Number(totalQtyRaw || 0);
+          if (!qty || qty <= 0) continue;
 
           const item = await SchoolOrderItem.create(
             {
               school_order_id: order.id,
               book_id: bookId,
-              total_order_qty: q,
+              total_order_qty: qty,
               received_qty: 0,
-
-              // commercial
               unit_price: null,
               discount_pct: null,
               discount_amt: null,
               net_unit_price: null,
               line_amount: null,
-
-              // legacy
               total_amount: null,
             },
             { transaction: t }
@@ -584,20 +695,11 @@ exports.generateOrdersForSession = async (request, reply) => {
               school_order_item_id: item.id,
               allocated_qty: rqQty,
             });
-            requirementIdsToUpdate.add(rr.id);
           }
         }
 
         if (linksToCreate.length) {
           await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
-        }
-
-        // (kept as-is)
-        if (requirementIdsToUpdate.size > 0) {
-          await SchoolBookRequirement.update(
-            { status: "confirmed" },
-            { where: { id: Array.from(requirementIdsToUpdate) }, transaction: t }
-          );
         }
 
         createdOrders.push(order);
@@ -606,15 +708,14 @@ exports.generateOrdersForSession = async (request, reply) => {
 
     await t.commit();
 
-    return reply.code(201).send({
-      message:
-        createdOrders.length > 0
-          ? "Supplier-wise school orders generated successfully."
-          : "No changes found — orders already up-to-date.",
+    return reply.code(200).send({
+      message: "Generate orders done (created/updated/skipped).",
       academic_session: session,
-      orders_count: createdOrders.length,
+      created_count: createdOrders.length,
+      updated_count: updatedOrders.length,
       skipped_count: skippedOrders.length,
-      orders: createdOrders,
+      created_orders: createdOrders,
+      updated_orders: updatedOrders,
       skipped_orders: skippedOrders,
     });
   } catch (err) {
@@ -624,7 +725,7 @@ exports.generateOrdersForSession = async (request, reply) => {
     console.error("Error in generateOrdersForSession:", err);
     return reply.code(500).send({
       error: "Error",
-      message: err.message || "Failed to generate supplier-wise orders.",
+      message: err.message || "Failed to generate orders.",
     });
   }
 };
@@ -648,7 +749,9 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
 
     if (typeof transport_through !== "undefined") {
       order.transport_through =
-        transport_through === null || transport_through === "" ? null : String(transport_through).trim();
+        transport_through === null || transport_through === ""
+          ? null
+          : String(transport_through).trim();
     }
 
     if ("transport_id_2" in order && typeof transport_id_2 !== "undefined") {
@@ -695,10 +798,17 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
 
     const plain = updated.toJSON();
     plain.items =
-      (plain.items || []).map((it) => ({
-        ...it,
-        pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
-      })) || [];
+      (plain.items || []).map((it) => {
+        const ordered = Number(it.total_order_qty) || 0;
+        const received = Number(it.received_qty) || 0;
+        const reordered = Number(it.reordered_qty) || 0;
+        const pending = Math.max(ordered - received - reordered, 0);
+
+        return {
+          ...it,
+          pending_qty: pending,
+        };
+      }) || [];
 
     return reply.code(200).send({ message: "Order meta updated successfully.", order: plain });
   } catch (err) {
@@ -709,6 +819,7 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
     });
   }
 };
+
 
 /* ============================================
  * PATCH /api/school-orders/:orderId/order-no
@@ -755,25 +866,10 @@ exports.updateSchoolOrderNo = async (request, reply) => {
 
 /* ============================================
  * POST /api/school-orders/:orderId/receive
- *
- * ✅ No duplicate saving:
- * - If frontend sends same request again => delta becomes 0 => no InventoryTxn created.
- * - If items array contains duplicate item_id rows in SAME request => we normalize (one per item_id).
- *
- * ✅ ALSO pushes Inventory (delta-based)
- * ✅ BLOCK decrease (delta < 0)
- * ✅ IF cancelled => no inventory add
- *
- * ✅ NEW:
- * - saves item commercial fields (unit_price/discount/net/line)
- * - saves order charges (freight/packing/other/overall_discount/round_off/grand_total)
- * - ✅ Option A: auto-create SupplierReceipt + SupplierReceiptItems
- * - ✅ NEW: SupplierLedgerTxn posting on RECEIVED (idempotent) + delete on CANCELLED
  * ============================================ */
 exports.receiveOrderItems = async (request, reply) => {
   const { orderId } = request.params;
 
-  // accept charges in payload
   const { items, status = "auto", charges } = request.body || {};
 
   if (!items || !Array.isArray(items) || !items.length) {
@@ -796,7 +892,6 @@ exports.receiveOrderItems = async (request, reply) => {
       return reply.code(404).send({ message: "School order not found." });
     }
 
-    // ✅ Safety: supplier_id must exist for inventory + receipt + ledger
     if (!order.supplier_id) {
       await t.rollback();
       return reply.code(400).send({
@@ -805,9 +900,6 @@ exports.receiveOrderItems = async (request, reply) => {
       });
     }
 
-    // ✅ Load/attach receipt:
-    // - If NOT cancelled => create/attach
-    // - If cancelled => try to load existing (so we can cancel + delete ledger)
     let supplierReceipt = null;
     if (!isCancelled) {
       supplierReceipt = await getOrCreateSupplierReceiptForOrder({ order, t });
@@ -827,8 +919,6 @@ exports.receiveOrderItems = async (request, reply) => {
       }
     }
 
-    // ✅ Normalize payload to avoid duplicate item_id rows in same request
-    // strategy: keep the last row per item_id (usually latest typed values)
     const normalizedMap = new Map();
     for (const row of items) {
       const itemId = Number(row?.item_id || 0);
@@ -843,7 +933,6 @@ exports.receiveOrderItems = async (request, reply) => {
     const itemById = new Map();
     for (const it of order.items || []) itemById.set(it.id, it);
 
-    // Track updated items for totals
     const updatedItemsForTotals = [];
 
     for (const row of normalizedItems) {
@@ -861,14 +950,12 @@ exports.receiveOrderItems = async (request, reply) => {
       const oldReceived = Number(item.received_qty || 0);
       const delta = newReceived - oldReceived;
 
-      // ✅ BLOCK decreasing (inventory mismatch avoid)
       if (delta < 0) {
         throw new Error(
           `Received qty cannot be reduced (Item #${item.id}). Use inventory adjustment if needed.`
         );
       }
 
-      // If no change, still allow price updates (optional) but DO NOT create inventory txn
       const pricing = computeLinePricing({
         qtyReceived: newReceived,
         unitPrice: row.unit_price ?? row.rate ?? item.unit_price ?? null,
@@ -884,14 +971,12 @@ exports.receiveOrderItems = async (request, reply) => {
       if ("net_unit_price" in item) item.net_unit_price = pricing.net_unit_price;
       if ("line_amount" in item) item.line_amount = pricing.line_amount;
 
-      // legacy field (keep in sync if exists)
       if ("total_amount" in item) item.total_amount = pricing.line_amount;
 
       await item.save({ transaction: t });
 
       updatedItemsForTotals.push(item);
 
-      // ✅ Option A: Upsert SupplierReceiptItem (idempotent)
       if (!isCancelled && supplierReceipt && SupplierReceiptItem) {
         const [rItem, created] = await SupplierReceiptItem.findOrCreate({
           where: {
@@ -905,7 +990,6 @@ exports.receiveOrderItems = async (request, reply) => {
             ordered_qty: ordered,
             received_qty: newReceived,
 
-            // pricing snapshot (if columns exist)
             unit_price: item.unit_price ?? null,
             discount_pct: item.discount_pct ?? null,
             discount_amt: item.discount_amt ?? null,
@@ -921,19 +1005,20 @@ exports.receiveOrderItems = async (request, reply) => {
           rItem.received_qty = newReceived;
 
           if ("unit_price" in rItem) rItem.unit_price = item.unit_price ?? rItem.unit_price ?? null;
-          if ("discount_pct" in rItem) rItem.discount_pct = item.discount_pct ?? rItem.discount_pct ?? null;
-          if ("discount_amt" in rItem) rItem.discount_amt = item.discount_amt ?? rItem.discount_amt ?? null;
+          if ("discount_pct" in rItem)
+            rItem.discount_pct = item.discount_pct ?? rItem.discount_pct ?? null;
+          if ("discount_amt" in rItem)
+            rItem.discount_amt = item.discount_amt ?? rItem.discount_amt ?? null;
           if ("net_unit_price" in rItem)
             rItem.net_unit_price = item.net_unit_price ?? rItem.net_unit_price ?? null;
-          if ("line_amount" in rItem) rItem.line_amount = item.line_amount ?? rItem.line_amount ?? null;
+          if ("line_amount" in rItem)
+            rItem.line_amount = item.line_amount ?? rItem.line_amount ?? null;
 
           await rItem.save({ transaction: t });
         }
       }
 
-      // ✅ If cancelled => do not add inventory
       if (!isCancelled && delta > 0) {
-        // Find a stable batch per order+item+book+supplier (idempotent)
         let batch = await InventoryBatch.findOne({
           where: {
             school_order_id: order.id,
@@ -953,7 +1038,6 @@ exports.receiveOrderItems = async (request, reply) => {
               school_order_id: order.id,
               school_order_item_id: item.id,
 
-              // ✅ Use net_unit_price if available else unit_price
               purchase_price:
                 item.net_unit_price != null
                   ? item.net_unit_price
@@ -967,7 +1051,6 @@ exports.receiveOrderItems = async (request, reply) => {
             { transaction: t }
           );
         } else {
-          // keep latest purchase price (optional)
           try {
             const pp =
               item.net_unit_price != null
@@ -983,7 +1066,6 @@ exports.receiveOrderItems = async (request, reply) => {
         batch.available_qty = Number(batch.available_qty || 0) + delta;
         await batch.save({ transaction: t });
 
-        // ✅ delta-based IN txn (idempotent by design due to delta)
         await InventoryTxn.create(
           {
             txn_type: "IN",
@@ -999,7 +1081,6 @@ exports.receiveOrderItems = async (request, reply) => {
       }
     }
 
-    // --- save order-level charges/totals (only when not cancelled) ---
     if (!isCancelled) {
       const totals = computeOrderTotals({
         items: updatedItemsForTotals.length ? updatedItemsForTotals : order.items || [],
@@ -1013,7 +1094,6 @@ exports.receiveOrderItems = async (request, reply) => {
       if ("round_off" in order) order.round_off = totals.round_off;
       if ("grand_total" in order) order.grand_total = totals.grand_total;
 
-      // stamp received_at once
       if ("received_at" in order && !order.received_at) order.received_at = new Date();
 
       await order.save({ transaction: t });
@@ -1023,13 +1103,11 @@ exports.receiveOrderItems = async (request, reply) => {
       order.status = "cancelled";
       await order.save({ transaction: t });
 
-      // optional: cancel receipt too (only if it exists)
       if (supplierReceipt && "status" in supplierReceipt) {
         supplierReceipt.status = RECEIPT_STATUS.CANCELLED;
         await supplierReceipt.save({ transaction: t });
       }
 
-      // ✅ NEW: remove ledger posting for this receipt (if any)
       if (supplierReceipt && SupplierLedgerTxn) {
         await SupplierLedgerTxn.destroy({
           where: {
@@ -1045,7 +1123,6 @@ exports.receiveOrderItems = async (request, reply) => {
       await recomputeOrderStatus(order, t);
     }
 
-    // ✅ Option A: update receipt totals/status + ✅ NEW: LEDGER POSTING
     if (!isCancelled && supplierReceipt && SupplierReceiptItem) {
       const rItems = await SupplierReceiptItem.findAll({
         where: { supplier_receipt_id: supplierReceipt.id },
@@ -1054,16 +1131,13 @@ exports.receiveOrderItems = async (request, reply) => {
 
       const itemsTotal = rItems.reduce((s, x) => s + num2(x.line_amount), 0);
 
-      // NOTE: model has sub_total + grand_total (not items_total)
       if ("sub_total" in supplierReceipt) supplierReceipt.sub_total = itemsTotal;
       if ("grand_total" in supplierReceipt) supplierReceipt.grand_total = itemsTotal;
 
-      // ✅ FIX: must match ENUM('draft','received','cancelled')
       if ("status" in supplierReceipt) supplierReceipt.status = RECEIPT_STATUS.RECEIVED;
 
       await supplierReceipt.save({ transaction: t });
 
-      // ✅ NEW: Ledger posting (idempotent + update-safe)
       if (SupplierLedgerTxn) {
         const txnDate =
           supplierReceipt.receipt_date ||
@@ -1072,7 +1146,6 @@ exports.receiveOrderItems = async (request, reply) => {
           order.received_at ||
           new Date();
 
-        // delete then create => safe if amount/date changed
         await SupplierLedgerTxn.destroy({
           where: {
             supplier_id: order.supplier_id,
@@ -1125,12 +1198,18 @@ exports.receiveOrderItems = async (request, reply) => {
 
     const plain = updated.toJSON();
     plain.items =
-      (plain.items || []).map((it) => ({
-        ...it,
-        pending_qty: (Number(it.total_order_qty) || 0) - (Number(it.received_qty) || 0),
-      })) || [];
+      (plain.items || []).map((it) => {
+        const ordered = Number(it.total_order_qty) || 0;
+        const received = Number(it.received_qty) || 0;
+        const reordered = Number(it.reordered_qty) || 0;
+        const pending = Math.max(ordered - received - reordered, 0);
 
-    // include receipt info in response (handy for frontend)
+        return {
+          ...it,
+          pending_qty: pending,
+        };
+      }) || [];
+
     if (supplierReceipt) {
       plain.supplier_receipt_id = supplierReceipt.id;
       plain.supplier_receipt_no = supplierReceipt.receipt_no || plain.supplier_receipt_no || null;
@@ -1152,8 +1231,13 @@ exports.receiveOrderItems = async (request, reply) => {
   }
 };
 
+
 /* ============================================
  * POST /api/school-orders/:orderId/reorder-pending
+ * - Creates a new reorder order for pending qty
+ * - ✅ Updates old order items.reordered_qty (shifts qty)
+ * - ✅ Pending = ordered - received - reordered
+ * - ✅ Uses parent_order_id (since your DB has it)
  * ============================================ */
 exports.reorderPendingForOrder = async (request, reply) => {
   const { orderId } = request.params;
@@ -1161,8 +1245,12 @@ exports.reorderPendingForOrder = async (request, reply) => {
 
   try {
     const sourceOrder = await SchoolOrder.findOne({
-      where: { id: orderId },
-      include: [{ model: School, as: "school" }, { model: SchoolOrderItem, as: "items" }],
+      where: { id: orderId, status: { [Op.ne]: "cancelled" } },
+      include: [
+        { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
+        { model: SchoolOrderItem, as: "items" },
+      ],
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
@@ -1172,17 +1260,69 @@ exports.reorderPendingForOrder = async (request, reply) => {
       return reply.code(404).send({ message: "School order not found." });
     }
 
-    const pendingItems = [];
-    for (const it of sourceOrder.items || []) {
-      const ordered = Number(it.total_order_qty) || 0;
-      const received = Number(it.received_qty || 0);
-      const pending = ordered - received;
-      if (pending > 0) pendingItems.push({ book_id: it.book_id, pending_qty: pending });
+    if (!sourceOrder.school_id || !sourceOrder.supplier_id) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "ValidationError",
+        message: "Order must have school_id and supplier_id to create re-order.",
+      });
     }
 
-    if (!pendingItems.length) {
+    // ✅ Calculate pending including reordered_qty
+    const bookMap = new Map(); // book_id -> pending_qty_to_shift
+    const shiftRows = []; // keep to update reordered_qty on source items
+
+    for (const it of sourceOrder.items || []) {
+      const ordered = Number(it.total_order_qty) || 0;
+      const received = Number(it.received_qty) || 0;
+      const alreadyReordered = Number(it.reordered_qty) || 0;
+
+      const pending = ordered - received - alreadyReordered;
+
+      if (pending > 0) {
+        bookMap.set(it.book_id, (Number(bookMap.get(it.book_id)) || 0) + pending);
+        shiftRows.push({ itemId: it.id, shiftQty: pending });
+      }
+    }
+
+    if (!bookMap.size) {
       await t.rollback();
-      return reply.code(400).send({ message: "No pending quantity found to re-order for this order." });
+      return reply.code(400).send({
+        message: "No pending quantity found to re-order for this order.",
+      });
+    }
+
+    // ✅ Avoid duplicate same reorder (latest one)
+    const pendingSignature = buildItemsSignatureFromMap(bookMap);
+
+    const latestReorder = await SchoolOrder.findOne({
+      where: {
+        school_id: sourceOrder.school_id,
+        supplier_id: sourceOrder.supplier_id,
+        academic_session: sourceOrder.academic_session || null,
+        order_type: "reorder",
+        status: { [Op.ne]: "cancelled" },
+
+        // ✅ Link by parent_order_id (your DB column)
+        parent_order_id: sourceOrder.id,
+      },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      order: [["createdAt", "DESC"]],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (latestReorder) {
+      const latestSig = buildItemsSignatureFromOrderItems(latestReorder.items || []);
+      if (latestSig === pendingSignature) {
+        await t.rollback();
+        return reply.code(200).send({
+          message: "Pending re-order already exists (no changes).",
+          original_order_id: sourceOrder.id,
+          existing_order_id: latestReorder.id,
+          existing_order_no: latestReorder.order_no,
+        });
+      }
     }
 
     const newOrderNo = await generateUniqueOrderNo(t);
@@ -1195,7 +1335,12 @@ exports.reorderPendingForOrder = async (request, reply) => {
         academic_session: sourceOrder.academic_session || null,
         order_date: new Date(),
         status: "draft",
-        remarks: `Re-order for pending quantity of ${sourceOrder.order_no}`,
+        remarks: `Re-order for pending qty of ${sourceOrder.order_no || sourceOrder.id}`,
+
+        order_type: "reorder",
+
+        // ✅ use parent_order_id (not source_order_id)
+        parent_order_id: sourceOrder.id,
 
         freight_charges: 0,
         packing_charges: 0,
@@ -1207,25 +1352,42 @@ exports.reorderPendingForOrder = async (request, reply) => {
       { transaction: t }
     );
 
-    for (const row of pendingItems) {
+    // create items in reorder
+    for (const [bookId, qty] of bookMap.entries()) {
+      const q = Number(qty || 0);
+      if (!q || q <= 0) continue;
+
       await SchoolOrderItem.create(
         {
           school_order_id: newOrder.id,
-          book_id: row.book_id,
-          total_order_qty: row.pending_qty,
+          book_id: Number(bookId),
+          total_order_qty: q,
           received_qty: 0,
+          reordered_qty: 0, // reorder item itself starts 0
 
           unit_price: null,
           discount_pct: null,
           discount_amt: null,
           net_unit_price: null,
           line_amount: null,
-
           total_amount: null,
         },
         { transaction: t }
       );
     }
+
+    // ✅ IMPORTANT: shift qty in source items (update reordered_qty)
+    for (const s of shiftRows) {
+      const it = (sourceOrder.items || []).find((x) => x.id === s.itemId);
+      if (!it) continue;
+
+      const current = Number(it.reordered_qty) || 0;
+      it.reordered_qty = current + Number(s.shiftQty || 0);
+      await it.save({ transaction: t });
+    }
+
+    // (optional) you may recompute source order status if you want
+    // await recomputeOrderStatus(sourceOrder, t);
 
     const fullNewOrder = await SchoolOrder.findOne({
       where: { id: newOrder.id },
@@ -1233,14 +1395,8 @@ exports.reorderPendingForOrder = async (request, reply) => {
         { model: School, as: "school" },
         { model: Supplier, as: "supplier" },
         {
-          model: SchoolOrderItem,
-          as: "items",
-          include: [
-            {
-              model: Book, as: "book",
-              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
-            },
-          ],
+          model: SchoolOrderItem, as: "items",
+          include: [{ model: Book, as: "book", include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }] }],
         },
         { model: Transport, as: "transport" },
       ],
@@ -1265,6 +1421,9 @@ exports.reorderPendingForOrder = async (request, reply) => {
     });
   }
 };
+
+
+
 
 /* ============================================================
  * ✅ NEW (Module-2): School -> Book wise availability
@@ -1350,8 +1509,6 @@ exports.getSchoolBookAvailability = async (request, reply) => {
 
 /* ============================================================
  * PDF builder -> Buffer
- * ✅ Publisher column removed
- * ✅ Ordered/Received/Pending are FIXED WIDE + bold
  * ============================================================ */
 function buildSchoolOrderPdfBuffer({
   order,
@@ -1565,7 +1722,7 @@ function buildSchoolOrderPdfBuffer({
     /* ---------- Table (NO publisher) — FIXED WIDE OR/RC/PD ---------- */
     const W = {
       sr: 26,
-      title: 0, // auto
+      title: 0,
       subject: 70,
       ord: 85,
       rec: 85,
@@ -1609,9 +1766,24 @@ function buildSchoolOrderPdfBuffer({
       doc.text("Subject", X.subject, y, { width: W.subject });
 
       doc.font("Helvetica-Bold").fontSize(10);
-      doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false, height: 14 });
-      doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false, height: 14 });
-      doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false, height: 14 });
+      doc.text("Ordered", X.ord, y - 1, {
+        width: W.ord,
+        align: "center",
+        lineBreak: false,
+        height: 14,
+      });
+      doc.text("Received", X.rec, y - 1, {
+        width: W.rec,
+        align: "center",
+        lineBreak: false,
+        height: 14,
+      });
+      doc.text("Pending", X.pend, y - 1, {
+        width: W.pend,
+        align: "center",
+        lineBreak: false,
+        height: 14,
+      });
 
       doc.moveDown(1.1);
       drawHR2();
@@ -1653,9 +1825,21 @@ function buildSchoolOrderPdfBuffer({
         doc.text(cells.subject, X.subject, y, { width: W.subject });
 
         doc.font("Helvetica-Bold").fontSize(10);
-        doc.text(String(orderedQty), X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
-        doc.text(String(receivedQty), X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
-        doc.text(String(pendingQty), X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
+        doc.text(String(orderedQty), X.ord, y - 1, {
+          width: W.ord,
+          align: "center",
+          lineBreak: false,
+        });
+        doc.text(String(receivedQty), X.rec, y - 1, {
+          width: W.rec,
+          align: "center",
+          lineBreak: false,
+        });
+        doc.text(String(pendingQty), X.pend, y - 1, {
+          width: W.pend,
+          align: "center",
+          lineBreak: false,
+        });
 
         doc.y = y + rh - 3;
         sr++;
@@ -1676,7 +1860,9 @@ function buildSchoolOrderPdfBuffer({
     }
 
     const t2Through =
-      "transport_through_2" in order && order.transport_through_2 ? order.transport_through_2 : null;
+      "transport_through_2" in order && order.transport_through_2
+        ? order.transport_through_2
+        : null;
     const t2Name = t2Obj?.name || null;
     const t2City = t2Obj?.city || null;
     const t2Phone = t2Obj?.phone || null;

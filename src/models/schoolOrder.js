@@ -33,6 +33,25 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ NEW (Option-1): original vs reorder
+      order_type: {
+        type: DataTypes.ENUM("original", "reorder"),
+        allowNull: false,
+        defaultValue: "original",
+      },
+
+      // ✅ NEW (optional but recommended): link reorder -> original order
+      parent_order_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
+      // ✅ NEW (optional): reorder number sequence for same parent (1,2,3...)
+      reorder_seq: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
       order_date: {
         type: DataTypes.DATE,
         allowNull: false,
@@ -150,17 +169,33 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.DATE,
         allowNull: true,
       },
+
+      // ✅ NEW: Supplier Bill No captured during receiving
+      bill_no: {
+        type: DataTypes.STRING(50),
+        allowNull: true,
+      },
     },
     {
       tableName: "school_orders",
       timestamps: true,
-      // indexes: [
-      //   { fields: ["school_id"] },
-      //   { fields: ["supplier_id"] },
-      //   { fields: ["academic_session"] },
-      //   { fields: ["order_date"] },
-      //   { fields: ["supplier_receipt_id"] },
-      // ],
+      indexes: [
+        { fields: ["school_id"] },
+        { fields: ["supplier_id"] },
+        { fields: ["academic_session"] },
+        { fields: ["order_type"] },
+        { fields: ["parent_order_id"] },
+        { fields: ["order_date"] },
+        { fields: ["supplier_receipt_id"] },
+
+        // ✅ IMPORTANT: allows 1 original + many reorders for same school/supplier/session
+        // (You must also DROP old uniq_school_session_supplier on DB)
+        {
+          name: "uniq_school_session_supplier_type",
+          unique: true,
+          fields: ["school_id", "academic_session", "supplier_id", "order_type"],
+        },
+      ],
     }
   );
 
@@ -199,6 +234,18 @@ module.exports = (sequelize, DataTypes) => {
         as: "supplierReceipt",
       });
     }
+
+    // ✅ NEW: self association (reorder -> parent original)
+    SchoolOrder.belongsTo(models.SchoolOrder, {
+      foreignKey: "parent_order_id",
+      as: "parentOrder",
+    });
+
+    // ✅ NEW: original -> many reorders
+    SchoolOrder.hasMany(models.SchoolOrder, {
+      foreignKey: "parent_order_id",
+      as: "reorders",
+    });
   };
 
   return SchoolOrder;
