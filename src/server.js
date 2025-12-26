@@ -14,12 +14,16 @@ const path = require("path");
 const config = require("./config");
 const { sequelize } = require("./models");
 
+// ✅ FIX: define isProd once, then use everywhere safely
+const NODE_ENV = process.env.NODE_ENV || "development";
+const isProd = NODE_ENV === "production";
+
 const buildServer = () => {
   const fastify = fastifyFactory({
     logger: {
       level: "info",
       transport:
-        process.env.NODE_ENV === "development"
+        NODE_ENV === "development"
           ? {
               target: "pino-pretty",
               options: { colorize: true, translateTime: "HH:MM:ss" },
@@ -131,27 +135,16 @@ const buildServer = () => {
    */
 
   // ✅ Supplier ledger & balance
-  // GET /api/suppliers/:supplierId/ledger
-  // GET /api/suppliers/:supplierId/balance
   fastify.register(require("./routes/supplierLedgerRoutes"), {
     prefix: "/api/suppliers",
   });
 
   // ✅ Supplier payments (CREDIT entries)
-  // POST  /api/suppliers/:supplierId/payments
-  // GET   /api/suppliers/:supplierId/payments
-  // GET   /api/suppliers/:supplierId/payments/:paymentId
-  // PATCH /api/suppliers/:supplierId/payments/:paymentId
-  // DELETE /api/suppliers/:supplierId/payments/:paymentId
   fastify.register(require("./routes/supplierPaymentRoutes"), {
     prefix: "/api/suppliers",
   });
 
   // ✅ Supplier Receipts (Receiving / Purchase Invoices from Supplier)
-  // POST  /api/supplier-receipts
-  // GET   /api/supplier-receipts
-  // GET   /api/supplier-receipts/:id
-  // PATCH /api/supplier-receipts/:id/status
   fastify.register(require("./routes/supplierReceiptsRoutes"), {
     prefix: "/api/supplier-receipts",
   });
@@ -242,10 +235,13 @@ const start = async () => {
     await sequelize.authenticate();
     fastify.log.info("✅ Database connected");
 
-    // ✅ safer sync: do NOT alter prod tables accidentally
-    const isProd = process.env.NODE_ENV === "production";
-    await sequelize.sync({ alter: !isProd });
-    fastify.log.info(`✅ Models synced (alter=${!isProd})`);
+    // ✅ safest default: never auto-alter in prod
+    // If you want alter in dev only, you can enable it here:
+    // await sequelize.sync({ alter: !isProd });
+    await sequelize.sync();
+
+    // ✅ correct log message (since we are NOT altering here)
+    fastify.log.info(`✅ Models synced (env=${NODE_ENV}, alter=false)`);
 
     await fastify.listen({ port: config.port, host: "0.0.0.0" });
     fastify.log.info(`🚀 Server running on port ${config.port}`);

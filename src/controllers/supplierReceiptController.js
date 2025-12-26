@@ -1,4 +1,11 @@
+// src/controllers/supplierReceiptController.js
 "use strict";
+
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const https = require("https");
+const PDFDocument = require("pdfkit");
 
 const { Op } = require("sequelize");
 const {
@@ -10,9 +17,12 @@ const {
   SupplierReceipt,
   SupplierReceiptItem,
   SupplierLedgerTxn,
+  CompanyProfile,
 } = require("../models");
 
-/* ---------------- Helpers ---------------- */
+/* ============================================================
+ * Helpers
+ * ============================================================ */
 
 const num = (v) => {
   const n = Number(v);
@@ -24,6 +34,8 @@ const round2 = (n) => Math.round(num(n) * 100) / 100;
 function now() {
   return new Date();
 }
+
+const safeText = (v) => String(v ?? "").trim();
 
 /**
  * Generate receipt number like: SR-2025-12-000001
@@ -104,6 +116,9 @@ function calcHeaderTotals({
   return { sub_total, bill_discount_amount, grand_total };
 }
 
+/**
+ * Pick only columns that exist in model
+ */
 function pickAttrs(model, payload) {
   const attrs = model?.rawAttributes || {};
   const out = {};
@@ -113,14 +128,574 @@ function pickAttrs(model, payload) {
   return out;
 }
 
-/* ---------------- Controller ---------------- */
+/* ============================================================
+ * LOGO helpers (URL / local path / base64 data-url)
+ * ============================================================ */
+
+function fetchUrlBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
+
+    lib
+      .get(url, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return resolve(fetchUrlBuffer(res.headers.location));
+        }
+
+        if (res.statusCode !== 200) {
+          return reject(new Error(`Logo download failed. HTTP ${res.statusCode}`));
+        }
+
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+      })
+      .on("error", reject);
+  });
+}
+
+async function loadLogoBuffer(logoRef) {
+  if (!logoRef) return null;
+
+  const s = String(logoRef).trim();
+
+  // skip svg/webp (pdfkit unreliable)
+  if (/\.(svg|webp)(\?.*)?$/i.test(s)) return null;
+
+  // data url
+  if (s.startsWith("data:image/")) {
+    try {
+      const base64 = s.split(",")[1];
+      if (!base64) return null;
+      return Buffer.from(base64, "base64");
+    } catch {
+      return null;
+    }
+  }
+
+  // url
+  if (s.startsWith("http://") || s.startsWith("https://")) {
+    try {
+      return await fetchUrlBuffer(s);
+    } catch {
+      return null;
+    }
+  }
+
+  // local file
+  const localPath = path.isAbsolute(s) ? s : path.join(process.cwd(), s);
+  if (fs.existsSync(localPath)) {
+    try {
+      return fs.readFileSync(localPath);
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Ledger Post (idempotent)
+ */
+async function postPurchaseLedger({ receipt, t }) {
+  if (!SupplierLedgerTxn) return;
+
+  await SupplierLedgerTxn.destroy({
+    where: {
+      supplier_id: receipt.supplier_id,
+      txn_type: "PURCHASE_RECEIVE",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+    },
+    transaction: t,
+  });
+
+  await SupplierLedgerTxn.create(
+    {
+      supplier_id: receipt.supplier_id,
+      txn_date: receipt.received_date || receipt.invoice_date || now(),
+      txn_type: "PURCHASE_RECEIVE",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+      ref_no: receipt.receipt_no,
+      debit: round2(receipt.grand_total),
+      credit: 0,
+      narration: receipt.invoice_no
+        ? `Purchase Invoice ${receipt.invoice_no}`
+        : `Receipt ${receipt.receipt_no}`,
+    },
+    { transaction: t }
+  );
+}
+
+/**
+ * Ledger Remove (idempotent)
+ */
+async function removePurchaseLedger({ receipt, t }) {
+  if (!SupplierLedgerTxn) return;
+
+  await SupplierLedgerTxn.destroy({
+    where: {
+      supplier_id: receipt.supplier_id,
+      txn_type: "PURCHASE_RECEIVE",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+    },
+    transaction: t,
+  });
+}
+
+/**
+ * Inventory IN for receipt (idempotent by checking existing batches for this receipt)
+ */
+async function ensureInventoryInForReceipt({ receipt, items, t }) {
+  if (!InventoryBatch || !InventoryTxn) return;
+
+  const existingCount = await InventoryBatch.count({
+    where: pickAttrs(InventoryBatch, {
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+    }),
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+
+  // if already created earlier, skip to avoid duplicates
+  if (existingCount > 0) return;
+
+  for (const r of items) {
+    const batchPayload = pickAttrs(InventoryBatch, {
+      book_id: r.book_id,
+
+      supplier_id: receipt.supplier_id,
+
+      source_type: "SUPPLIER_RECEIPT",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+
+      received_qty: r.qty,
+      available_qty: r.qty,
+
+      rate: r.rate,
+      unit_cost: r.rate,
+      cost_price: r.rate,
+      purchase_price: r.rate,
+
+      remarks: `Receipt ${receipt.receipt_no}`,
+    });
+
+    const batch = await InventoryBatch.create(batchPayload, { transaction: t });
+
+    const txnPayload = pickAttrs(InventoryTxn, {
+      book_id: r.book_id,
+      batch_id: batch.id,
+      qty: r.qty,
+      txn_type: "IN",
+      type: "IN",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+      notes: `Receive via ${receipt.receipt_no}`,
+    });
+
+    await InventoryTxn.create(txnPayload, { transaction: t });
+  }
+}
+
+/**
+ * Inventory reverse on cancel:
+ * - only allowed if all batches created by this receipt still have enough available_qty to reverse
+ */
+async function reverseInventoryForReceipt({ receipt, t }) {
+  if (!InventoryBatch || !InventoryTxn) return;
+
+  const batches = await InventoryBatch.findAll({
+    where: pickAttrs(InventoryBatch, {
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+    }),
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+    order: [["id", "ASC"]],
+  });
+
+  if (!batches.length) return; // nothing to reverse
+
+  for (const b of batches) {
+    const avail = num(b.available_qty);
+    const rec = num(b.received_qty);
+    const reverseQty = rec;
+    if (reverseQty <= 0) continue;
+
+    if (avail < reverseQty) {
+      throw new Error(
+        `Cannot cancel receipt: stock already used for book_id ${b.book_id}. Available ${avail}, required ${reverseQty}.`
+      );
+    }
+  }
+
+  for (const b of batches) {
+    const reverseQty = num(b.received_qty);
+    if (reverseQty <= 0) continue;
+
+    const txnPayload = pickAttrs(InventoryTxn, {
+      book_id: b.book_id,
+      batch_id: b.id,
+      qty: reverseQty,
+      txn_type: "OUT",
+      type: "OUT",
+      ref_table: "supplier_receipts",
+      ref_id: receipt.id,
+      notes: `Cancel receipt ${receipt.receipt_no}`,
+    });
+    await InventoryTxn.create(txnPayload, { transaction: t });
+
+    b.available_qty = num(b.available_qty) - reverseQty;
+    b.received_qty = num(b.received_qty) - reverseQty;
+
+    await b.save({ transaction: t });
+  }
+}
+
+/* ============================================================
+ * ✅ RECEIPT PDF builder -> Buffer (same style as PO)
+ * ============================================================ */
+function buildSupplierReceiptPdfBuffer({
+  receipt,
+  supplier,
+  companyProfile,
+  items,
+  pdfTitle = "SUPPLIER RECEIPT",
+  showPrintDate = true,
+}) {
+  return new Promise(async (resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const chunks = [];
+
+    doc.on("data", (c) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const pageLeft = doc.page.margins.left;
+    const pageRight = doc.page.width - doc.page.margins.right;
+    const contentWidth = pageRight - pageLeft;
+
+    const drawHR = () => {
+      doc.save();
+      doc.lineWidth(0.7);
+      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+      doc.restore();
+    };
+
+    const ensureSpace = (neededHeight) => {
+      const bottom = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + neededHeight > bottom) doc.addPage();
+    };
+
+    /* ---------- Header (logo + company) ---------- */
+    if (companyProfile) {
+      const startY = doc.y;
+      const logoSize = 52;
+      const gap = 10;
+
+      const logoRef =
+        companyProfile.logo_url ||
+        companyProfile.logo ||
+        companyProfile.logo_path ||
+        companyProfile.logo_image ||
+        null;
+
+      let logoBuf = null;
+      try {
+        logoBuf = await loadLogoBuffer(logoRef);
+      } catch {
+        logoBuf = null;
+      }
+
+      const logoX = pageLeft;
+      const logoY = startY;
+      const textX = logoBuf ? logoX + logoSize + gap : pageLeft;
+      const textWidth = pageRight - textX;
+
+      if (logoBuf) {
+        try {
+          doc.image(logoBuf, logoX, logoY, { fit: [logoSize, logoSize] });
+        } catch {}
+      }
+
+      const addrParts = [];
+      if (companyProfile.address_line1) addrParts.push(companyProfile.address_line1);
+      if (companyProfile.address_line2) addrParts.push(companyProfile.address_line2);
+
+      const cityStatePin = [companyProfile.city, companyProfile.state, companyProfile.pincode]
+        .filter(Boolean)
+        .join(", ");
+      if (cityStatePin) addrParts.push(cityStatePin);
+
+      const lines = [];
+      if (companyProfile.name)
+        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
+      if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
+
+      const contactParts = [];
+      if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
+      if (companyProfile.email) contactParts.push(`Email: ${companyProfile.email}`);
+      if (contactParts.length)
+        lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
+
+      if (companyProfile.gstin)
+        lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
+
+      let yCursor = startY;
+      for (const ln of lines) {
+        doc.font(ln.font).fontSize(ln.size).fillColor("#000");
+        doc.text(safeText(ln.text), textX, yCursor, { width: textWidth, align: "left" });
+        const h = doc.heightOfString(safeText(ln.text), { width: textWidth });
+        yCursor += h + 2;
+      }
+
+      const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 12;
+      doc.y = headerBottom;
+
+      drawHR();
+      doc.moveDown(0.35);
+    }
+
+    /* ---------- Title ---------- */
+    doc.font("Helvetica-Bold").fontSize(14).fillColor("#000");
+    const titleBoxW = Math.floor(contentWidth * 0.72);
+    const titleX = pageLeft + Math.floor((contentWidth - titleBoxW) / 2);
+    doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
+    doc.moveDown(0.5);
+
+    /* ---------- TOP: Receipt No (left) + Date (right) ---------- */
+    const topY = doc.y;
+    const leftTopW = Math.floor(contentWidth * 0.65);
+    const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
+    const rightTopW = pageRight - rightTopX;
+
+    const receiptNo = safeText(receipt.receipt_no || receipt.id);
+    const invNo = receipt.invoice_no ? safeText(receipt.invoice_no) : "-";
+    const invDate = receipt.invoice_date ? new Date(receipt.invoice_date).toLocaleDateString("en-IN") : "-";
+    const recvDate = receipt.received_date ? new Date(receipt.received_date).toLocaleDateString("en-IN") : "-";
+
+    doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
+    doc.text(`Receipt No: ${receiptNo}`, pageLeft, topY, { width: leftTopW, align: "left" });
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(`Invoice No: ${invNo}`, pageLeft, doc.y + 2, { width: leftTopW, align: "left" });
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(`Invoice Date: ${invDate}`, rightTopX, topY + 1, { width: rightTopW, align: "right" });
+    doc.text(`Received Date: ${recvDate}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
+
+    if (showPrintDate) {
+      const pd = new Date().toLocaleDateString("en-IN");
+      doc.text(`Print Date: ${pd}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
+    }
+
+    doc.moveDown(0.6);
+    drawHR();
+    doc.moveDown(0.35);
+
+    /* ---------- To (Supplier) ---------- */
+    if (supplier && supplier.name) {
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+      doc.text("From Supplier:", pageLeft, doc.y);
+
+      doc.font("Helvetica").fontSize(10).fillColor("#000");
+      doc.text(safeText(supplier.name), pageLeft, doc.y);
+
+      const subLines = [];
+      const addr = supplier.address || supplier.address_line1 || supplier.full_address || "";
+      const phone = supplier.phone || supplier.phone_primary || "";
+      const email = supplier.email || "";
+
+      if (addr) subLines.push(safeText(addr));
+      if (phone) subLines.push(`Phone: ${safeText(phone)}`);
+      if (email) subLines.push(`Email: ${safeText(email)}`);
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      for (const ln of subLines) doc.text(ln, pageLeft, doc.y, { width: Math.floor(contentWidth * 0.72) });
+    }
+
+    doc.moveDown(0.25);
+    drawHR();
+    doc.moveDown(0.4);
+
+    /* ---------- Summary ---------- */
+    const itemCount = (items || []).length;
+    const subTotal = round2(receipt.sub_total);
+    const billDisc = round2(receipt.bill_discount_amount);
+    const ship = round2(receipt.shipping_charge);
+    const other = round2(receipt.other_charge);
+    const ro = round2(receipt.round_off);
+    const grand = round2(receipt.grand_total);
+
+    const boxY = doc.y;
+    const boxH = 62;
+
+    doc.save();
+    doc.rect(pageLeft, boxY, contentWidth, boxH).fill("#f6f8fb");
+    doc.restore();
+
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+    doc.text("Summary", pageLeft + 10, boxY + 8);
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(`Items: ${itemCount}`, pageLeft + 10, boxY + 26, { width: contentWidth / 2 - 10 });
+    doc.text(`Sub Total: ${subTotal}`, pageLeft + 10, boxY + 40, { width: contentWidth / 2 - 10 });
+
+    doc.text(`Bill Discount: ${billDisc}`, pageLeft + contentWidth / 2, boxY + 26, {
+      width: contentWidth / 2 - 10,
+      align: "right",
+    });
+    doc.text(`Grand Total: ${grand}`, pageLeft + contentWidth / 2, boxY + 40, {
+      width: contentWidth / 2 - 10,
+      align: "right",
+    });
+
+    doc.y = boxY + boxH + 10;
+
+    /* ---------- Table ---------- */
+    const W = { sr: 24, title: 0, qty: 46, rate: 56, disc: 60, net: 66 };
+    W.title = contentWidth - (W.sr + W.qty + W.rate + W.disc + W.net);
+    const X = {
+      sr: pageLeft,
+      title: pageLeft + W.sr,
+      qty: pageLeft + W.sr + W.title,
+      rate: pageLeft + W.sr + W.title + W.qty,
+      disc: pageLeft + W.sr + W.title + W.qty + W.rate,
+      net: pageLeft + W.sr + W.title + W.qty + W.rate + W.disc,
+    };
+
+    const drawHR2 = () => {
+      doc.save();
+      doc.lineWidth(0.6);
+      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+      doc.restore();
+    };
+
+    const printTableHeader = () => {
+      const y = doc.y;
+      doc.save();
+      doc.rect(pageLeft, y - 2, contentWidth, 18).fill("#f2f2f2");
+      doc.restore();
+
+      doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
+      doc.text("Sr", X.sr, y, { width: W.sr });
+      doc.text("Book Title", X.title, y, { width: W.title });
+
+      doc.text("Qty", X.qty, y, { width: W.qty, align: "center", lineBreak: false });
+      doc.text("Rate", X.rate, y, { width: W.rate, align: "center", lineBreak: false });
+      doc.text("Disc", X.disc, y, { width: W.disc, align: "center", lineBreak: false });
+      doc.text("Net", X.net, y, { width: W.net, align: "center", lineBreak: false });
+
+      doc.moveDown(1.1);
+      drawHR2();
+      doc.moveDown(0.25);
+    };
+
+    const rowHeight = (title, fontSize = 9) => {
+      doc.font("Helvetica").fontSize(fontSize);
+      const h = doc.heightOfString(title, { width: W.title });
+      return Math.ceil(Math.max(h, fontSize + 2)) + 6;
+    };
+
+    printTableHeader();
+
+    if (!items.length) {
+      doc.font("Helvetica").fontSize(10).fillColor("#000");
+      doc.text("No items found in this receipt.", { align: "left" });
+    } else {
+      let sr = 1;
+      for (const it of items) {
+        const title = safeText(it.book?.title || `Book #${it.book_id}`);
+        const qty = num(it.qty);
+        const rate = round2(it.rate);
+        const disc = round2(it.discount_amount);
+        const net = round2(it.net_amount);
+
+        const rh = rowHeight(title, 9);
+        ensureSpace(rh + 8);
+
+        const y = doc.y;
+
+        doc.font("Helvetica").fontSize(9).fillColor("#000");
+        doc.text(String(sr), X.sr, y, { width: W.sr });
+        doc.text(title, X.title, y, { width: W.title });
+
+        doc.font("Helvetica-Bold").fontSize(10);
+        doc.text(String(qty), X.qty, y - 1, { width: W.qty, align: "center" });
+        doc.text(String(rate), X.rate, y - 1, { width: W.rate, align: "center" });
+        doc.text(String(disc), X.disc, y - 1, { width: W.disc, align: "center" });
+        doc.text(String(net), X.net, y - 1, { width: W.net, align: "center" });
+
+        doc.y = y + rh - 3;
+        sr++;
+      }
+    }
+
+    /* ---------- Totals (bottom right) ---------- */
+    ensureSpace(90);
+    doc.moveDown(0.4);
+    drawHR2();
+    doc.moveDown(0.25);
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+
+    const rightColX = pageLeft + Math.floor(contentWidth * 0.55);
+    const rightColW = pageRight - rightColX;
+
+    const line = (label, value, bold = false) => {
+      doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(bold ? 10 : 9);
+      doc.text(label, rightColX, doc.y, { width: rightColW * 0.6, align: "left" });
+      doc.text(String(value), rightColX, doc.y - (bold ? 12 : 11), {
+        width: rightColW,
+        align: "right",
+      });
+      doc.moveDown(0.35);
+    };
+
+    line("Sub Total", subTotal);
+    line("Bill Discount", billDisc);
+    line("Shipping", ship);
+    line("Other", other);
+    line("Round Off", ro);
+    line("Grand Total", grand, true);
+
+    /* ---------- Remarks / Notes ---------- */
+    const noteText = safeText(receipt.remarks || "");
+    if (noteText) {
+      const noteH = Math.max(38, doc.heightOfString(noteText, { width: contentWidth - 20 }) + 22);
+      ensureSpace(noteH + 10);
+
+      doc.moveDown(0.4);
+      const y = doc.y;
+
+      doc.save();
+      doc.rect(pageLeft, y, contentWidth, noteH).fill("#fff3cd");
+      doc.restore();
+
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+      doc.text("Remarks", pageLeft + 10, y + 8);
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      doc.text(noteText, pageLeft + 10, y + 22, { width: contentWidth - 20 });
+
+      doc.y = y + noteH + 2;
+    }
+
+    doc.end();
+  });
+}
+
+/* ============================================================
+ * Controller
+ * ============================================================ */
 
 /**
  * POST /api/supplier-receipts
- * body: { supplier_id, school_order_id?, invoice_no?, academic_session?, invoice_date?, received_date?,
- *         status?, remarks?, bill_discount_type?, bill_discount_value?, shipping_charge?, other_charge?, round_off?,
- *         items: [{ book_id, qty, rate, item_discount_type?, item_discount_value? }, ...]
- *       }
  */
 exports.create = async (request, reply) => {
   const body = request.body || {};
@@ -143,8 +718,7 @@ exports.create = async (request, reply) => {
   const other_charge = body.other_charge ?? 0;
   const round_off = body.round_off ?? 0;
 
-  const status = body.status ? String(body.status) : "received";
-
+  const status = body.status ? String(body.status).toLowerCase() : "received";
   const items = Array.isArray(body.items) ? body.items : [];
 
   if (!supplier_id) return reply.code(400).send({ error: "supplier_id is required" });
@@ -246,7 +820,6 @@ exports.create = async (request, reply) => {
       { transaction: t }
     );
 
-    // Update Book rate & discount_percent (only if item discount is percent)
     for (const r of calcLines) {
       const discType = String(r.item_discount_type || "NONE").toUpperCase();
       const discVal = num(r.item_discount_value);
@@ -257,74 +830,9 @@ exports.create = async (request, reply) => {
       await Book.update(updatePayload, { where: { id: r.book_id }, transaction: t });
     }
 
-    // Inventory IN (Supplier Receipt)
-    for (const r of calcLines) {
-      const batchPayload = pickAttrs(InventoryBatch, {
-        book_id: r.book_id,
-
-        // ✅ supplier-focused
-        supplier_id: supplier_id,
-
-        // remove publisher_id usage (only included if column exists)
-        publisher_id: null,
-
-        source_type: "SUPPLIER_RECEIPT",
-        ref_table: "supplier_receipts",
-        ref_id: receipt.id,
-
-        received_qty: r.qty,
-        available_qty: r.qty,
-
-        rate: r.rate,
-        unit_cost: r.rate,
-        cost_price: r.rate,
-
-        remarks: `Receipt ${receipt.receipt_no}`,
-      });
-
-      const batch = await InventoryBatch.create(batchPayload, { transaction: t });
-
-      const txnPayload = pickAttrs(InventoryTxn, {
-        book_id: r.book_id,
-        batch_id: batch.id,
-        qty: r.qty,
-        txn_type: "IN",
-        type: "IN",
-        ref_table: "supplier_receipts",
-        ref_id: receipt.id,
-        notes: `Receive via ${receipt.receipt_no}`,
-      });
-
-      await InventoryTxn.create(txnPayload, { transaction: t });
-    }
-
-    // Ledger posting (only if received)
     if (receipt.status === "received") {
-      // ✅ idempotent: delete existing purchase posting for this receipt if any
-      await SupplierLedgerTxn.destroy({
-        where: {
-          supplier_id,
-          txn_type: "PURCHASE_RECEIVE",
-          ref_table: "supplier_receipts",
-          ref_id: receipt.id,
-        },
-        transaction: t,
-      });
-
-      await SupplierLedgerTxn.create(
-        {
-          supplier_id,
-          txn_date: receipt.received_date || receipt.invoice_date || now(),
-          txn_type: "PURCHASE_RECEIVE",
-          ref_table: "supplier_receipts",
-          ref_id: receipt.id,
-          ref_no: receipt.receipt_no,
-          debit: receipt.grand_total,
-          credit: 0,
-          narration: invoice_no ? `Purchase Invoice ${invoice_no}` : `Receipt ${receipt.receipt_no}`,
-        },
-        { transaction: t }
-      );
+      await ensureInventoryInForReceipt({ receipt, items: calcLines, t });
+      await postPurchaseLedger({ receipt, t });
     }
 
     await t.commit();
@@ -352,11 +860,10 @@ exports.create = async (request, reply) => {
 
 /**
  * GET /api/supplier-receipts
- * Query: supplier_id?, status?, from?, to?
  */
 exports.list = async (request, reply) => {
   try {
-    const { supplier_id, status, from, to } = request.query || {};
+    const { supplier_id, status, from, to, q } = request.query || {};
 
     const where = {};
     if (supplier_id) where.supplier_id = num(supplier_id);
@@ -366,6 +873,11 @@ exports.list = async (request, reply) => {
       where.invoice_date = {};
       if (from) where.invoice_date[Op.gte] = new Date(String(from));
       if (to) where.invoice_date[Op.lte] = new Date(String(to));
+    }
+
+    if (q && String(q).trim()) {
+      const s = `%${String(q).trim()}%`;
+      where[Op.or] = [{ receipt_no: { [Op.like]: s } }, { invoice_no: { [Op.like]: s } }];
     }
 
     const rows = await SupplierReceipt.findAll({
@@ -407,8 +919,67 @@ exports.getById = async (request, reply) => {
 };
 
 /**
+ * ✅ GET /api/supplier-receipts/:id/pdf
+ */
+exports.printReceiptPdf = async (request, reply) => {
+  const id = num(request.params?.id);
+
+  try {
+    const receipt = await SupplierReceipt.findByPk(id, {
+      include: [
+        { model: Supplier, as: "supplier" },
+        { model: SupplierReceiptItem, as: "items", include: [{ model: Book, as: "book" }] },
+      ],
+      order: [[{ model: SupplierReceiptItem, as: "items" }, "id", "ASC"]],
+    });
+
+    if (!receipt) {
+      return reply.code(404).send({ error: "NotFound", message: "Supplier receipt not found" });
+    }
+
+    const companyProfile = await CompanyProfile.findOne({
+      where: { is_active: true },
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
+    });
+
+    const r = receipt.toJSON();
+    const supplier = r.supplier || null;
+    const items = r.items || [];
+
+    const safeNo = String(r.receipt_no || `receipt-${r.id}`).replace(/[^\w\-]+/g, "_");
+
+    const pdfBuffer = await buildSupplierReceiptPdfBuffer({
+      receipt: r,
+      supplier,
+      companyProfile,
+      items,
+      pdfTitle: "SUPPLIER RECEIPT",
+      showPrintDate: true,
+    });
+
+    reply
+      .header("Content-Type", "application/pdf")
+      .header("Content-Disposition", `inline; filename="supplier-receipt-${safeNo}.pdf"`)
+      .send(pdfBuffer);
+
+    return reply;
+  } catch (err) {
+    request.log?.error?.(err);
+    console.error("❌ printReceiptPdf error:", err);
+    if (!reply.sent) {
+      return reply.code(500).send({
+        error: "InternalServerError",
+        message: err?.message || "Failed to generate supplier receipt PDF",
+      });
+    }
+  }
+};
+
+/**
  * PATCH /api/supplier-receipts/:id/status
- * body: { status: "draft" | "received" | "cancelled" }
  */
 exports.updateStatus = async (request, reply) => {
   const id = num(request.params?.id);
@@ -429,62 +1000,56 @@ exports.updateStatus = async (request, reply) => {
       return reply.code(404).send({ error: "Receipt not found" });
     }
 
-    const prevStatus = receipt.status;
+    const prevStatus = String(receipt.status || "draft").toLowerCase();
+
+    const items =
+      nextStatus === "received" || (prevStatus === "received" && nextStatus === "cancelled")
+        ? await SupplierReceiptItem.findAll({
+            where: { supplier_receipt_id: receipt.id },
+            transaction: t,
+            lock: t.LOCK.UPDATE,
+          })
+        : [];
+
+    if (prevStatus === "cancelled") {
+      await t.rollback();
+      return reply.code(400).send({ error: "Cancelled receipt cannot be changed." });
+    }
+
     receipt.status = nextStatus;
     await receipt.save({ transaction: t });
 
-    // When moving to received -> ensure ledger posted
     if (prevStatus !== "received" && nextStatus === "received") {
-      // idempotent delete + create
-      await SupplierLedgerTxn.destroy({
-        where: {
-          supplier_id: receipt.supplier_id,
-          ref_table: "supplier_receipts",
-          ref_id: receipt.id,
-          txn_type: "PURCHASE_RECEIVE",
-        },
-        transaction: t,
-      });
+      const lineItems = (items || []).map((x) => ({
+        book_id: num(x.book_id),
+        qty: Math.max(0, Math.floor(num(x.qty))),
+        rate: round2(x.rate),
+      }));
 
-      await SupplierLedgerTxn.create(
-        {
-          supplier_id: receipt.supplier_id,
-          txn_date: receipt.received_date || receipt.invoice_date || now(),
-          txn_type: "PURCHASE_RECEIVE",
-          ref_table: "supplier_receipts",
-          ref_id: receipt.id,
-          ref_no: receipt.receipt_no,
-          debit: receipt.grand_total,
-          credit: 0,
-          narration: receipt.invoice_no
-            ? `Purchase Invoice ${receipt.invoice_no}`
-            : `Receipt ${receipt.receipt_no}`,
-        },
-        { transaction: t }
-      );
+      await ensureInventoryInForReceipt({ receipt, items: lineItems, t });
+      await postPurchaseLedger({ receipt, t });
     }
 
-    // If cancelled -> remove ledger posting (optional but recommended)
-    if (nextStatus === "cancelled") {
-      await SupplierLedgerTxn.destroy({
-        where: {
-          supplier_id: receipt.supplier_id,
-          ref_table: "supplier_receipts",
-          ref_id: receipt.id,
-          txn_type: "PURCHASE_RECEIVE",
-        },
-        transaction: t,
-      });
+    if (prevStatus === "received" && nextStatus === "cancelled") {
+      await removePurchaseLedger({ receipt, t });
+      await reverseInventoryForReceipt({ receipt, t });
+    }
+
+    if (prevStatus === "draft" && nextStatus === "cancelled") {
+      await removePurchaseLedger({ receipt, t });
     }
 
     await t.commit();
-    return reply.send({ ok: true });
+    return reply.send({ ok: true, id: receipt.id, status: receipt.status });
   } catch (err) {
     try {
       await t.rollback();
     } catch (_) {}
     request.log?.error?.(err);
     console.error("❌ updateSupplierReceiptStatus error:", err);
-    return reply.code(500).send({ error: "Failed to update status" });
+    return reply.code(500).send({
+      error: "Failed to update status",
+      details: err?.message || String(err),
+    });
   }
 };
