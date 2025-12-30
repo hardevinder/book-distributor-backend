@@ -1,3 +1,4 @@
+// src/routes/schoolOrders.js  (or routes/schoolOrders.js)
 "use strict";
 
 const schoolOrderController = require("../controllers/schoolOrderController");
@@ -24,15 +25,27 @@ module.exports = async function (fastify, opts) {
   fastify.get("/availability", availabilityController.schoolAvailability);
 
   // ======================================================
-  // PARAM ROUTES AFTER THIS
+  // ✅ PARAM ROUTES (Grouped)
   // ======================================================
 
+  // ---------- Email helpers for modal ----------
+  // GET /api/school-orders/:orderId/email-preview
+  fastify.get("/:orderId/email-preview", schoolOrderController.getOrderEmailPreview);
+
+  // GET /api/school-orders/:orderId/email-logs?limit=20
+  fastify.get("/:orderId/email-logs", schoolOrderController.getOrderEmailLogs);
+
+  // POST /api/school-orders/:orderId/send-email
+  fastify.post("/:orderId/send-email", schoolOrderController.sendOrderEmailForOrder);
+
+  // ---------- Meta / order no ----------
   // PATCH /api/school-orders/:orderId/meta
   fastify.patch("/:orderId/meta", schoolOrderController.updateSchoolOrderMeta);
 
   // PATCH /api/school-orders/:orderId/order-no
   fastify.patch("/:orderId/order-no", schoolOrderController.updateSchoolOrderNo);
 
+  // ---------- Receive ----------
   // POST /api/school-orders/:orderId/receive
   fastify.post("/:orderId/receive", schoolOrderController.receiveOrderItems);
 
@@ -40,29 +53,24 @@ module.exports = async function (fastify, opts) {
   // ✅ RE-ORDER ROUTES (IMPORTANT)
   // ======================================================
 
-  // ✅ Alias (for frontend calling /reorder)
-  // POST /api/school-orders/:orderId/reorder
-  fastify.post(
-    "/:orderId/reorder",
-    schoolOrderController.reorderPendingForOrder
-  );
+  /**
+   * ✅ NEW: Copy reorder with manual qty (does NOT touch old order, does NOT change pending)
+   * POST /api/school-orders/:orderId/reorder-copy
+   * body: { items: [{ item_id, total_order_qty }] }
+   */
+  fastify.post("/:orderId/reorder-copy", schoolOrderController.reorderCopyWithEdit);
 
-  // ✅ Canonical route
+  // ✅ Alias (frontend calling /reorder)
+  // POST /api/school-orders/:orderId/reorder
+  fastify.post("/:orderId/reorder", schoolOrderController.reorderPendingForOrder);
+
+  // ✅ Canonical route (pending-only, shifts reordered_qty)
   // POST /api/school-orders/:orderId/reorder-pending
-  fastify.post(
-    "/:orderId/reorder-pending",
-    schoolOrderController.reorderPendingForOrder
-  );
+  fastify.post("/:orderId/reorder-pending", schoolOrderController.reorderPendingForOrder);
 
   // ======================================================
   // OTHER ACTION ROUTES
   // ======================================================
-
-  // POST /api/school-orders/:orderId/send-email
-  fastify.post(
-    "/:orderId/send-email",
-    schoolOrderController.sendOrderEmailForOrder
-  );
 
   // GET /api/school-orders/:orderId/pdf
   fastify.get("/:orderId/pdf", schoolOrderController.printOrderPdf);

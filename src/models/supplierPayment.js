@@ -1,4 +1,3 @@
-
 "use strict";
 
 module.exports = (sequelize, DataTypes) => {
@@ -21,7 +20,28 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
+      // Cash paid
       amount: {
+        type: DataTypes.DECIMAL(12, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+
+      // ✅ Discount received during payment
+      discount_amount: {
+        type: DataTypes.DECIMAL(12, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+
+      discount_percent: {
+        type: DataTypes.DECIMAL(6, 2),
+        allowNull: false,
+        defaultValue: 0,
+      },
+
+      // ✅ Amount + discount (payable reduced by this)
+      total_settled: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
@@ -60,9 +80,6 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: "supplier_id",
       as: "supplier",
     });
-
-    // optional reverse relation later:
-    // SupplierPayment.hasMany(models.SupplierLedgerTxn, { ... })
   };
 
   return SupplierPayment;

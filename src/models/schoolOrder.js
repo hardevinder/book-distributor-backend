@@ -16,7 +16,6 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
-      // ✅ supplier-wise order
       supplier_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
@@ -33,20 +32,17 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ NEW (Option-1): original vs reorder
       order_type: {
         type: DataTypes.ENUM("original", "reorder"),
         allowNull: false,
         defaultValue: "original",
       },
 
-      // ✅ NEW (optional but recommended): link reorder -> original order
       parent_order_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
       },
 
-      // ✅ NEW (optional): reorder number sequence for same parent (1,2,3...)
       reorder_seq: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
@@ -59,7 +55,7 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       status: {
-        type: DataTypes.ENUM("draft", "sent", "partial_received", "completed", "cancelled"),
+        type: DataTypes.ENUM("draft", "sent", "partial_received", "completed", "cancelled", "reordered"),
         allowNull: false,
         defaultValue: "draft",
       },
@@ -69,39 +65,20 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // FK → transports.id (Option 1)
       transport_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
       },
 
-      // “Through” text (Option 1)
-      transport_through: {
-        type: DataTypes.STRING(150),
-        allowNull: true,
-      },
-
-      // ✅ Option 2 transport
       transport_id_2: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
       },
 
-      // ✅ “Through” text (Option 2)
-      transport_through_2: {
-        type: DataTypes.STRING(150),
-        allowNull: true,
-      },
-
-      // Notes (will be printed highlighted in footer)
       notes: {
         type: DataTypes.TEXT,
         allowNull: true,
       },
-
-      /* =======================================================
-       * ✅ Commercial / Ledger fields (Order level)
-       * ======================================================= */
 
       freight_charges: {
         type: DataTypes.DECIMAL(12, 2),
@@ -121,56 +98,70 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
       },
 
-      // overall discount on whole order (₹)
       overall_discount: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      // +/- adjustment
       round_off: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      // final payable total (₹)
       grand_total: {
         type: DataTypes.DECIMAL(14, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      /* =======================================================
-       * ✅ NEW: Link SchoolOrder -> SupplierReceipt (Option A)
-       * ======================================================= */
-
       supplier_receipt_id: {
-        // links supplier_receipts.id
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
       },
 
       supplier_receipt_no: {
-        // convenience snapshot like SR-2025-12-000001
         type: DataTypes.STRING(50),
         allowNull: true,
       },
 
       received_at: {
-        // optional: first time receive completed
         type: DataTypes.DATE,
         allowNull: true,
       },
 
-      // optional: when email sent (if your DB has/needs it)
       email_sent_at: {
         type: DataTypes.DATE,
         allowNull: true,
       },
 
-      // ✅ NEW: Supplier Bill No captured during receiving
+      email_sent_count: {
+        type: DataTypes.INTEGER,
+        allowNull: false,
+        defaultValue: 0,
+      },
+
+      last_email_sent_at: {
+        type: DataTypes.DATE,
+        allowNull: true,
+      },
+
+      last_email_to: {
+        type: DataTypes.STRING(500),
+        allowNull: true,
+      },
+
+      last_email_cc: {
+        type: DataTypes.STRING(500),
+        allowNull: true,
+      },
+
+      last_email_subject: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+      },
+
       bill_no: {
         type: DataTypes.STRING(50),
         allowNull: true,
@@ -185,67 +176,38 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ["academic_session"] },
         { fields: ["order_type"] },
         { fields: ["parent_order_id"] },
+        { fields: ["reorder_seq"] },
         { fields: ["order_date"] },
         { fields: ["supplier_receipt_id"] },
+        { fields: ["email_sent_count"] },
+        { fields: ["last_email_sent_at"] },
 
-        // ✅ IMPORTANT: allows 1 original + many reorders for same school/supplier/session
-        // (You must also DROP old uniq_school_session_supplier on DB)
-        {
-          name: "uniq_school_session_supplier_type",
-          unique: true,
-          fields: ["school_id", "academic_session", "supplier_id", "order_type"],
-        },
+        // ✅ IMPORTANT:
+        // We REMOVED uniq_school_session_supplier_type because it blocks multiple reorders.
+        // We will enforce "only 1 ORIGINAL per school+session+supplier" via DB migration (generated column trick).
+        // And we enforce reorder sequencing per parent via uq_parent_reorder_seq (migration).
       ],
     }
   );
 
   SchoolOrder.associate = (models) => {
-    SchoolOrder.belongsTo(models.School, {
-      foreignKey: "school_id",
-      as: "school",
-    });
+    SchoolOrder.belongsTo(models.School, { foreignKey: "school_id", as: "school" });
+    SchoolOrder.belongsTo(models.Supplier, { foreignKey: "supplier_id", as: "supplier" });
+    SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id", as: "transport" });
+    SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id_2", as: "transport2" });
 
-    SchoolOrder.belongsTo(models.Supplier, {
-      foreignKey: "supplier_id",
-      as: "supplier",
-    });
+    SchoolOrder.hasMany(models.SchoolOrderItem, { foreignKey: "school_order_id", as: "items" });
 
-    // ✅ Option 1 transport
-    SchoolOrder.belongsTo(models.Transport, {
-      foreignKey: "transport_id",
-      as: "transport",
-    });
-
-    // ✅ Option 2 transport
-    SchoolOrder.belongsTo(models.Transport, {
-      foreignKey: "transport_id_2",
-      as: "transport2",
-    });
-
-    SchoolOrder.hasMany(models.SchoolOrderItem, {
-      foreignKey: "school_order_id",
-      as: "items",
-    });
-
-    // ✅ optional association: SchoolOrder -> SupplierReceipt
     if (models.SupplierReceipt) {
-      SchoolOrder.belongsTo(models.SupplierReceipt, {
-        foreignKey: "supplier_receipt_id",
-        as: "supplierReceipt",
-      });
+      SchoolOrder.belongsTo(models.SupplierReceipt, { foreignKey: "supplier_receipt_id", as: "supplierReceipt" });
     }
 
-    // ✅ NEW: self association (reorder -> parent original)
-    SchoolOrder.belongsTo(models.SchoolOrder, {
-      foreignKey: "parent_order_id",
-      as: "parentOrder",
-    });
+    SchoolOrder.belongsTo(models.SchoolOrder, { foreignKey: "parent_order_id", as: "parentOrder" });
+    SchoolOrder.hasMany(models.SchoolOrder, { foreignKey: "parent_order_id", as: "reorders" });
 
-    // ✅ NEW: original -> many reorders
-    SchoolOrder.hasMany(models.SchoolOrder, {
-      foreignKey: "parent_order_id",
-      as: "reorders",
-    });
+    if (models.SchoolOrderEmailLog) {
+      SchoolOrder.hasMany(models.SchoolOrderEmailLog, { foreignKey: "school_order_id", as: "emailLogs" });
+    }
   };
 
   return SchoolOrder;

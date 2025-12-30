@@ -31,7 +31,6 @@ const cleanStr = (v, max = 255) => {
 };
 
 const buildPaymentRefNo = (payment) => {
-  // prefer user-provided ref_no, else fallback
   return (
     cleanStr(payment?.ref_no, 80) ||
     cleanStr(payment?.txn_ref, 80) ||
@@ -42,20 +41,26 @@ const buildPaymentRefNo = (payment) => {
 /**
  * Notes:
  * - Debit = payable increases (purchase receive)
- * - Credit = payable decreases (payment made to supplier)
+ * - Credit = payable decreases (payment made OR discount received)
+ *
+ * Payment discount logic:
+ * - Cash paid (amount)
+ * - Discount received (discount)
+ * - Ledger credit = amount + discount
  */
 
 /* ============================
    POST /api/suppliers/:supplierId/payments
    Body:
    {
-     amount: number,
-     pay_date?: date,
-     payment_mode?: string,
+     amount: number,                 // cash paid
+     discount_amount?: number,       // optional discount received
+     discount_percent?: number,      // optional (only one of discount_* allowed)
+     payment_date?: date,            // (DATEONLY in your model)
+     mode?: "CASH"|"UPI"|"BANK"|"CHEQUE"|"OTHER",
      ref_no?: string,
      narration?: string,
-     notes?: string,
-     txn_ref?: string (optional)
+     created_by?: string
    }
    ============================ */
 exports.createPayment = async (request, reply) => {
@@ -74,59 +79,91 @@ exports.createPayment = async (request, reply) => {
     }
 
     const body = request.body || {};
-    const amount = round2(body.amount);
 
+    const amount = round2(body.amount); // cash paid
     if (!amount || amount <= 0) {
       await t.rollback();
       return reply.code(400).send({ error: "Amount must be > 0" });
     }
 
-    const payDate = safeDate(body.pay_date) || new Date();
+    // ✅ discount: allow either percent OR fixed (not both)
+    const discountPercentRaw = body.discount_percent;
+    const discountAmountRaw = body.discount_amount;
 
-    // These fields depend on your SupplierPayment model. We set them only if present.
+    const hasPct =
+      discountPercentRaw !== undefined &&
+      discountPercentRaw !== null &&
+      String(discountPercentRaw).trim() !== "";
+
+    const hasFix =
+      discountAmountRaw !== undefined &&
+      discountAmountRaw !== null &&
+      String(discountAmountRaw).trim() !== "";
+
+    if (hasPct && hasFix) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "Enter either discount_percent OR discount_amount (not both).",
+      });
+    }
+
+    let discount_percent = hasPct ? round2(discountPercentRaw) : 0;
+    let discount_amount = hasFix ? round2(discountAmountRaw) : 0;
+
+    if (discount_percent < 0 || discount_amount < 0) {
+      await t.rollback();
+      return reply.code(400).send({ error: "Discount cannot be negative." });
+    }
+
+    if (hasPct) {
+      if (discount_percent > 100) {
+        await t.rollback();
+        return reply
+          .code(400)
+          .send({ error: "discount_percent cannot exceed 100." });
+      }
+      discount_amount = round2((amount * discount_percent) / 100);
+    } else if (hasFix) {
+      discount_percent = amount > 0 ? round2((discount_amount * 100) / amount) : 0;
+    }
+
+    if (discount_amount > amount) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "discount_amount cannot be greater than amount (cash paid).",
+      });
+    }
+
+    const total_settled = round2(amount + discount_amount);
+
+    // ✅ payment_date is DATEONLY in your model
+    // Accept body.payment_date, else today (DATEONLY)
+    const paymentDateObj = safeDate(body.payment_date) || new Date();
+    const payment_date = paymentDateObj.toISOString().slice(0, 10); // YYYY-MM-DD
+
+    const mode = cleanStr(body.mode || body.payment_mode, 10) || "CASH";
+
+    // ✅ Build payment payload matching your model
     const paymentPayload = {
       supplier_id: supplierId,
-
-      // common date column names: pay_date / txn_date / payment_date
-      ...(SupplierPayment.rawAttributes.pay_date
-        ? { pay_date: payDate }
-        : SupplierPayment.rawAttributes.txn_date
-        ? { txn_date: payDate }
-        : SupplierPayment.rawAttributes.payment_date
-        ? { payment_date: payDate }
-        : {}),
-
-      // amount column name possibilities
-      ...(SupplierPayment.rawAttributes.amount
-        ? { amount }
-        : SupplierPayment.rawAttributes.paid_amount
-        ? { paid_amount: amount }
-        : SupplierPayment.rawAttributes.payment_amount
-        ? { payment_amount: amount }
-        : { amount }), // fallback
-
-      ...(SupplierPayment.rawAttributes.payment_mode
-        ? { payment_mode: cleanStr(body.payment_mode, 30) }
-        : SupplierPayment.rawAttributes.mode
-        ? { mode: cleanStr(body.payment_mode || body.mode, 30) }
-        : {}),
-
-      ...(SupplierPayment.rawAttributes.ref_no
-        ? { ref_no: cleanStr(body.ref_no, 80) }
-        : {}),
-
-      ...(SupplierPayment.rawAttributes.txn_ref
-        ? { txn_ref: cleanStr(body.txn_ref, 80) }
-        : {}),
-
-      ...(SupplierPayment.rawAttributes.narration
-        ? { narration: cleanStr(body.narration, 255) }
-        : {}),
-
-      ...(SupplierPayment.rawAttributes.notes
-        ? { notes: cleanStr(body.notes, 255) }
-        : {}),
+      payment_date,
+      amount,
+      mode,
+      ref_no: cleanStr(body.ref_no, 80),
+      narration: cleanStr(body.narration, 255),
+      created_by: cleanStr(body.created_by, 80),
     };
+
+    // ✅ save discount fields only if columns exist (so code won’t crash before migration)
+    if (SupplierPayment.rawAttributes.discount_amount) {
+      paymentPayload.discount_amount = discount_amount;
+    }
+    if (SupplierPayment.rawAttributes.discount_percent) {
+      paymentPayload.discount_percent = discount_percent;
+    }
+    if (SupplierPayment.rawAttributes.total_settled) {
+      paymentPayload.total_settled = total_settled;
+    }
 
     const payment = await SupplierPayment.create(paymentPayload, {
       transaction: t,
@@ -134,25 +171,27 @@ exports.createPayment = async (request, reply) => {
 
     const refNo = buildPaymentRefNo(payment);
 
-    // ✅ Post to ledger as CREDIT (payable decreases)
-    // Unique index on ledger: (supplier_id, txn_type, ref_table, ref_id)
-    // => prevents double-posting if createPayment is retried accidentally.
+    // ✅ ledger date should be a full DateTime
+    const ledgerDate = paymentDateObj;
+
+    const narrationBase =
+      body.narration ||
+      (discount_amount > 0
+        ? `Payment (₹${amount}) + Discount (₹${discount_amount}) (${refNo})`
+        : `Payment to supplier (${refNo})`);
+
     const ledgerPayload = {
       supplier_id: supplierId,
-      txn_date: payDate,
+      txn_date: ledgerDate,
       txn_type: "PAYMENT",
       ref_table: "supplier_payments",
       ref_id: payment.id,
       ref_no: refNo,
       debit: 0,
-      credit: amount,
-      narration: cleanStr(
-        body.narration || `Payment to supplier (${refNo})`,
-        255
-      ),
+      credit: total_settled,
+      narration: cleanStr(narrationBase, 255),
     };
 
-    // If the row already exists due to retry, we keep it idempotent.
     await SupplierLedgerTxn.findOrCreate({
       where: {
         supplier_id: supplierId,
@@ -167,9 +206,18 @@ exports.createPayment = async (request, reply) => {
     await t.commit();
 
     return reply.send({
-      message: "Payment saved and ledger credited.",
+      message:
+        discount_amount > 0
+          ? "Payment + discount saved and ledger credited."
+          : "Payment saved and ledger credited.",
       supplier,
       payment,
+      settle: {
+        cash_paid: amount,
+        discount_amount,
+        discount_percent,
+        total_settled,
+      },
     });
   } catch (err) {
     await t.rollback();
@@ -199,23 +247,17 @@ exports.listPayments = async (request, reply) => {
     const fromD = safeDate(from);
     const toD = safeDate(to);
 
-    // detect which date column exists on SupplierPayment
-    const dateCol =
-      (SupplierPayment.rawAttributes.pay_date && "pay_date") ||
-      (SupplierPayment.rawAttributes.txn_date && "txn_date") ||
-      (SupplierPayment.rawAttributes.payment_date && "payment_date") ||
-      null;
-
-    if (dateCol && (fromD || toD)) {
-      where[dateCol] = {};
-      if (fromD) where[dateCol][Op.gte] = fromD;
-      if (toD) where[dateCol][Op.lte] = toD;
+    // ✅ your model uses payment_date
+    if (fromD || toD) {
+      where.payment_date = {};
+      if (fromD) where.payment_date[Op.gte] = fromD.toISOString().slice(0, 10);
+      if (toD) where.payment_date[Op.lte] = toD.toISOString().slice(0, 10);
     }
 
     const rows = await SupplierPayment.findAll({
       where,
       order: [
-        [dateCol || "createdAt", "DESC"],
+        ["payment_date", "DESC"],
         ["id", "DESC"],
       ],
       limit: Math.min(500, Math.max(1, num(limit) || 200)),
@@ -231,7 +273,6 @@ exports.listPayments = async (request, reply) => {
 
 /* ============================
    GET /api/suppliers/:supplierId/payments/:paymentId
-   - Fetch single payment (for View modal)
    ============================ */
 exports.getPaymentById = async (request, reply) => {
   try {
@@ -252,8 +293,6 @@ exports.getPaymentById = async (request, reply) => {
 
     if (!payment) return reply.code(404).send({ error: "Payment not found" });
 
-    // Keep response shape flexible for frontend:
-    // frontend accepts { payment } or direct object
     return reply.send({ supplier, payment });
   } catch (err) {
     request.log?.error?.(err);
@@ -263,26 +302,20 @@ exports.getPaymentById = async (request, reply) => {
 };
 
 /* ============================
-   DELETE /api/suppliers/:supplierId/payments/:paymentId   ✅ (preferred)
-   ALSO supports: /api/suppliers/payments/:paymentId       ✅ (backward compatible)
-   - Deletes payment
-   - Deletes corresponding ledger txn (PAYMENT credit)
+   DELETE /api/suppliers/:supplierId/payments/:paymentId
+   ALSO supports: /api/suppliers/payments/:paymentId
    ============================ */
 exports.deletePayment = async (request, reply) => {
   const t = await sequelize.transaction();
   try {
-    // ✅ support both route shapes:
-    // 1) /:supplierId/payments/:paymentId  (frontend wants this)
-    // 2) /payments/:paymentId              (your existing route)
     const paymentId = num(request.params?.paymentId);
-    const supplierIdFromParams = num(request.params?.supplierId); // may be 0 in old route
+    const supplierIdFromParams = num(request.params?.supplierId);
 
     if (!paymentId) {
       await t.rollback();
       return reply.code(400).send({ error: "Invalid paymentId" });
     }
 
-    // ensure payment exists
     const payment = await SupplierPayment.findByPk(paymentId, { transaction: t });
     if (!payment) {
       await t.rollback();
@@ -291,7 +324,6 @@ exports.deletePayment = async (request, reply) => {
 
     const supplierId = num(payment.supplier_id);
 
-    // extra guard if supplierId was provided in route
     if (supplierIdFromParams && supplierIdFromParams !== supplierId) {
       await t.rollback();
       return reply
@@ -299,7 +331,6 @@ exports.deletePayment = async (request, reply) => {
         .send({ error: "Payment does not belong to this supplier" });
     }
 
-    // delete ledger row first (safe)
     await SupplierLedgerTxn.destroy({
       where: {
         supplier_id: supplierId,
