@@ -26,20 +26,37 @@ module.exports = (sequelize, DataTypes) => {
         unique: true,
       },
 
-      // ✅ Existing (keep)
+      /* =========================
+         ✅ NEW: Challan vs Invoice
+         ========================= */
+      receive_doc_type: {
+        type: DataTypes.ENUM("CHALLAN", "INVOICE"),
+        allowNull: false,
+        defaultValue: "CHALLAN",
+      },
+
+      // store challan/invoice number in one place
+      doc_no: {
+        type: DataTypes.STRING(100),
+        allowNull: true,
+      },
+
+      // optional challan/invoice date
+      doc_date: {
+        type: DataTypes.DATEONLY,
+        allowNull: true,
+      },
+
+      /* =========================
+         ✅ Backward-compat fields
+         (keep if old data exists)
+         ========================= */
       invoice_no: {
         type: DataTypes.STRING(50),
         allowNull: true,
       },
 
-      // ✅ NEW: Bill Number (store while receiving)
-      bill_no: {
-        type: DataTypes.STRING(100),
-        allowNull: true,
-      },
-
-      // ✅ NEW: Bill Date (optional)
-      bill_date: {
+      invoice_date: {
         type: DataTypes.DATEONLY,
         allowNull: true,
       },
@@ -49,21 +66,9 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ optional: "receipt_date" (controller uses it)
-      // if you don't want to add this column in DB, then instead change controller to use received_date.
-      receipt_date: {
-        type: DataTypes.DATE,
-        allowNull: true,
-      },
-
-      invoice_date: {
-        type: DataTypes.DATE,
-        allowNull: false,
-        defaultValue: DataTypes.NOW,
-      },
-
+      // ✅ Keep only one "received date" (GRN date)
       received_date: {
-        type: DataTypes.DATE,
+        type: DataTypes.DATEONLY,
         allowNull: false,
         defaultValue: DataTypes.NOW,
       },
@@ -134,13 +139,12 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         { fields: ["supplier_id", "received_date"] },
         { fields: ["supplier_id", "status"] },
-        { fields: ["school_order_id"] },
+        { fields: ["school_order_id"] }, // ✅ NOT unique (multiple receipts per order allowed)
+        { fields: ["supplier_id", "receive_doc_type"] },
+        { fields: ["supplier_id", "doc_no"] },
 
-        // ✅ helpful: only one receipt per order (recommended for your flow)
-        { unique: true, fields: ["school_order_id"] },
-
-        // ✅ optional: prevent duplicate bill no per supplier (enable only if you want)
-        // { unique: true, fields: ["supplier_id", "bill_no"] },
+        // ✅ optional: prevent duplicate doc number per supplier+type
+        // { unique: true, fields: ["supplier_id", "receive_doc_type", "doc_no"] },
       ],
     }
   );

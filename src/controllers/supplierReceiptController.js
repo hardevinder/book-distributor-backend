@@ -1,4 +1,3 @@
-// src/controllers/supplierReceiptController.js
 "use strict";
 
 const fs = require("fs");
@@ -18,6 +17,9 @@ const {
   SupplierReceiptItem,
   SupplierLedgerTxn,
   CompanyProfile,
+
+  // Optional (if exists in your models/index.js)
+  SchoolOrderItem,
 } = require("../models");
 
 /* ============================================================
@@ -69,6 +71,7 @@ function calcItemLine({ qty, rate, discType, discVal }) {
   if (t === "PERCENT") {
     discount = round2(gross * (Math.max(0, v) / 100));
   } else if (t === "AMOUNT") {
+    // NOTE: AMOUNT here means "line discount amount" as per current legacy logic
     discount = round2(Math.max(0, v));
   }
 
@@ -126,6 +129,26 @@ function pickAttrs(model, payload) {
     if (attrs[k]) out[k] = payload[k];
   }
   return out;
+}
+
+/* ============================================================
+ * Doc helpers (Challan/Invoice)
+ * ============================================================ */
+
+function normalizeDocType(v) {
+  const s = String(v || "").trim().toUpperCase();
+  return s === "INVOICE" ? "INVOICE" : "CHALLAN";
+}
+
+function docLabel(receive_doc_type) {
+  return normalizeDocType(receive_doc_type) === "INVOICE" ? "Invoice No" : "Challan No";
+}
+
+function docNarration(receipt) {
+  const t = normalizeDocType(receipt.receive_doc_type);
+  const no = safeText(receipt.doc_no || receipt.invoice_no || "");
+  if (no) return `${t} ${no}`;
+  return `Receipt ${safeText(receipt.receipt_no || receipt.id)}`;
 }
 
 /* ============================================================
@@ -195,6 +218,45 @@ async function loadLogoBuffer(logoRef) {
   return null;
 }
 
+/* ============================================================
+ * Order items received_qty helpers (optional)
+ * ============================================================ */
+
+async function bumpOrderReceivedQty({ school_order_id, lines, sign, t }) {
+  if (!SchoolOrderItem) return; // optional
+  if (!school_order_id) return;
+
+  // sign: +1 for receive, -1 for cancel/reverse
+  for (const r of lines) {
+    const book_id = num(r.book_id);
+    const qty = Math.max(0, Math.floor(num(r.qty)));
+    if (!book_id || qty <= 0) continue;
+
+    // lock row if exists
+    const row = await SchoolOrderItem.findOne({
+      where: { school_order_id: num(school_order_id), book_id },
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    // if no row found, skip silently (some setups don't store order-item per book)
+    if (!row) continue;
+
+    const prev = num(row.received_qty);
+    const next = prev + sign * qty;
+
+    // clamp to [0, ordered_qty if exists]
+    let finalVal = Math.max(0, next);
+    if (row.total_order_qty != null || row.ordered_qty != null) {
+      const ord = num(row.total_order_qty ?? row.ordered_qty);
+      if (ord > 0) finalVal = Math.min(finalVal, ord);
+    }
+
+    row.received_qty = finalVal;
+    await row.save({ transaction: t });
+  }
+}
+
 /**
  * Ledger Post (idempotent)
  */
@@ -221,9 +283,7 @@ async function postPurchaseLedger({ receipt, t }) {
       ref_no: receipt.receipt_no,
       debit: round2(receipt.grand_total),
       credit: 0,
-      narration: receipt.invoice_no
-        ? `Purchase Invoice ${receipt.invoice_no}`
-        : `Receipt ${receipt.receipt_no}`,
+      narration: docNarration(receipt),
     },
     { transaction: t }
   );
@@ -282,7 +342,7 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
       cost_price: r.rate,
       purchase_price: r.rate,
 
-      remarks: `Receipt ${receipt.receipt_no}`,
+      remarks: `${normalizeDocType(receipt.receive_doc_type)} ${safeText(receipt.doc_no || receipt.invoice_no || "")} • ${receipt.receipt_no}`,
     });
 
     const batch = await InventoryBatch.create(batchPayload, { transaction: t });
@@ -358,7 +418,7 @@ async function reverseInventoryForReceipt({ receipt, t }) {
 }
 
 /* ============================================================
- * ✅ RECEIPT PDF builder -> Buffer (same style as PO)
+ * ✅ RECEIPT PDF builder -> Buffer
  * ============================================================ */
 function buildSupplierReceiptPdfBuffer({
   receipt,
@@ -468,25 +528,38 @@ function buildSupplierReceiptPdfBuffer({
     doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
     doc.moveDown(0.5);
 
-    /* ---------- TOP: Receipt No (left) + Date (right) ---------- */
+    /* ---------- TOP: Receipt No + Doc + Dates ---------- */
     const topY = doc.y;
     const leftTopW = Math.floor(contentWidth * 0.65);
     const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
     const rightTopW = pageRight - rightTopX;
 
     const receiptNo = safeText(receipt.receipt_no || receipt.id);
-    const invNo = receipt.invoice_no ? safeText(receipt.invoice_no) : "-";
-    const invDate = receipt.invoice_date ? new Date(receipt.invoice_date).toLocaleDateString("en-IN") : "-";
+
+    const rType = normalizeDocType(receipt.receive_doc_type);
+    const dNo = safeText(receipt.doc_no || receipt.invoice_no || "-");
+    const dDate = receipt.doc_date
+      ? new Date(receipt.doc_date).toLocaleDateString("en-IN")
+      : receipt.invoice_date
+      ? new Date(receipt.invoice_date).toLocaleDateString("en-IN")
+      : "-";
+
     const recvDate = receipt.received_date ? new Date(receipt.received_date).toLocaleDateString("en-IN") : "-";
 
     doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
     doc.text(`Receipt No: ${receiptNo}`, pageLeft, topY, { width: leftTopW, align: "left" });
 
     doc.font("Helvetica").fontSize(9).fillColor("#000");
-    doc.text(`Invoice No: ${invNo}`, pageLeft, doc.y + 2, { width: leftTopW, align: "left" });
+    doc.text(`${rType === "INVOICE" ? "Invoice" : "Challan"} No: ${dNo}`, pageLeft, doc.y + 2, {
+      width: leftTopW,
+      align: "left",
+    });
 
     doc.font("Helvetica").fontSize(9).fillColor("#000");
-    doc.text(`Invoice Date: ${invDate}`, rightTopX, topY + 1, { width: rightTopW, align: "right" });
+    doc.text(`${rType === "INVOICE" ? "Invoice" : "Challan"} Date: ${dDate}`, rightTopX, topY + 1, {
+      width: rightTopW,
+      align: "right",
+    });
     doc.text(`Received Date: ${recvDate}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
 
     if (showPrintDate) {
@@ -498,7 +571,7 @@ function buildSupplierReceiptPdfBuffer({
     drawHR();
     doc.moveDown(0.35);
 
-    /* ---------- To (Supplier) ---------- */
+    /* ---------- From Supplier ---------- */
     if (supplier && supplier.name) {
       doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
       doc.text("From Supplier:", pageLeft, doc.y);
@@ -650,10 +723,7 @@ function buildSupplierReceiptPdfBuffer({
     const line = (label, value, bold = false) => {
       doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(bold ? 10 : 9);
       doc.text(label, rightColX, doc.y, { width: rightColW * 0.6, align: "left" });
-      doc.text(String(value), rightColX, doc.y - (bold ? 12 : 11), {
-        width: rightColW,
-        align: "right",
-      });
+      doc.text(String(value), rightColX, doc.y - (bold ? 12 : 11), { width: rightColW, align: "right" });
       doc.moveDown(0.35);
     };
 
@@ -664,7 +734,7 @@ function buildSupplierReceiptPdfBuffer({
     line("Round Off", ro);
     line("Grand Total", grand, true);
 
-    /* ---------- Remarks / Notes ---------- */
+    /* ---------- Remarks ---------- */
     const noteText = safeText(receipt.remarks || "");
     if (noteText) {
       const noteH = Math.max(38, doc.heightOfString(noteText, { width: contentWidth - 20 }) + 22);
@@ -703,12 +773,18 @@ exports.create = async (request, reply) => {
   const supplier_id = num(body.supplier_id);
   const school_order_id = body.school_order_id ? num(body.school_order_id) : null;
 
+  // ✅ NEW: Challan/Invoice support
+  const receive_doc_type = normalizeDocType(body.receive_doc_type);
+  const doc_no = body.doc_no != null ? String(body.doc_no).trim() : null;
+  const doc_date = body.doc_date ? new Date(body.doc_date) : null;
+
+  // Backward compatibility
   const invoice_no = body.invoice_no ? String(body.invoice_no).trim() : null;
+  const invoice_date = body.invoice_date ? new Date(body.invoice_date) : null;
+
   const academic_session = body.academic_session ? String(body.academic_session).trim() : null;
 
-  const invoice_date = body.invoice_date ? new Date(body.invoice_date) : now();
   const received_date = body.received_date ? new Date(body.received_date) : now();
-
   const remarks = body.remarks ? String(body.remarks) : null;
 
   const bill_discount_type = body.bill_discount_type || "NONE";
@@ -785,15 +861,29 @@ exports.create = async (request, reply) => {
 
     const receipt_no = await makeReceiptNo(t);
 
+    // Choose doc fields:
+    // - prefer new doc_no/doc_date
+    // - fallback to invoice_no/invoice_date
+    const final_doc_no = doc_no || invoice_no || null;
+    const final_doc_date = doc_date || invoice_date || null;
+
     const receipt = await SupplierReceipt.create(
       {
         supplier_id,
         school_order_id,
         receipt_no,
-        invoice_no,
+
+        receive_doc_type,
+        doc_no: final_doc_no,
+        doc_date: final_doc_date ? new Date(final_doc_date) : null,
+
+        // backward compat store (optional)
+        invoice_no: invoice_no || null,
+        invoice_date: invoice_date ? new Date(invoice_date) : null,
+
         academic_session,
-        invoice_date,
         received_date,
+
         status: status === "draft" ? "draft" : "received",
         remarks,
 
@@ -820,19 +910,18 @@ exports.create = async (request, reply) => {
       { transaction: t }
     );
 
+    // optional: update last purchase rate on book
     for (const r of calcLines) {
-      const discType = String(r.item_discount_type || "NONE").toUpperCase();
-      const discVal = num(r.item_discount_value);
-
       const updatePayload = { rate: round2(r.rate) };
-      if (discType === "PERCENT") updatePayload.discount_percent = round2(Math.max(0, discVal));
-
       await Book.update(updatePayload, { where: { id: r.book_id }, transaction: t });
     }
 
     if (receipt.status === "received") {
       await ensureInventoryInForReceipt({ receipt, items: calcLines, t });
       await postPurchaseLedger({ receipt, t });
+
+      // ✅ critical for partial receiving pending calc (if SchoolOrderItem exists)
+      await bumpOrderReceivedQty({ school_order_id, lines: calcLines, sign: +1, t });
     }
 
     await t.commit();
@@ -863,21 +952,29 @@ exports.create = async (request, reply) => {
  */
 exports.list = async (request, reply) => {
   try {
-    const { supplier_id, status, from, to, q } = request.query || {};
+    const { supplier_id, status, from, to, q, receive_doc_type, doc_no } = request.query || {};
 
     const where = {};
     if (supplier_id) where.supplier_id = num(supplier_id);
     if (status) where.status = String(status);
 
+    if (receive_doc_type) where.receive_doc_type = normalizeDocType(receive_doc_type);
+    if (doc_no && String(doc_no).trim()) where.doc_no = { [Op.like]: `%${String(doc_no).trim()}%` };
+
     if (from || to) {
-      where.invoice_date = {};
-      if (from) where.invoice_date[Op.gte] = new Date(String(from));
-      if (to) where.invoice_date[Op.lte] = new Date(String(to));
+      // filter on received_date (GRN date) is generally more accurate for receiving reports
+      where.received_date = {};
+      if (from) where.received_date[Op.gte] = String(from);
+      if (to) where.received_date[Op.lte] = String(to);
     }
 
     if (q && String(q).trim()) {
       const s = `%${String(q).trim()}%`;
-      where[Op.or] = [{ receipt_no: { [Op.like]: s } }, { invoice_no: { [Op.like]: s } }];
+      where[Op.or] = [
+        { receipt_no: { [Op.like]: s } },
+        { doc_no: { [Op.like]: s } },
+        { invoice_no: { [Op.like]: s } },
+      ];
     }
 
     const rows = await SupplierReceipt.findAll({
@@ -1028,11 +1125,33 @@ exports.updateStatus = async (request, reply) => {
 
       await ensureInventoryInForReceipt({ receipt, items: lineItems, t });
       await postPurchaseLedger({ receipt, t });
+
+      // ✅ apply order received qty
+      await bumpOrderReceivedQty({
+        school_order_id: receipt.school_order_id,
+        lines: lineItems,
+        sign: +1,
+        t,
+      });
     }
 
     if (prevStatus === "received" && nextStatus === "cancelled") {
       await removePurchaseLedger({ receipt, t });
       await reverseInventoryForReceipt({ receipt, t });
+
+      // ✅ reverse order received qty
+      const lineItems = (items || []).map((x) => ({
+        book_id: num(x.book_id),
+        qty: Math.max(0, Math.floor(num(x.qty))),
+        rate: round2(x.rate),
+      }));
+
+      await bumpOrderReceivedQty({
+        school_order_id: receipt.school_order_id,
+        lines: lineItems,
+        sign: -1,
+        t,
+      });
     }
 
     if (prevStatus === "draft" && nextStatus === "cancelled") {
