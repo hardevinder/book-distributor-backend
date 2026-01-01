@@ -2,9 +2,7 @@
 const supplierController = require("../controllers/supplierController");
 
 async function supplierRoutes(fastify) {
-  // Helpers: small role check (based on your JWT payload)
   const requireRoles = (roles) => async (request, reply) => {
-    // ensure authenticated
     await fastify.authenticate(request, reply);
 
     const role =
@@ -17,11 +15,25 @@ async function supplierRoutes(fastify) {
     }
   };
 
-  // Everyone logged-in can read
+  // ✅ Everyone logged-in can read
   fastify.get("/", { preHandler: [fastify.authenticate] }, supplierController.list);
+
+  // ✅ NEW: invoices
+  fastify.get(
+    "/:id/invoices",
+    { preHandler: [fastify.authenticate] },
+    supplierController.listInvoices
+  );
+
+  fastify.get(
+    "/:id/invoices/:invoiceId",
+    { preHandler: [fastify.authenticate] },
+    supplierController.getInvoiceDetail
+  );
+
   fastify.get("/:id", { preHandler: [fastify.authenticate] }, supplierController.getById);
 
-  // Only admin/superadmin can write
+  // ✅ Only admin/superadmin can write
   fastify.post(
     "/",
     { preHandler: [requireRoles(["admin", "superadmin"])] },

@@ -18,8 +18,12 @@ const {
   SupplierLedgerTxn,
   CompanyProfile,
 
-  // Optional (if exists in your models/index.js)
+  // Optional (if exists)
   SchoolOrderItem,
+
+  // ✅ NEW (optional but recommended for School return + PDF)
+  School,
+  SchoolOrder,
 } = require("../models");
 
 /* ============================================================
@@ -39,9 +43,21 @@ function now() {
 
 const safeText = (v) => String(v ?? "").trim();
 
-/**
- * Generate receipt number like: SR-2025-12-000001
- */
+// ✅ Money formatting (₹)
+const money = (v) => {
+  const n = round2(v);
+  return `₹ ${n.toFixed(2)}`;
+};
+
+const formatDateIN = (d) => {
+  if (!d) return "-";
+  try {
+    return new Date(d).toLocaleDateString("en-IN");
+  } catch {
+    return "-";
+  }
+};
+
 async function makeReceiptNo(t) {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -58,6 +74,12 @@ async function makeReceiptNo(t) {
   return `SR-${yyyy}-${mm}-${seq}`;
 }
 
+/**
+ * NOTE:
+ * - We keep legacy logic for discount:
+ *   - PERCENT => % of gross line
+ *   - AMOUNT  => line discount amount (NOT per-unit)
+ */
 function calcItemLine({ qty, rate, discType, discVal }) {
   const q = Math.max(0, Math.floor(num(qty)));
   const r = Math.max(0, num(rate));
@@ -71,12 +93,10 @@ function calcItemLine({ qty, rate, discType, discVal }) {
   if (t === "PERCENT") {
     discount = round2(gross * (Math.max(0, v) / 100));
   } else if (t === "AMOUNT") {
-    // NOTE: AMOUNT here means "line discount amount" as per current legacy logic
     discount = round2(Math.max(0, v));
   }
 
   if (discount > gross) discount = gross;
-
   const net = round2(gross - discount);
 
   return {
@@ -115,7 +135,6 @@ function calcHeaderTotals({
   const ro = round2(num(round_off)); // can be negative/positive
 
   const grand_total = round2(sub_total - bill_discount_amount + ship + other + ro);
-
   return { sub_total, bill_discount_amount, grand_total };
 }
 
@@ -140,15 +159,43 @@ function normalizeDocType(v) {
   return s === "INVOICE" ? "INVOICE" : "CHALLAN";
 }
 
-function docLabel(receive_doc_type) {
-  return normalizeDocType(receive_doc_type) === "INVOICE" ? "Invoice No" : "Challan No";
-}
-
 function docNarration(receipt) {
   const t = normalizeDocType(receipt.receive_doc_type);
   const no = safeText(receipt.doc_no || receipt.invoice_no || "");
   if (no) return `${t} ${no}`;
   return `Receipt ${safeText(receipt.receipt_no || receipt.id)}`;
+}
+
+/* ============================================================
+ * ✅ School helpers (return school in API + print in PDF)
+ * ============================================================ */
+
+async function fetchSchoolForReceipt(receiptLike, opts = {}) {
+  try {
+    const schoolOrderId = num(receiptLike?.school_order_id);
+    if (!schoolOrderId) return null;
+    if (!SchoolOrder || !School) return null;
+
+    const so = await SchoolOrder.findByPk(schoolOrderId, opts);
+    if (!so) return null;
+
+    const soJson = so.toJSON ? so.toJSON() : so;
+    const schoolId = num(soJson.school_id ?? soJson.schoolId);
+    if (!schoolId) return null;
+
+    const school = await School.findByPk(schoolId, opts);
+    if (!school) return null;
+
+    return school.toJSON ? school.toJSON() : school;
+  } catch {
+    return null;
+  }
+}
+
+async function attachSchoolToReceiptJson(receiptInstanceOrJson) {
+  const r = receiptInstanceOrJson?.toJSON ? receiptInstanceOrJson.toJSON() : receiptInstanceOrJson;
+  const school = await fetchSchoolForReceipt(r);
+  return { ...(r || {}), school };
 }
 
 /* ============================================================
@@ -223,29 +270,25 @@ async function loadLogoBuffer(logoRef) {
  * ============================================================ */
 
 async function bumpOrderReceivedQty({ school_order_id, lines, sign, t }) {
-  if (!SchoolOrderItem) return; // optional
+  if (!SchoolOrderItem) return;
   if (!school_order_id) return;
 
-  // sign: +1 for receive, -1 for cancel/reverse
   for (const r of lines) {
     const book_id = num(r.book_id);
     const qty = Math.max(0, Math.floor(num(r.qty)));
     if (!book_id || qty <= 0) continue;
 
-    // lock row if exists
     const row = await SchoolOrderItem.findOne({
       where: { school_order_id: num(school_order_id), book_id },
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
 
-    // if no row found, skip silently (some setups don't store order-item per book)
     if (!row) continue;
 
     const prev = num(row.received_qty);
     const next = prev + sign * qty;
 
-    // clamp to [0, ordered_qty if exists]
     let finalVal = Math.max(0, next);
     if (row.total_order_qty != null || row.ordered_qty != null) {
       const ord = num(row.total_order_qty ?? row.ordered_qty);
@@ -257,9 +300,10 @@ async function bumpOrderReceivedQty({ school_order_id, lines, sign, t }) {
   }
 }
 
-/**
+/* ============================================================
  * Ledger Post (idempotent)
- */
+ * ============================================================ */
+
 async function postPurchaseLedger({ receipt, t }) {
   if (!SupplierLedgerTxn) return;
 
@@ -289,9 +333,6 @@ async function postPurchaseLedger({ receipt, t }) {
   );
 }
 
-/**
- * Ledger Remove (idempotent)
- */
 async function removePurchaseLedger({ receipt, t }) {
   if (!SupplierLedgerTxn) return;
 
@@ -306,9 +347,10 @@ async function removePurchaseLedger({ receipt, t }) {
   });
 }
 
-/**
- * Inventory IN for receipt (idempotent by checking existing batches for this receipt)
- */
+/* ============================================================
+ * Inventory IN (idempotent via InventoryBatch ref)
+ * ============================================================ */
+
 async function ensureInventoryInForReceipt({ receipt, items, t }) {
   if (!InventoryBatch || !InventoryTxn) return;
 
@@ -321,13 +363,11 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
     lock: t.LOCK.UPDATE,
   });
 
-  // if already created earlier, skip to avoid duplicates
   if (existingCount > 0) return;
 
   for (const r of items) {
     const batchPayload = pickAttrs(InventoryBatch, {
       book_id: r.book_id,
-
       supplier_id: receipt.supplier_id,
 
       source_type: "SUPPLIER_RECEIPT",
@@ -342,19 +382,29 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
       cost_price: r.rate,
       purchase_price: r.rate,
 
-      remarks: `${normalizeDocType(receipt.receive_doc_type)} ${safeText(receipt.doc_no || receipt.invoice_no || "")} • ${receipt.receipt_no}`,
+      remarks: `${normalizeDocType(receipt.receive_doc_type)} ${safeText(receipt.doc_no || receipt.invoice_no || "")} • ${
+        receipt.receipt_no
+      }`,
     });
 
     const batch = await InventoryBatch.create(batchPayload, { transaction: t });
 
     const txnPayload = pickAttrs(InventoryTxn, {
       book_id: r.book_id,
+
+      // supports either column in your model
       batch_id: batch.id,
+      inventory_batch_id: batch.id,
+
       qty: r.qty,
       txn_type: "IN",
       type: "IN",
+
+      ref_type: "SUPPLIER_RECEIPT",
       ref_table: "supplier_receipts",
       ref_id: receipt.id,
+      ref_no: receipt.receipt_no,
+
       notes: `Receive via ${receipt.receipt_no}`,
     });
 
@@ -362,10 +412,10 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
   }
 }
 
-/**
- * Inventory reverse on cancel:
- * - only allowed if all batches created by this receipt still have enough available_qty to reverse
- */
+/* ============================================================
+ * Inventory Reverse (on cancel)
+ * ============================================================ */
+
 async function reverseInventoryForReceipt({ receipt, t }) {
   if (!InventoryBatch || !InventoryTxn) return;
 
@@ -379,55 +429,146 @@ async function reverseInventoryForReceipt({ receipt, t }) {
     order: [["id", "ASC"]],
   });
 
-  if (!batches.length) return; // nothing to reverse
+  if (!batches.length) return;
 
-  for (const b of batches) {
-    const avail = num(b.available_qty);
-    const rec = num(b.received_qty);
+  // strict safety
+  for (const batch of batches) {
+    const avail = num(batch.available_qty);
+    const rec = num(batch.received_qty);
     const reverseQty = rec;
     if (reverseQty <= 0) continue;
 
     if (avail < reverseQty) {
       throw new Error(
-        `Cannot cancel receipt: stock already used for book_id ${b.book_id}. Available ${avail}, required ${reverseQty}.`
+        `Cannot cancel receipt: stock already used for book_id ${batch.book_id}. Available ${avail}, required ${reverseQty}.`
       );
     }
   }
 
-  for (const b of batches) {
-    const reverseQty = num(b.received_qty);
+  for (const batch of batches) {
+    const reverseQty = num(batch.received_qty);
     if (reverseQty <= 0) continue;
 
     const txnPayload = pickAttrs(InventoryTxn, {
-      book_id: b.book_id,
-      batch_id: b.id,
+      book_id: batch.book_id,
+
+      batch_id: batch.id,
+      inventory_batch_id: batch.id,
+
       qty: reverseQty,
       txn_type: "OUT",
       type: "OUT",
+
+      ref_type: "SUPPLIER_RECEIPT",
       ref_table: "supplier_receipts",
       ref_id: receipt.id,
+      ref_no: receipt.receipt_no,
+
       notes: `Cancel receipt ${receipt.receipt_no}`,
     });
+
     await InventoryTxn.create(txnPayload, { transaction: t });
 
-    b.available_qty = num(b.available_qty) - reverseQty;
-    b.received_qty = num(b.received_qty) - reverseQty;
-
-    await b.save({ transaction: t });
+    batch.available_qty = num(batch.available_qty) - reverseQty;
+    batch.received_qty = num(batch.received_qty) - reverseQty;
+    await batch.save({ transaction: t });
   }
 }
 
 /* ============================================================
- * ✅ RECEIPT PDF builder -> Buffer
+ * Posting Guard Helpers
  * ============================================================ */
+
+function hasPostedFlag(modelInstance) {
+  const attrs = SupplierReceipt?.rawAttributes || {};
+  if (!attrs.posted_at) return false;
+  return !!modelInstance.posted_at;
+}
+
+async function markPosted({ receipt, t }) {
+  const attrs = SupplierReceipt?.rawAttributes || {};
+  if (!attrs.posted_at) return;
+  receipt.posted_at = now();
+  await receipt.save({ transaction: t });
+}
+
+async function clearPosted({ receipt, t }) {
+  const attrs = SupplierReceipt?.rawAttributes || {};
+  if (!attrs.posted_at) return;
+  receipt.posted_at = null;
+  await receipt.save({ transaction: t });
+}
+
+async function postIfNotPosted({ receipt, lineItems, t }) {
+  if (hasPostedFlag(receipt)) return;
+
+  await ensureInventoryInForReceipt({ receipt, items: lineItems, t });
+  await postPurchaseLedger({ receipt, t });
+  await bumpOrderReceivedQty({
+    school_order_id: receipt.school_order_id,
+    lines: lineItems,
+    sign: +1,
+    t,
+  });
+
+  await markPosted({ receipt, t });
+}
+
+/* ============================================================
+ * Validations for "received"
+ * ============================================================ */
+
+function validateReadyToReceive({ receipt, lineItems }) {
+  const docType = normalizeDocType(receipt.receive_doc_type);
+  const hasDocNo = safeText(receipt.doc_no || receipt.invoice_no || "").length > 0;
+
+  if (docType === "INVOICE" && !hasDocNo) {
+    return "Invoice No is required before marking received.";
+  }
+
+  const anyZeroRate = (lineItems || []).some((x) => num(x.rate) <= 0);
+  if (anyZeroRate) {
+    return "One or more items have missing/zero rate. Fill price before marking received.";
+  }
+
+  return null;
+}
+
+/* ============================================================
+ * ✅ RECEIPT PDF builder -> Buffer
+ * ✅ Updated:
+ * - show School name
+ * - show Academic session + Status
+ * - currency formatting ₹
+ * ============================================================ */
+
 function buildSupplierReceiptPdfBuffer({
   receipt,
   supplier,
+  school, // ✅ NEW
   companyProfile,
   items,
   pdfTitle = "SUPPLIER RECEIPT",
   showPrintDate = true,
 }) {
+  // ✅ NO ₹ SYMBOL: numbers only (2 decimals)
+  const money = (v) => {
+    const n = round2(v);
+    return Number.isFinite(n) ? n.toFixed(2) : "0.00";
+  };
+
+  // ✅ Safe date formatting (en-IN)
+  const formatDateIN = (d) => {
+    if (!d) return "-";
+    try {
+      const dt = d instanceof Date ? d : new Date(d);
+      if (Number.isNaN(dt.getTime())) return "-";
+      return dt.toLocaleDateString("en-IN");
+    } catch {
+      return "-";
+    }
+  };
+
   return new Promise(async (resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 40 });
     const chunks = [];
@@ -493,18 +634,15 @@ function buildSupplierReceiptPdfBuffer({
       if (cityStatePin) addrParts.push(cityStatePin);
 
       const lines = [];
-      if (companyProfile.name)
-        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
+      if (companyProfile.name) lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
       if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
 
       const contactParts = [];
       if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
       if (companyProfile.email) contactParts.push(`Email: ${companyProfile.email}`);
-      if (contactParts.length)
-        lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
+      if (contactParts.length) lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
 
-      if (companyProfile.gstin)
-        lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
+      if (companyProfile.gstin) lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
 
       let yCursor = startY;
       for (const ln of lines) {
@@ -528,7 +666,7 @@ function buildSupplierReceiptPdfBuffer({
     doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
     doc.moveDown(0.5);
 
-    /* ---------- TOP: Receipt No + Doc + Dates ---------- */
+    /* ---------- TOP: Receipt No + School + Doc + Dates ---------- */
     const topY = doc.y;
     const leftTopW = Math.floor(contentWidth * 0.65);
     const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
@@ -538,19 +676,24 @@ function buildSupplierReceiptPdfBuffer({
 
     const rType = normalizeDocType(receipt.receive_doc_type);
     const dNo = safeText(receipt.doc_no || receipt.invoice_no || "-");
-    const dDate = receipt.doc_date
-      ? new Date(receipt.doc_date).toLocaleDateString("en-IN")
-      : receipt.invoice_date
-      ? new Date(receipt.invoice_date).toLocaleDateString("en-IN")
-      : "-";
 
-    const recvDate = receipt.received_date ? new Date(receipt.received_date).toLocaleDateString("en-IN") : "-";
+    const dDate = formatDateIN(receipt.doc_date || receipt.invoice_date);
+    const recvDate = formatDateIN(receipt.received_date);
+
+    // ✅ School name (from school object)
+    const schoolName = safeText(school?.name || school?.school_name || "");
 
     doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
     doc.text(`Receipt No: ${receiptNo}`, pageLeft, topY, { width: leftTopW, align: "left" });
 
+    // ✅ School line (left)
+    if (schoolName) {
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+      doc.text(`School: ${schoolName}`, pageLeft, doc.y + 3, { width: leftTopW, align: "left" });
+    }
+
     doc.font("Helvetica").fontSize(9).fillColor("#000");
-    doc.text(`${rType === "INVOICE" ? "Invoice" : "Challan"} No: ${dNo}`, pageLeft, doc.y + 2, {
+    doc.text(`${rType === "INVOICE" ? "Invoice" : "Challan"} No: ${dNo}`, pageLeft, doc.y + 3, {
       width: leftTopW,
       align: "left",
     });
@@ -562,8 +705,14 @@ function buildSupplierReceiptPdfBuffer({
     });
     doc.text(`Received Date: ${recvDate}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
 
+    // ✅ Academic Session + Status
+    const ac = safeText(receipt.academic_session || "");
+    const st = safeText(receipt.status || "");
+    if (ac) doc.text(`Academic Session: ${ac}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
+    if (st) doc.text(`Status: ${st.toUpperCase()}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
+
     if (showPrintDate) {
-      const pd = new Date().toLocaleDateString("en-IN");
+      const pd = formatDateIN(new Date());
       doc.text(`Print Date: ${pd}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
     }
 
@@ -571,38 +720,61 @@ function buildSupplierReceiptPdfBuffer({
     drawHR();
     doc.moveDown(0.35);
 
-    /* ---------- From Supplier ---------- */
-    if (supplier && supplier.name) {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
-      doc.text("From Supplier:", pageLeft, doc.y);
+    /* ---------- ✅ Highlighted Supplier Box ---------- */
+    const supplierName = safeText(supplier?.name || "");
+    if (supplierName) {
+      const addr = safeText(supplier.address || supplier.address_line1 || supplier.full_address || "");
+      const phone = safeText(supplier.phone || supplier.phone_primary || "");
+      const email = safeText(supplier.email || "");
+      const gstin = safeText(supplier.gstin || supplier.gst_no || supplier.gst || "");
 
+      const boxX = pageLeft;
+      const boxW = contentWidth;
+      const startY2 = doc.y;
+
+      const nameH = doc.heightOfString(supplierName, { width: boxW - 20 }) + 6;
+      const lines = [
+        addr ? addr : null,
+        gstin ? `GSTIN: ${gstin}` : null,
+        phone ? `Phone: ${phone}` : null,
+        email ? `Email: ${email}` : null,
+      ].filter(Boolean);
+
+      doc.font("Helvetica").fontSize(10);
+      const linesH = lines.reduce((sum, ln) => sum + doc.heightOfString(String(ln), { width: boxW - 20 }) + 2, 0);
+
+      const boxH = Math.max(70, 18 + nameH + linesH + 14);
+
+      ensureSpace(boxH + 8);
+
+      doc.save();
+      doc.rect(boxX, startY2, boxW, boxH).fill("#eef6ff");
+      doc.rect(boxX, startY2, boxW, boxH).lineWidth(1).stroke("#1d4ed8");
+      doc.restore();
+
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#1e3a8a");
+      doc.text("Supplier Details", boxX + 10, startY2 + 8);
+
+      doc.font("Helvetica-Bold").fontSize(14).fillColor("#000");
+      doc.text(supplierName, boxX + 10, startY2 + 24, { width: boxW - 20 });
+
+      let yCursor = startY2 + 24 + nameH;
       doc.font("Helvetica").fontSize(10).fillColor("#000");
-      doc.text(safeText(supplier.name), pageLeft, doc.y);
 
-      const subLines = [];
-      const addr = supplier.address || supplier.address_line1 || supplier.full_address || "";
-      const phone = supplier.phone || supplier.phone_primary || "";
-      const email = supplier.email || "";
+      for (const ln of lines) {
+        doc.text(String(ln), boxX + 10, yCursor, { width: boxW - 20 });
+        yCursor += doc.heightOfString(String(ln), { width: boxW - 20 }) + 2;
+      }
 
-      if (addr) subLines.push(safeText(addr));
-      if (phone) subLines.push(`Phone: ${safeText(phone)}`);
-      if (email) subLines.push(`Email: ${safeText(email)}`);
-
-      doc.font("Helvetica").fontSize(9).fillColor("#000");
-      for (const ln of subLines) doc.text(ln, pageLeft, doc.y, { width: Math.floor(contentWidth * 0.72) });
+      doc.y = startY2 + boxH + 10;
+      drawHR();
+      doc.moveDown(0.35);
     }
-
-    doc.moveDown(0.25);
-    drawHR();
-    doc.moveDown(0.4);
 
     /* ---------- Summary ---------- */
     const itemCount = (items || []).length;
     const subTotal = round2(receipt.sub_total);
     const billDisc = round2(receipt.bill_discount_amount);
-    const ship = round2(receipt.shipping_charge);
-    const other = round2(receipt.other_charge);
-    const ro = round2(receipt.round_off);
     const grand = round2(receipt.grand_total);
 
     const boxY = doc.y;
@@ -617,13 +789,13 @@ function buildSupplierReceiptPdfBuffer({
 
     doc.font("Helvetica").fontSize(9).fillColor("#000");
     doc.text(`Items: ${itemCount}`, pageLeft + 10, boxY + 26, { width: contentWidth / 2 - 10 });
-    doc.text(`Sub Total: ${subTotal}`, pageLeft + 10, boxY + 40, { width: contentWidth / 2 - 10 });
+    doc.text(`Sub Total: ${money(subTotal)}`, pageLeft + 10, boxY + 40, { width: contentWidth / 2 - 10 });
 
-    doc.text(`Bill Discount: ${billDisc}`, pageLeft + contentWidth / 2, boxY + 26, {
+    doc.text(`Bill Discount: ${money(billDisc)}`, pageLeft + contentWidth / 2, boxY + 26, {
       width: contentWidth / 2 - 10,
       align: "right",
     });
-    doc.text(`Grand Total: ${grand}`, pageLeft + contentWidth / 2, boxY + 40, {
+    doc.text(`Grand Total: ${money(grand)}`, pageLeft + contentWidth / 2, boxY + 40, {
       width: contentWidth / 2 - 10,
       align: "right",
     });
@@ -631,7 +803,7 @@ function buildSupplierReceiptPdfBuffer({
     doc.y = boxY + boxH + 10;
 
     /* ---------- Table ---------- */
-    const W = { sr: 24, title: 0, qty: 46, rate: 56, disc: 60, net: 66 };
+    const W = { sr: 24, title: 0, qty: 46, rate: 64, disc: 64, net: 72 };
     W.title = contentWidth - (W.sr + W.qty + W.rate + W.disc + W.net);
     const X = {
       sr: pageLeft,
@@ -700,9 +872,9 @@ function buildSupplierReceiptPdfBuffer({
 
         doc.font("Helvetica-Bold").fontSize(10);
         doc.text(String(qty), X.qty, y - 1, { width: W.qty, align: "center" });
-        doc.text(String(rate), X.rate, y - 1, { width: W.rate, align: "center" });
-        doc.text(String(disc), X.disc, y - 1, { width: W.disc, align: "center" });
-        doc.text(String(net), X.net, y - 1, { width: W.net, align: "center" });
+        doc.text(money(rate), X.rate, y - 1, { width: W.rate, align: "center" });
+        doc.text(money(disc), X.disc, y - 1, { width: W.disc, align: "center" });
+        doc.text(money(net), X.net, y - 1, { width: W.net, align: "center" });
 
         doc.y = y + rh - 3;
         sr++;
@@ -710,6 +882,10 @@ function buildSupplierReceiptPdfBuffer({
     }
 
     /* ---------- Totals (bottom right) ---------- */
+    const ship = round2(receipt.shipping_charge);
+    const other = round2(receipt.other_charge);
+    const ro = round2(receipt.round_off);
+
     ensureSpace(90);
     doc.moveDown(0.4);
     drawHR2();
@@ -727,12 +903,12 @@ function buildSupplierReceiptPdfBuffer({
       doc.moveDown(0.35);
     };
 
-    line("Sub Total", subTotal);
-    line("Bill Discount", billDisc);
-    line("Shipping", ship);
-    line("Other", other);
-    line("Round Off", ro);
-    line("Grand Total", grand, true);
+    line("Sub Total", money(subTotal));
+    line("Bill Discount", money(billDisc));
+    line("Shipping", money(ship));
+    line("Other", money(other));
+    line("Round Off", money(ro));
+    line("Grand Total", money(grand), true);
 
     /* ---------- Remarks ---------- */
     const noteText = safeText(receipt.remarks || "");
@@ -760,6 +936,7 @@ function buildSupplierReceiptPdfBuffer({
   });
 }
 
+
 /* ============================================================
  * Controller
  * ============================================================ */
@@ -773,18 +950,16 @@ exports.create = async (request, reply) => {
   const supplier_id = num(body.supplier_id);
   const school_order_id = body.school_order_id ? num(body.school_order_id) : null;
 
-  // ✅ NEW: Challan/Invoice support
   const receive_doc_type = normalizeDocType(body.receive_doc_type);
   const doc_no = body.doc_no != null ? String(body.doc_no).trim() : null;
   const doc_date = body.doc_date ? new Date(body.doc_date) : null;
 
-  // Backward compatibility
   const invoice_no = body.invoice_no ? String(body.invoice_no).trim() : null;
   const invoice_date = body.invoice_date ? new Date(body.invoice_date) : null;
 
   const academic_session = body.academic_session ? String(body.academic_session).trim() : null;
-
   const received_date = body.received_date ? new Date(body.received_date) : now();
+
   const remarks = body.remarks ? String(body.remarks) : null;
 
   const bill_discount_type = body.bill_discount_type || "NONE";
@@ -794,7 +969,8 @@ exports.create = async (request, reply) => {
   const other_charge = body.other_charge ?? 0;
   const round_off = body.round_off ?? 0;
 
-  const status = body.status ? String(body.status).toLowerCase() : "received";
+  const requestedStatus = body.status ? String(body.status).toLowerCase() : "draft";
+
   const items = Array.isArray(body.items) ? body.items : [];
 
   if (!supplier_id) return reply.code(400).send({ error: "supplier_id is required" });
@@ -808,6 +984,25 @@ exports.create = async (request, reply) => {
       return reply.code(400).send({ error: `items[${i}].qty must be > 0` });
     }
   }
+
+  // INVOICE strict requirement
+  if (receive_doc_type === "INVOICE") {
+    const invNo = safeText(doc_no || invoice_no);
+    if (!invNo) return reply.code(400).send({ error: "Invoice No is required." });
+
+    for (const [i, it] of items.entries()) {
+      if (num(it.rate) <= 0) {
+        return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
+      }
+    }
+  }
+
+  const anyMissingRate = items.some((it) => num(it.rate) <= 0);
+
+  let finalStatus = requestedStatus;
+  if (receive_doc_type === "INVOICE") finalStatus = "received";
+  if (receive_doc_type === "CHALLAN" && anyMissingRate) finalStatus = "draft";
+  if (!["draft", "received"].includes(finalStatus)) finalStatus = "draft";
 
   const t = await sequelize.transaction();
   try {
@@ -861,67 +1056,68 @@ exports.create = async (request, reply) => {
 
     const receipt_no = await makeReceiptNo(t);
 
-    // Choose doc fields:
-    // - prefer new doc_no/doc_date
-    // - fallback to invoice_no/invoice_date
     const final_doc_no = doc_no || invoice_no || null;
     const final_doc_date = doc_date || invoice_date || null;
 
-    const receipt = await SupplierReceipt.create(
-      {
-        supplier_id,
-        school_order_id,
-        receipt_no,
+    const receiptPayload = {
+      supplier_id,
+      school_order_id,
+      receipt_no,
 
-        receive_doc_type,
-        doc_no: final_doc_no,
-        doc_date: final_doc_date ? new Date(final_doc_date) : null,
+      receive_doc_type,
+      doc_no: final_doc_no,
+      doc_date: final_doc_date ? new Date(final_doc_date) : null,
 
-        // backward compat store (optional)
-        invoice_no: invoice_no || null,
-        invoice_date: invoice_date ? new Date(invoice_date) : null,
+      invoice_no: invoice_no || (receive_doc_type === "INVOICE" ? final_doc_no : null),
+      invoice_date: invoice_date ? new Date(invoice_date) : null,
 
-        academic_session,
-        received_date,
+      academic_session,
+      received_date,
 
-        status: status === "draft" ? "draft" : "received",
-        remarks,
+      status: finalStatus,
+      remarks,
 
-        sub_total: totals.sub_total,
+      sub_total: totals.sub_total,
 
-        bill_discount_type: String(bill_discount_type).toUpperCase(),
-        bill_discount_value:
-          bill_discount_value === null || bill_discount_value === undefined
-            ? null
-            : round2(bill_discount_value),
-        bill_discount_amount: totals.bill_discount_amount,
+      bill_discount_type: String(bill_discount_type).toUpperCase(),
+      bill_discount_value:
+        bill_discount_value === null || bill_discount_value === undefined ? null : round2(bill_discount_value),
+      bill_discount_amount: totals.bill_discount_amount,
 
-        shipping_charge: round2(Math.max(0, num(shipping_charge))),
-        other_charge: round2(Math.max(0, num(other_charge))),
-        round_off: round2(num(round_off)),
+      shipping_charge: round2(Math.max(0, num(shipping_charge))),
+      other_charge: round2(Math.max(0, num(other_charge))),
+      round_off: round2(num(round_off)),
 
-        grand_total: totals.grand_total,
-      },
-      { transaction: t }
-    );
+      grand_total: totals.grand_total,
+    };
+
+    const receipt = await SupplierReceipt.create(receiptPayload, { transaction: t });
 
     await SupplierReceiptItem.bulkCreate(
       calcLines.map((r) => ({ ...r, supplier_receipt_id: receipt.id })),
       { transaction: t }
     );
 
-    // optional: update last purchase rate on book
     for (const r of calcLines) {
-      const updatePayload = { rate: round2(r.rate) };
-      await Book.update(updatePayload, { where: { id: r.book_id }, transaction: t });
+      if (num(r.rate) > 0) {
+        await Book.update({ rate: round2(r.rate) }, { where: { id: r.book_id }, transaction: t });
+      }
     }
 
     if (receipt.status === "received") {
-      await ensureInventoryInForReceipt({ receipt, items: calcLines, t });
-      await postPurchaseLedger({ receipt, t });
+      const lineItems = calcLines.map((x) => ({
+        book_id: num(x.book_id),
+        qty: Math.max(0, Math.floor(num(x.qty))),
+        rate: round2(x.rate),
+      }));
 
-      // ✅ critical for partial receiving pending calc (if SchoolOrderItem exists)
-      await bumpOrderReceivedQty({ school_order_id, lines: calcLines, sign: +1, t });
+      const errMsg = validateReadyToReceive({ receipt, lineItems });
+      if (errMsg) {
+        await t.rollback();
+        return reply.code(400).send({ error: errMsg });
+      }
+
+      await postIfNotPosted({ receipt, lineItems, t });
     }
 
     await t.commit();
@@ -933,7 +1129,10 @@ exports.create = async (request, reply) => {
       ],
     });
 
-    return reply.code(201).send({ receipt: full });
+    // ✅ attach school
+    const fullWithSchool = await attachSchoolToReceiptJson(full);
+
+    return reply.code(201).send({ receipt: fullWithSchool });
   } catch (err) {
     try {
       await t.rollback();
@@ -948,7 +1147,242 @@ exports.create = async (request, reply) => {
 };
 
 /**
+ * ✅ PATCH /api/supplier-receipts/:id
+ */
+exports.update = async (request, reply) => {
+  const id = num(request.params?.id);
+  const body = request.body || {};
+
+  const t = await sequelize.transaction();
+  try {
+    const receipt = await SupplierReceipt.findByPk(id, {
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+    if (!receipt) {
+      await t.rollback();
+      return reply.code(404).send({ error: "Receipt not found" });
+    }
+
+    if (String(receipt.status).toLowerCase() === "cancelled") {
+      await t.rollback();
+      return reply.code(400).send({ error: "Cancelled receipt cannot be updated." });
+    }
+
+    const attrs = SupplierReceipt?.rawAttributes || {};
+    const isPosted = hasPostedFlag(receipt);
+    const statusLower = String(receipt.status || "").toLowerCase();
+
+    // Always-allowed fields
+    if (body.receive_doc_type != null && attrs.receive_doc_type) {
+      receipt.receive_doc_type = normalizeDocType(body.receive_doc_type);
+    }
+
+    if (body.doc_no !== undefined && attrs.doc_no) {
+      const v = String(body.doc_no || "").trim();
+      receipt.doc_no = v ? v : null;
+    }
+
+    if (body.doc_date !== undefined && attrs.doc_date) {
+      receipt.doc_date = body.doc_date ? new Date(body.doc_date) : null;
+    }
+
+    if (body.received_date !== undefined && attrs.received_date) {
+      receipt.received_date = body.received_date ? new Date(body.received_date) : receipt.received_date;
+    }
+
+    if (body.academic_session !== undefined && attrs.academic_session) {
+      const v = String(body.academic_session || "").trim();
+      receipt.academic_session = v ? v : null;
+    }
+
+    if (body.remarks !== undefined && attrs.remarks) {
+      const v = String(body.remarks || "").trim();
+      receipt.remarks = v ? v : null;
+    }
+
+    // backward compat sync
+    if (
+      attrs.invoice_no &&
+      (body.invoice_no !== undefined || body.doc_no !== undefined || body.receive_doc_type !== undefined)
+    ) {
+      const t2 = normalizeDocType(receipt.receive_doc_type);
+      if (t2 === "INVOICE") {
+        const inv = safeText(body.invoice_no ?? receipt.invoice_no ?? receipt.doc_no);
+        receipt.invoice_no = inv ? inv : null;
+      }
+    }
+
+    if (body.invoice_date !== undefined && attrs.invoice_date) {
+      receipt.invoice_date = body.invoice_date ? new Date(body.invoice_date) : receipt.invoice_date;
+    }
+
+    const wantsItemsEdit = Array.isArray(body.items);
+    const wantsHeaderMoneyEdit =
+      body.bill_discount_type !== undefined ||
+      body.bill_discount_value !== undefined ||
+      body.shipping_charge !== undefined ||
+      body.other_charge !== undefined ||
+      body.round_off !== undefined;
+
+    if (isPosted) {
+      if (wantsItemsEdit || wantsHeaderMoneyEdit) {
+        await t.rollback();
+        return reply.code(400).send({
+          error: "Receipt already posted. You can edit only Doc fields (Challan/Invoice No/Date, GRN, Remarks).",
+        });
+      }
+    } else {
+      if (statusLower !== "draft") {
+        if (wantsItemsEdit || wantsHeaderMoneyEdit) {
+          await t.rollback();
+          return reply.code(400).send({ error: "Only DRAFT receipt can be edited for qty/price/discount/charges." });
+        }
+      } else {
+        if (body.bill_discount_type !== undefined && attrs.bill_discount_type) {
+          receipt.bill_discount_type = String(body.bill_discount_type || "NONE").toUpperCase();
+        }
+        if (body.bill_discount_value !== undefined && attrs.bill_discount_value) {
+          const v = body.bill_discount_value;
+          receipt.bill_discount_value = v === null || v === undefined || v === "" ? null : round2(v);
+        }
+        if (body.shipping_charge !== undefined && attrs.shipping_charge) {
+          receipt.shipping_charge = round2(Math.max(0, num(body.shipping_charge)));
+        }
+        if (body.other_charge !== undefined && attrs.other_charge) {
+          receipt.other_charge = round2(Math.max(0, num(body.other_charge)));
+        }
+        if (body.round_off !== undefined && attrs.round_off) {
+          receipt.round_off = round2(num(body.round_off));
+        }
+
+        let calcLines = null;
+
+        if (wantsItemsEdit) {
+          const items = body.items || [];
+          if (!items.length) {
+            await t.rollback();
+            return reply.code(400).send({ error: "At least one item is required." });
+          }
+
+          for (const [i, it] of items.entries()) {
+            if (!it || !num(it.book_id)) return reply.code(400).send({ error: `items[${i}].book_id is required` });
+            if (num(it.qty) <= 0) return reply.code(400).send({ error: `items[${i}].qty must be > 0` });
+          }
+
+          const docType = normalizeDocType(receipt.receive_doc_type);
+          if (docType === "INVOICE") {
+            const invNo = safeText(receipt.doc_no || receipt.invoice_no);
+            if (!invNo) {
+              await t.rollback();
+              return reply.code(400).send({ error: "Invoice No is required for INVOICE type." });
+            }
+            for (const [i, it] of items.entries()) {
+              if (num(it.rate) <= 0) {
+                await t.rollback();
+                return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
+              }
+            }
+          }
+
+          calcLines = items.map((it) => {
+            const discType = it.item_discount_type || "NONE";
+            const discVal = it.item_discount_value ?? null;
+
+            const line = calcItemLine({
+              qty: it.qty,
+              rate: it.rate,
+              discType,
+              discVal,
+            });
+
+            return {
+              book_id: num(it.book_id),
+              qty: line.qty,
+              rate: line.rate,
+              item_discount_type: String(discType).toUpperCase(),
+              item_discount_value: discVal === null || discVal === undefined ? null : round2(discVal),
+              gross_amount: line.gross_amount,
+              discount_amount: line.discount_amount,
+              net_amount: line.net_amount,
+            };
+          });
+
+          await SupplierReceiptItem.destroy({ where: { supplier_receipt_id: receipt.id }, transaction: t });
+          await SupplierReceiptItem.bulkCreate(
+            calcLines.map((r) => ({ ...r, supplier_receipt_id: receipt.id })),
+            { transaction: t }
+          );
+
+          for (const r of calcLines) {
+            if (num(r.rate) > 0) {
+              await Book.update({ rate: round2(r.rate) }, { where: { id: r.book_id }, transaction: t });
+            }
+          }
+        }
+
+        if (wantsItemsEdit || wantsHeaderMoneyEdit) {
+          const itemsForTotals =
+            calcLines ||
+            (await SupplierReceiptItem.findAll({
+              where: { supplier_receipt_id: receipt.id },
+              transaction: t,
+              lock: t.LOCK.UPDATE,
+            })).map((x) => x.toJSON());
+
+          const itemsNetSum = (itemsForTotals || []).reduce((s, r) => s + num(r.net_amount), 0);
+
+          const totals = calcHeaderTotals({
+            itemsNetSum,
+            billDiscountType: receipt.bill_discount_type,
+            billDiscountValue: receipt.bill_discount_value,
+            shipping_charge: receipt.shipping_charge,
+            other_charge: receipt.other_charge,
+            round_off: receipt.round_off,
+          });
+
+          if (totals.grand_total < 0) {
+            await t.rollback();
+            return reply.code(400).send({ error: "grand_total cannot be negative" });
+          }
+
+          receipt.sub_total = totals.sub_total;
+          receipt.bill_discount_amount = totals.bill_discount_amount;
+          receipt.grand_total = totals.grand_total;
+        }
+      }
+    }
+
+    await receipt.save({ transaction: t });
+    await t.commit();
+
+    const full = await SupplierReceipt.findByPk(receipt.id, {
+      include: [
+        { model: Supplier, as: "supplier" },
+        { model: SupplierReceiptItem, as: "items", include: [{ model: Book, as: "book" }] },
+      ],
+    });
+
+    // ✅ attach school
+    const fullWithSchool = await attachSchoolToReceiptJson(full);
+
+    return reply.send({ receipt: fullWithSchool });
+  } catch (err) {
+    try {
+      await t.rollback();
+    } catch (_) {}
+    request.log?.error?.(err);
+    console.error("❌ updateSupplierReceipt error:", err);
+    return reply.code(500).send({
+      error: "Failed to update receipt",
+      details: err?.message || String(err),
+    });
+  }
+};
+
+/**
  * GET /api/supplier-receipts
+ * ✅ includes supplier + (school if available)
  */
 exports.list = async (request, reply) => {
   try {
@@ -962,7 +1396,6 @@ exports.list = async (request, reply) => {
     if (doc_no && String(doc_no).trim()) where.doc_no = { [Op.like]: `%${String(doc_no).trim()}%` };
 
     if (from || to) {
-      // filter on received_date (GRN date) is generally more accurate for receiving reports
       where.received_date = {};
       if (from) where.received_date[Op.gte] = String(from);
       if (to) where.received_date[Op.lte] = String(to);
@@ -984,7 +1417,13 @@ exports.list = async (request, reply) => {
       limit: 200,
     });
 
-    return reply.send({ receipts: rows });
+    // ✅ attach school for each row (best-effort)
+    const receipts = [];
+    for (const r of rows) {
+      receipts.push(await attachSchoolToReceiptJson(r));
+    }
+
+    return reply.send({ receipts });
   } catch (err) {
     request.log?.error?.(err);
     console.error("❌ listSupplierReceipts error:", err);
@@ -994,6 +1433,7 @@ exports.list = async (request, reply) => {
 
 /**
  * GET /api/supplier-receipts/:id
+ * ✅ includes supplier + items + (school if available)
  */
 exports.getById = async (request, reply) => {
   try {
@@ -1007,7 +1447,9 @@ exports.getById = async (request, reply) => {
     });
 
     if (!row) return reply.code(404).send({ error: "Receipt not found" });
-    return reply.send({ receipt: row });
+
+    const receipt = await attachSchoolToReceiptJson(row);
+    return reply.send({ receipt });
   } catch (err) {
     request.log?.error?.(err);
     console.error("❌ getSupplierReceiptById error:", err);
@@ -1017,6 +1459,8 @@ exports.getById = async (request, reply) => {
 
 /**
  * ✅ GET /api/supplier-receipts/:id/pdf
+ * ✅ Title & filename auto by doc type
+ * ✅ Adds school name
  */
 exports.printReceiptPdf = async (request, reply) => {
   const id = num(request.params?.id);
@@ -1046,20 +1490,28 @@ exports.printReceiptPdf = async (request, reply) => {
     const supplier = r.supplier || null;
     const items = r.items || [];
 
+    // ✅ fetch school (best-effort)
+    const school = await fetchSchoolForReceipt(r);
+
+    const docType = normalizeDocType(r.receive_doc_type);
+    const docLabel = docType === "INVOICE" ? "INVOICE" : "CHALLAN";
+
     const safeNo = String(r.receipt_no || `receipt-${r.id}`).replace(/[^\w\-]+/g, "_");
+    const fileName = `supplier-${docLabel.toLowerCase()}-${safeNo}.pdf`;
 
     const pdfBuffer = await buildSupplierReceiptPdfBuffer({
       receipt: r,
       supplier,
+      school,
       companyProfile,
       items,
-      pdfTitle: "SUPPLIER RECEIPT",
+      pdfTitle: `SUPPLIER ${docLabel}`,
       showPrintDate: true,
     });
 
     reply
       .header("Content-Type", "application/pdf")
-      .header("Content-Disposition", `inline; filename="supplier-receipt-${safeNo}.pdf"`)
+      .header("Content-Disposition", `inline; filename="${fileName}"`)
       .send(pdfBuffer);
 
     return reply;
@@ -1099,63 +1551,65 @@ exports.updateStatus = async (request, reply) => {
 
     const prevStatus = String(receipt.status || "draft").toLowerCase();
 
-    const items =
-      nextStatus === "received" || (prevStatus === "received" && nextStatus === "cancelled")
-        ? await SupplierReceiptItem.findAll({
-            where: { supplier_receipt_id: receipt.id },
-            transaction: t,
-            lock: t.LOCK.UPDATE,
-          })
-        : [];
-
     if (prevStatus === "cancelled") {
       await t.rollback();
       return reply.code(400).send({ error: "Cancelled receipt cannot be changed." });
+    }
+
+    const needItems =
+      nextStatus === "received" ||
+      (prevStatus === "received" && (nextStatus === "draft" || nextStatus === "cancelled"));
+
+    const items = needItems
+      ? await SupplierReceiptItem.findAll({
+          where: { supplier_receipt_id: receipt.id },
+          transaction: t,
+          lock: t.LOCK.UPDATE,
+        })
+      : [];
+
+    const lineItems = (items || []).map((x) => ({
+      book_id: num(x.book_id),
+      qty: Math.max(0, Math.floor(num(x.qty))),
+      rate: round2(x.rate),
+    }));
+
+    if (prevStatus !== "received" && nextStatus === "received") {
+      const errMsg = validateReadyToReceive({ receipt, lineItems });
+      if (errMsg) {
+        await t.rollback();
+        return reply.code(400).send({ error: errMsg });
+      }
     }
 
     receipt.status = nextStatus;
     await receipt.save({ transaction: t });
 
     if (prevStatus !== "received" && nextStatus === "received") {
-      const lineItems = (items || []).map((x) => ({
-        book_id: num(x.book_id),
-        qty: Math.max(0, Math.floor(num(x.qty))),
-        rate: round2(x.rate),
-      }));
-
-      await ensureInventoryInForReceipt({ receipt, items: lineItems, t });
-      await postPurchaseLedger({ receipt, t });
-
-      // ✅ apply order received qty
-      await bumpOrderReceivedQty({
-        school_order_id: receipt.school_order_id,
-        lines: lineItems,
-        sign: +1,
-        t,
-      });
+      await postIfNotPosted({ receipt, lineItems, t });
     }
 
     if (prevStatus === "received" && nextStatus === "cancelled") {
-      await removePurchaseLedger({ receipt, t });
-      await reverseInventoryForReceipt({ receipt, t });
+      if (hasPostedFlag(receipt)) {
+        await removePurchaseLedger({ receipt, t });
+        await reverseInventoryForReceipt({ receipt, t });
 
-      // ✅ reverse order received qty
-      const lineItems = (items || []).map((x) => ({
-        book_id: num(x.book_id),
-        qty: Math.max(0, Math.floor(num(x.qty))),
-        rate: round2(x.rate),
-      }));
+        await bumpOrderReceivedQty({
+          school_order_id: receipt.school_order_id,
+          lines: lineItems,
+          sign: -1,
+          t,
+        });
 
-      await bumpOrderReceivedQty({
-        school_order_id: receipt.school_order_id,
-        lines: lineItems,
-        sign: -1,
-        t,
-      });
+        await clearPosted({ receipt, t });
+      } else {
+        await removePurchaseLedger({ receipt, t });
+      }
     }
 
     if (prevStatus === "draft" && nextStatus === "cancelled") {
       await removePurchaseLedger({ receipt, t });
+      await clearPosted({ receipt, t });
     }
 
     await t.commit();

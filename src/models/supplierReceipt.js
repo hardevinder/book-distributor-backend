@@ -67,10 +67,12 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       // ✅ Keep only one "received date" (GRN date)
+      // NOTE: DATEONLY + NOW can create "Incorrect date value"
+      // so we use CURRENT_DATE literal.
       received_date: {
         type: DataTypes.DATEONLY,
         allowNull: false,
-        defaultValue: DataTypes.NOW,
+        defaultValue: sequelize.literal("CURRENT_DATE"),
       },
 
       status: {
@@ -81,6 +83,16 @@ module.exports = (sequelize, DataTypes) => {
 
       remarks: {
         type: DataTypes.TEXT,
+        allowNull: true,
+      },
+
+      /* =========================
+         ✅ Posting Guard
+         Inventory/Ledger posting must happen only once.
+         If later you attach invoice details, no reposting.
+         ========================= */
+      posted_at: {
+        type: DataTypes.DATE,
         allowNull: true,
       },
 
@@ -142,6 +154,7 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ["school_order_id"] }, // ✅ NOT unique (multiple receipts per order allowed)
         { fields: ["supplier_id", "receive_doc_type"] },
         { fields: ["supplier_id", "doc_no"] },
+        { fields: ["posted_at"] },
 
         // ✅ optional: prevent duplicate doc number per supplier+type
         // { unique: true, fields: ["supplier_id", "receive_doc_type", "doc_no"] },

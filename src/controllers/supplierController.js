@@ -1,5 +1,12 @@
 // src/controllers/supplierController.js
-const { Supplier, Publisher, sequelize } = require("../models");
+const {
+  Supplier,
+  Publisher,
+  SupplierReceipt,
+  SupplierReceiptItem,
+  Book,
+  sequelize,
+} = require("../models");
 
 /* ---------------- Helpers ---------------- */
 
@@ -22,6 +29,23 @@ const toBool = (v, defaultValue = true) => {
   if (["false", "0", "no", "n"].includes(s)) return false;
   return defaultValue;
 };
+
+/**
+ * ✅ Find Sequelize association alias automatically
+ * Fixes: "associated to X using an alias. You must use 'as' keyword"
+ */
+function findAssocAlias(sourceModel, targetModel) {
+  if (!sourceModel?.associations) return null;
+  const assoc = Object.values(sourceModel.associations).find(
+    (a) => a?.target === targetModel
+  );
+  return assoc?.as || null;
+}
+
+function safeNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 
 /* =========================================
  * CREATE Supplier
@@ -155,7 +179,9 @@ exports.update = async (request, reply) => {
       email: email !== undefined ? cleanNullable(email) : supplier.email,
       address: address !== undefined ? cleanNullable(address) : supplier.address,
       is_active:
-        is_active !== undefined ? toBool(is_active, supplier.is_active) : supplier.is_active,
+        is_active !== undefined
+          ? toBool(is_active, supplier.is_active)
+          : supplier.is_active,
     });
 
     return reply.send({
@@ -195,5 +221,174 @@ exports.remove = async (request, reply) => {
   } catch (err) {
     request.log?.error({ err }, "Delete Supplier Error");
     return reply.code(500).send({ error: "Failed to delete supplier." });
+  }
+};
+
+/* =========================================
+ * ✅ NEW: Supplier Invoices List
+ * GET /api/suppliers/:id/invoices
+ * ========================================= */
+exports.listInvoices = async (request, reply) => {
+  try {
+    const supplierId = Number(request.params.id);
+    if (!supplierId) {
+      return reply.code(400).send({ error: "Invalid supplier id" });
+    }
+
+    const supplier = await Supplier.findByPk(supplierId, {
+      attributes: ["id", "name"],
+    });
+    if (!supplier) {
+      return reply.code(404).send({ error: "Supplier not found." });
+    }
+
+    // ✅ Fix alias issue automatically
+    const itemsAlias = findAssocAlias(SupplierReceipt, SupplierReceiptItem);
+
+    const receipts = await SupplierReceipt.findAll({
+      where: { supplier_id: supplierId },
+      order: [["id", "DESC"]],
+      include: [
+        itemsAlias
+          ? {
+              model: SupplierReceiptItem,
+              as: itemsAlias,
+              attributes: ["id"],
+              required: false,
+            }
+          : null,
+      ].filter(Boolean),
+    });
+
+    const invoices = (receipts || []).map((r) => {
+      const itemsArr = itemsAlias ? r[itemsAlias] : [];
+
+      return {
+        id: r.id,
+        receipt_no: r.receipt_no ?? r.invoice_no ?? null,
+        status: r.status ?? null,
+        received_date: r.received_date ?? null,
+        doc_no: r.doc_no ?? r.bill_no ?? r.invoice_no ?? null,
+        doc_date: r.doc_date ?? r.invoice_date ?? null,
+
+        sub_total: r.sub_total ?? null,
+        bill_discount_amount: r.bill_discount_amount ?? r.discount_amount ?? null,
+        shipping_charge: r.shipping_charge ?? null,
+        other_charge: r.other_charge ?? null,
+        round_off: r.round_off ?? null,
+        grand_total: r.grand_total ?? r.total ?? r.net_total ?? null,
+
+        items_count: Array.isArray(itemsArr) ? itemsArr.length : 0,
+      };
+    });
+
+    return reply.send({
+      supplier: { id: supplier.id, name: supplier.name },
+      invoices,
+    });
+  } catch (err) {
+    request.log?.error({ err }, "listInvoices Error");
+    return reply.code(500).send({ error: "Failed to fetch invoices." });
+  }
+};
+
+/* =========================================
+ * ✅ NEW: Supplier Invoice Detail
+ * GET /api/suppliers/:id/invoices/:invoiceId
+ * ========================================= */
+exports.getInvoiceDetail = async (request, reply) => {
+  try {
+    const supplierId = Number(request.params.id);
+    const invoiceId = Number(request.params.invoiceId);
+
+    if (!supplierId || !invoiceId) {
+      return reply.code(400).send({ error: "Invalid supplier/invoice id" });
+    }
+
+    const itemsAlias = findAssocAlias(SupplierReceipt, SupplierReceiptItem);
+    const bookAlias = findAssocAlias(SupplierReceiptItem, Book);
+
+    const receipt = await SupplierReceipt.findOne({
+      where: { id: invoiceId, supplier_id: supplierId },
+      include: [
+        itemsAlias
+          ? {
+              model: SupplierReceiptItem,
+              as: itemsAlias,
+              required: false,
+              include: [
+                bookAlias
+                  ? {
+                      model: Book,
+                      as: bookAlias,
+                      required: false,
+                      attributes: ["id", "title", "class_name", "subject", "code"],
+                    }
+                  : {
+                      model: Book,
+                      required: false,
+                      attributes: ["id", "title", "class_name", "subject", "code"],
+                    },
+              ],
+            }
+          : null,
+      ].filter(Boolean),
+    });
+
+    if (!receipt) {
+      return reply.code(404).send({ error: "Invoice not found." });
+    }
+
+    const rawItems = itemsAlias ? receipt[itemsAlias] : [];
+    const items = (rawItems || []).map((it) => {
+      const bk = bookAlias ? it[bookAlias] : it.Book;
+
+      const qty =
+        it.qty ?? it.quantity ?? it.received_qty ?? it.ordered_qty ?? null;
+      const rate = it.rate ?? it.unit_price ?? it.price ?? null;
+
+      const amount =
+        it.amount ??
+        it.line_total ??
+        (qty != null && rate != null ? safeNumber(qty) * safeNumber(rate) : null);
+
+      return {
+        id: it.id,
+        book_id: it.book_id ?? bk?.id ?? null,
+        title: bk?.title ?? it.title ?? null,
+        class_name: bk?.class_name ?? it.class_name ?? null,
+        subject: bk?.subject ?? it.subject ?? null,
+        code: bk?.code ?? it.code ?? null,
+        qty,
+        rate,
+        amount,
+      };
+    });
+
+    return reply.send({
+      supplier: { id: supplierId },
+      invoice: {
+        id: receipt.id,
+        receipt_no: receipt.receipt_no ?? receipt.invoice_no ?? null,
+        status: receipt.status ?? null,
+        received_date: receipt.received_date ?? null,
+        doc_no: receipt.doc_no ?? receipt.bill_no ?? receipt.invoice_no ?? null,
+        doc_date: receipt.doc_date ?? receipt.invoice_date ?? null,
+
+        sub_total: receipt.sub_total ?? null,
+        bill_discount_amount:
+          receipt.bill_discount_amount ?? receipt.discount_amount ?? null,
+        shipping_charge: receipt.shipping_charge ?? null,
+        other_charge: receipt.other_charge ?? null,
+        round_off: receipt.round_off ?? null,
+        grand_total: receipt.grand_total ?? receipt.total ?? receipt.net_total ?? null,
+
+        items_count: items.length,
+      },
+      items,
+    });
+  } catch (err) {
+    request.log?.error({ err }, "getInvoiceDetail Error");
+    return reply.code(500).send({ error: "Failed to fetch invoice detail." });
   }
 };

@@ -178,6 +178,14 @@ const buildServer = () => {
     prefix: "/api/school-orders",
   });
 
+  /* =========================================================
+     ✅ Reports (School + Publisher Billing Summary etc.)
+     ========================================================= */
+  // Example route: GET /api/reports/school-publisher-billing
+  fastify.register(require("./routes/reportRoutes"), {
+    prefix: "/api/reports",
+  });
+
   /* ---------------- Module-2 ---------------- */
 
   // ✅ Step-2 Bundles/Kits (Reserve / Unreserve / List)
