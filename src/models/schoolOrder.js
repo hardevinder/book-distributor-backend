@@ -182,6 +182,11 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ["email_sent_count"] },
         { fields: ["last_email_sent_at"] },
 
+        // ✅ helpful compound indexes for reports
+        { fields: ["school_id", "order_date"] },
+        { fields: ["supplier_id", "order_date"] },
+        { fields: ["school_id", "supplier_id", "academic_session"] },
+
         // ✅ IMPORTANT:
         // We REMOVED uniq_school_session_supplier_type because it blocks multiple reorders.
         // We will enforce "only 1 ORIGINAL per school+session+supplier" via DB migration (generated column trick).
@@ -193,15 +198,31 @@ module.exports = (sequelize, DataTypes) => {
   SchoolOrder.associate = (models) => {
     SchoolOrder.belongsTo(models.School, { foreignKey: "school_id", as: "school" });
     SchoolOrder.belongsTo(models.Supplier, { foreignKey: "supplier_id", as: "supplier" });
-    SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id", as: "transport" });
-    SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id_2", as: "transport2" });
 
-    SchoolOrder.hasMany(models.SchoolOrderItem, { foreignKey: "school_order_id", as: "items" });
-
-    if (models.SupplierReceipt) {
-      SchoolOrder.belongsTo(models.SupplierReceipt, { foreignKey: "supplier_receipt_id", as: "supplierReceipt" });
+    if (models.Transport) {
+      SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id", as: "transport" });
+      SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id_2", as: "transport2" });
     }
 
+    // ✅ CRITICAL for ORDERED-side report
+    // Ensures SchoolOrder.associations includes target SchoolOrderItem so your dynamic alias detection works.
+    if (models.SchoolOrderItem) {
+      SchoolOrder.hasMany(models.SchoolOrderItem, {
+        foreignKey: "school_order_id",
+        as: "items",
+        onDelete: "CASCADE",
+        hooks: true,
+      });
+    }
+
+    if (models.SupplierReceipt) {
+      SchoolOrder.belongsTo(models.SupplierReceipt, {
+        foreignKey: "supplier_receipt_id",
+        as: "supplierReceipt",
+      });
+    }
+
+    // self references for reorders
     SchoolOrder.belongsTo(models.SchoolOrder, { foreignKey: "parent_order_id", as: "parentOrder" });
     SchoolOrder.hasMany(models.SchoolOrder, { foreignKey: "parent_order_id", as: "reorders" });
 

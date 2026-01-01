@@ -5,6 +5,9 @@ const {
   SupplierReceipt,
   SupplierReceiptItem,
   Book,
+  // ✅ NEW (optional models - if exist in your project)
+  School,
+  SchoolOrder,
   sequelize,
 } = require("../models");
 
@@ -35,16 +38,57 @@ const toBool = (v, defaultValue = true) => {
  * Fixes: "associated to X using an alias. You must use 'as' keyword"
  */
 function findAssocAlias(sourceModel, targetModel) {
-  if (!sourceModel?.associations) return null;
-  const assoc = Object.values(sourceModel.associations).find(
-    (a) => a?.target === targetModel
-  );
+  if (!sourceModel?.associations || !targetModel) return null;
+  const assoc = Object.values(sourceModel.associations).find((a) => a?.target === targetModel);
   return assoc?.as || null;
 }
 
 function safeNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * ✅ Safe include builder (only if model + alias exists)
+ */
+function buildInclude(sourceModel, targetModel, includeObj) {
+  if (!sourceModel || !targetModel) return null;
+  const as = findAssocAlias(sourceModel, targetModel);
+  if (!as) return null;
+  return { ...includeObj, model: targetModel, as };
+}
+
+/**
+ * ✅ Extract school from receipt JSON (supports different association shapes)
+ */
+function extractSchoolMeta({ receipt, schoolAlias, orderAlias, orderSchoolAlias }) {
+  if (!receipt) return { school_id: null, school_name: null };
+
+  // 1) Direct receipt -> School
+  const direct = schoolAlias ? receipt[schoolAlias] : receipt.school || receipt.School;
+  if (direct?.id || direct?.name) {
+    return {
+      school_id: direct.id ?? null,
+      school_name: direct.name ?? direct.school_name ?? null,
+    };
+  }
+
+  // 2) receipt -> SchoolOrder -> School
+  const ord = orderAlias ? receipt[orderAlias] : receipt.school_order || receipt.SchoolOrder;
+  const ordSchool = ord
+    ? orderSchoolAlias
+      ? ord[orderSchoolAlias]
+      : ord.school || ord.School
+    : null;
+
+  if (ordSchool?.id || ordSchool?.name) {
+    return {
+      school_id: ordSchool.id ?? null,
+      school_name: ordSchool.name ?? ordSchool.school_name ?? null,
+    };
+  }
+
+  return { school_id: null, school_name: null };
 }
 
 /* =========================================
@@ -55,14 +99,7 @@ function safeNumber(v) {
 exports.create = async (request, reply) => {
   const t = await sequelize.transaction();
   try {
-    const {
-      name,
-      contact_person,
-      phone,
-      email,
-      address,
-      is_active = true,
-    } = request.body || {};
+    const { name, contact_person, phone, email, address, is_active = true } = request.body || {};
 
     const cleanName = cleanStr(name);
     if (!cleanName) {
@@ -107,9 +144,7 @@ exports.create = async (request, reply) => {
     request.log?.error({ err }, "Create Supplier Error");
 
     if (err?.name === "SequelizeUniqueConstraintError") {
-      return reply
-        .code(409)
-        .send({ error: "Supplier with this name already exists." });
+      return reply.code(409).send({ error: "Supplier with this name already exists." });
     }
 
     return reply.code(500).send({ error: "Failed to create supplier." });
@@ -162,8 +197,7 @@ exports.update = async (request, reply) => {
       return reply.code(404).send({ error: "Supplier not found." });
     }
 
-    const { name, contact_person, phone, email, address, is_active } =
-      request.body || {};
+    const { name, contact_person, phone, email, address, is_active } = request.body || {};
 
     if (name !== undefined && !cleanStr(name)) {
       return reply.code(400).send({ error: "Supplier name cannot be empty." });
@@ -171,17 +205,11 @@ exports.update = async (request, reply) => {
 
     await supplier.update({
       name: name !== undefined ? cleanStr(name) : supplier.name,
-      contact_person:
-        contact_person !== undefined
-          ? cleanNullable(contact_person)
-          : supplier.contact_person,
+      contact_person: contact_person !== undefined ? cleanNullable(contact_person) : supplier.contact_person,
       phone: phone !== undefined ? cleanNullable(phone) : supplier.phone,
       email: email !== undefined ? cleanNullable(email) : supplier.email,
       address: address !== undefined ? cleanNullable(address) : supplier.address,
-      is_active:
-        is_active !== undefined
-          ? toBool(is_active, supplier.is_active)
-          : supplier.is_active,
+      is_active: is_active !== undefined ? toBool(is_active, supplier.is_active) : supplier.is_active,
     });
 
     return reply.send({
@@ -192,9 +220,7 @@ exports.update = async (request, reply) => {
     request.log?.error({ err }, "Update Supplier Error");
 
     if (err?.name === "SequelizeUniqueConstraintError") {
-      return reply
-        .code(409)
-        .send({ error: "Supplier with this name already exists." });
+      return reply.code(409).send({ error: "Supplier with this name already exists." });
     }
 
     return reply.code(500).send({ error: "Failed to update supplier." });
@@ -225,8 +251,9 @@ exports.remove = async (request, reply) => {
 };
 
 /* =========================================
- * ✅ NEW: Supplier Invoices List
+ * ✅ Supplier Invoices List
  * GET /api/suppliers/:id/invoices
+ * ✅ Now returns school_name also
  * ========================================= */
 exports.listInvoices = async (request, reply) => {
   try {
@@ -245,23 +272,59 @@ exports.listInvoices = async (request, reply) => {
     // ✅ Fix alias issue automatically
     const itemsAlias = findAssocAlias(SupplierReceipt, SupplierReceiptItem);
 
+    // ✅ School include support (direct OR via SchoolOrder)
+    const schoolAlias = findAssocAlias(SupplierReceipt, School);
+    const orderAlias = findAssocAlias(SupplierReceipt, SchoolOrder);
+    const orderSchoolAlias = findAssocAlias(SchoolOrder, School);
+
+    const includes = [];
+
+    // items (count only)
+    if (itemsAlias) {
+      includes.push({
+        model: SupplierReceiptItem,
+        as: itemsAlias,
+        attributes: ["id"],
+        required: false,
+      });
+    }
+
+    // direct receipt -> school
+    const directSchoolInc = buildInclude(SupplierReceipt, School, {
+      attributes: ["id", "name"],
+      required: false,
+    });
+    if (directSchoolInc) includes.push(directSchoolInc);
+
+    // receipt -> schoolOrder -> school
+    const orderInc = buildInclude(SupplierReceipt, SchoolOrder, {
+      attributes: ["id", "school_id"],
+      required: false,
+      include: [],
+    });
+    if (orderInc) {
+      const nestedSchoolInc = buildInclude(SchoolOrder, School, {
+        attributes: ["id", "name"],
+        required: false,
+      });
+      if (nestedSchoolInc) orderInc.include.push(nestedSchoolInc);
+      includes.push(orderInc);
+    }
+
     const receipts = await SupplierReceipt.findAll({
       where: { supplier_id: supplierId },
       order: [["id", "DESC"]],
-      include: [
-        itemsAlias
-          ? {
-              model: SupplierReceiptItem,
-              as: itemsAlias,
-              attributes: ["id"],
-              required: false,
-            }
-          : null,
-      ].filter(Boolean),
+      include: includes,
     });
 
     const invoices = (receipts || []).map((r) => {
       const itemsArr = itemsAlias ? r[itemsAlias] : [];
+      const { school_id, school_name } = extractSchoolMeta({
+        receipt: r,
+        schoolAlias,
+        orderAlias,
+        orderSchoolAlias,
+      });
 
       return {
         id: r.id,
@@ -270,6 +333,10 @@ exports.listInvoices = async (request, reply) => {
         received_date: r.received_date ?? null,
         doc_no: r.doc_no ?? r.bill_no ?? r.invoice_no ?? null,
         doc_date: r.doc_date ?? r.invoice_date ?? null,
+
+        // ✅ NEW
+        school_id,
+        school_name,
 
         sub_total: r.sub_total ?? null,
         bill_discount_amount: r.bill_discount_amount ?? r.discount_amount ?? null,
@@ -293,8 +360,9 @@ exports.listInvoices = async (request, reply) => {
 };
 
 /* =========================================
- * ✅ NEW: Supplier Invoice Detail
+ * ✅ Supplier Invoice Detail
  * GET /api/suppliers/:id/invoices/:invoiceId
+ * ✅ Now returns school_name also
  * ========================================= */
 exports.getInvoiceDetail = async (request, reply) => {
   try {
@@ -308,31 +376,61 @@ exports.getInvoiceDetail = async (request, reply) => {
     const itemsAlias = findAssocAlias(SupplierReceipt, SupplierReceiptItem);
     const bookAlias = findAssocAlias(SupplierReceiptItem, Book);
 
+    // ✅ School include support (direct OR via SchoolOrder)
+    const schoolAlias = findAssocAlias(SupplierReceipt, School);
+    const orderAlias = findAssocAlias(SupplierReceipt, SchoolOrder);
+    const orderSchoolAlias = findAssocAlias(SchoolOrder, School);
+
+    const includes = [];
+
+    // items + book
+    if (itemsAlias) {
+      includes.push({
+        model: SupplierReceiptItem,
+        as: itemsAlias,
+        required: false,
+        include: [
+          bookAlias
+            ? {
+                model: Book,
+                as: bookAlias,
+                required: false,
+                attributes: ["id", "title", "class_name", "subject", "code"],
+              }
+            : {
+                model: Book,
+                required: false,
+                attributes: ["id", "title", "class_name", "subject", "code"],
+              },
+        ],
+      });
+    }
+
+    // direct receipt -> school
+    const directSchoolInc = buildInclude(SupplierReceipt, School, {
+      attributes: ["id", "name"],
+      required: false,
+    });
+    if (directSchoolInc) includes.push(directSchoolInc);
+
+    // receipt -> schoolOrder -> school
+    const orderInc = buildInclude(SupplierReceipt, SchoolOrder, {
+      attributes: ["id", "school_id"],
+      required: false,
+      include: [],
+    });
+    if (orderInc) {
+      const nestedSchoolInc = buildInclude(SchoolOrder, School, {
+        attributes: ["id", "name"],
+        required: false,
+      });
+      if (nestedSchoolInc) orderInc.include.push(nestedSchoolInc);
+      includes.push(orderInc);
+    }
+
     const receipt = await SupplierReceipt.findOne({
       where: { id: invoiceId, supplier_id: supplierId },
-      include: [
-        itemsAlias
-          ? {
-              model: SupplierReceiptItem,
-              as: itemsAlias,
-              required: false,
-              include: [
-                bookAlias
-                  ? {
-                      model: Book,
-                      as: bookAlias,
-                      required: false,
-                      attributes: ["id", "title", "class_name", "subject", "code"],
-                    }
-                  : {
-                      model: Book,
-                      required: false,
-                      attributes: ["id", "title", "class_name", "subject", "code"],
-                    },
-              ],
-            }
-          : null,
-      ].filter(Boolean),
+      include: includes,
     });
 
     if (!receipt) {
@@ -343,8 +441,7 @@ exports.getInvoiceDetail = async (request, reply) => {
     const items = (rawItems || []).map((it) => {
       const bk = bookAlias ? it[bookAlias] : it.Book;
 
-      const qty =
-        it.qty ?? it.quantity ?? it.received_qty ?? it.ordered_qty ?? null;
+      const qty = it.qty ?? it.quantity ?? it.received_qty ?? it.ordered_qty ?? null;
       const rate = it.rate ?? it.unit_price ?? it.price ?? null;
 
       const amount =
@@ -365,8 +462,16 @@ exports.getInvoiceDetail = async (request, reply) => {
       };
     });
 
+    const { school_id, school_name } = extractSchoolMeta({
+      receipt,
+      schoolAlias,
+      orderAlias,
+      orderSchoolAlias,
+    });
+
     return reply.send({
       supplier: { id: supplierId },
+      school: school_name ? { id: school_id, name: school_name } : null, // ✅ NEW (easy for frontend)
       invoice: {
         id: receipt.id,
         receipt_no: receipt.receipt_no ?? receipt.invoice_no ?? null,
@@ -375,9 +480,12 @@ exports.getInvoiceDetail = async (request, reply) => {
         doc_no: receipt.doc_no ?? receipt.bill_no ?? receipt.invoice_no ?? null,
         doc_date: receipt.doc_date ?? receipt.invoice_date ?? null,
 
+        // ✅ NEW
+        school_id,
+        school_name,
+
         sub_total: receipt.sub_total ?? null,
-        bill_discount_amount:
-          receipt.bill_discount_amount ?? receipt.discount_amount ?? null,
+        bill_discount_amount: receipt.bill_discount_amount ?? receipt.discount_amount ?? null,
         shipping_charge: receipt.shipping_charge ?? null,
         other_charge: receipt.other_charge ?? null,
         round_off: receipt.round_off ?? null,
