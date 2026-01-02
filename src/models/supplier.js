@@ -12,7 +12,6 @@ module.exports = (sequelize, DataTypes) => {
       name: {
         type: DataTypes.STRING(150),
         allowNull: false,
-        // unique: true,
       },
 
       contact_person: {
@@ -35,6 +34,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ NEW: Supplier -> Publisher (FK)
+      publisher_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
       is_active: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
@@ -44,6 +49,10 @@ module.exports = (sequelize, DataTypes) => {
     {
       tableName: "suppliers",
       timestamps: true,
+      indexes: [
+        // helpful for joins
+        { fields: ["publisher_id"] },
+      ],
     }
   );
 
@@ -55,14 +64,17 @@ module.exports = (sequelize, DataTypes) => {
       as: "schoolOrders",
     });
 
-    // ✅ Supplier -> Books (Catalogue)
+    // Supplier -> Books (Catalogue)
     Supplier.hasMany(models.Book, {
       foreignKey: "supplier_id",
       as: "books",
     });
 
-    // (Optional) if you ever link supplier on publisher:
-    // Supplier.hasMany(models.Publisher, { foreignKey: "supplier_id", as: "publishers" });
+    // ✅ Supplier -> Publisher
+    Supplier.belongsTo(models.Publisher, {
+      foreignKey: "publisher_id",
+      as: "publisher",
+    });
   };
 
   return Supplier;

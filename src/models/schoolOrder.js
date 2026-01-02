@@ -55,7 +55,14 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       status: {
-        type: DataTypes.ENUM("draft", "sent", "partial_received", "completed", "cancelled", "reordered"),
+        type: DataTypes.ENUM(
+          "draft",
+          "sent",
+          "partial_received",
+          "completed",
+          "cancelled",
+          "reordered"
+        ),
         allowNull: false,
         defaultValue: "draft",
       },
@@ -75,7 +82,14 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ Note 1 (existing)
       notes: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+      },
+
+      // ✅ Note 2 (new)
+      notes_2: {
         type: DataTypes.TEXT,
         allowNull: true,
       },
@@ -227,7 +241,10 @@ module.exports = (sequelize, DataTypes) => {
     SchoolOrder.hasMany(models.SchoolOrder, { foreignKey: "parent_order_id", as: "reorders" });
 
     if (models.SchoolOrderEmailLog) {
-      SchoolOrder.hasMany(models.SchoolOrderEmailLog, { foreignKey: "school_order_id", as: "emailLogs" });
+      SchoolOrder.hasMany(models.SchoolOrderEmailLog, {
+        foreignKey: "school_order_id",
+        as: "emailLogs",
+      });
     }
   };
 

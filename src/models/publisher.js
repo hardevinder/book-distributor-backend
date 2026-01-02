@@ -20,7 +20,6 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // Optional (can be empty)
       phone: {
         type: DataTypes.STRING(30),
         allowNull: true,
@@ -45,8 +44,24 @@ module.exports = (sequelize, DataTypes) => {
     {
       tableName: "publishers",
       timestamps: true,
+      indexes: [
+        // optional but useful for name lookups
+        { fields: ["name"] },
+      ],
     }
   );
+
+  // ✅ Associations
+  Publisher.associate = (models) => {
+    // Publisher -> Suppliers (ONE publisher, MANY suppliers)
+    Publisher.hasMany(models.Supplier, {
+      foreignKey: "publisher_id",
+      as: "suppliers",
+    });
+
+    // (Future safe)
+    // Publisher.hasMany(models.Book, { foreignKey: "publisher_id", as: "books" });
+  };
 
   return Publisher;
 };

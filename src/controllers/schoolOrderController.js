@@ -257,11 +257,7 @@ exports.listSchoolOrders = async (request, reply) => {
           const received = Number(it.received_qty) || 0;
           const reordered = Number(it.reordered_qty) || 0;
           const pending = Math.max(ordered - received - reordered, 0);
-
-          return {
-            ...it,
-            pending_qty: pending,
-          };
+          return { ...it, pending_qty: pending };
         }) || [];
       return o;
     });
@@ -569,7 +565,9 @@ exports.generateOrdersForSession = async (request, reply) => {
  * ============================================ */
 exports.updateSchoolOrderMeta = async (request, reply) => {
   const { orderId } = request.params;
-  const { transport_id, transport_id_2, notes } = request.body || {};
+
+  // ✅ UPDATED: accept notes_2
+  const { transport_id, transport_id_2, notes, notes_2 } = request.body || {};
 
   try {
     const order = await SchoolOrder.findOne({ where: { id: orderId } });
@@ -590,9 +588,14 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
       }
     }
 
-    // notes
+    // notes (note 1)
     if (typeof notes !== "undefined") {
       order.notes = notes === null || notes === "" ? null : String(notes).trim();
+    }
+
+    // ✅ notes_2 (note 2)
+    if (typeof notes_2 !== "undefined") {
+      order.notes_2 = notes_2 === null || notes_2 === "" ? null : String(notes_2).trim();
     }
 
     await order.save();
@@ -1203,175 +1206,293 @@ exports.getSchoolBookAvailability = async (request, reply) => {
 };
 
 /* ============================================================
- * PDF builder -> Buffer
+ * PDF renderer (draws ONE order into an existing doc)
+ * - Used for single-PDF and bulk-PDF
  * ============================================================ */
-function buildSchoolOrderPdfBuffer({
-  order,
-  companyProfile,
-  items,
-  pdfTitle,
-  toParty,
-  dateStr,
-  orderDate,
-  isPurchaseOrder = false,
-  showPrintDate = false,
+async function renderSchoolOrderToDoc(doc, opts) {
+  const {
+    order,
+    companyProfile,
+    items,
+    pdfTitle,
+    toParty,
+    dateStr,
+    orderDate,
+    isPurchaseOrder = false,
+    showPrintDate = false,
+    showReceivedPending = true,
 
-  // ✅ NEW: if false => Supplier PO PDF will show ONLY ORDERED (no received/pending)
-  showReceivedPending = true,
-}) {
-  return new Promise(async (resolve, reject) => {
-    const doc = new PDFDocument({ size: "A4", margin: 40 });
-    const chunks = [];
+    // ✅ Notes override (two notes)
+    notes = null,
 
-    doc.on("data", (chunk) => chunks.push(chunk));
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
-    doc.on("error", reject);
+    // ✅ Layout tweaks requested by client
+    layout = {},
+  } = opts || {};
 
-    const pageLeft = doc.page.margins.left;
-    const pageRight = doc.page.width - doc.page.margins.right;
-    const contentWidth = pageRight - pageLeft;
+  const L = {
+    hideSubject: Boolean(layout?.hideSubject),
+    summaryTotalOnly: Boolean(layout?.summaryTotalOnly),
+    supplierAddressSecondColumn: Boolean(layout?.supplierAddressSecondColumn),
+    boldSupplierName: Boolean(layout?.boldSupplierName),
+    boldOrderDate: Boolean(layout?.boldOrderDate),
+  };
 
-    const safeText = (v) => String(v ?? "").trim();
+  const pageLeft = doc.page.margins.left;
+  const pageRight = doc.page.width - doc.page.margins.right;
+  const contentWidth = pageRight - pageLeft;
 
-    const drawHR = () => {
-      doc.save();
-      doc.lineWidth(0.7);
-      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
-      doc.restore();
-    };
+  const safeText = (v) => String(v ?? "").trim();
 
-    const ensureSpaceWithHeader = (neededHeight, printHeaderFn) => {
-      const bottom = doc.page.height - doc.page.margins.bottom;
-      if (doc.y + neededHeight > bottom) {
-        doc.addPage();
-        if (typeof printHeaderFn === "function") printHeaderFn();
-      }
-    };
+  const drawHR = () => {
+    doc.save();
+    doc.lineWidth(0.7);
+    doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+    doc.restore();
+  };
 
-    /* ---------- Header (logo + company) ---------- */
-    if (companyProfile) {
-      const startY = doc.y;
-      const logoSize = 52;
-      const gap = 10;
+  const drawHR2 = () => {
+    doc.save();
+    doc.lineWidth(0.6);
+    doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+    doc.restore();
+  };
 
-      const logoRef =
-        companyProfile.logo_url ||
-        companyProfile.logo ||
-        companyProfile.logo_path ||
-        companyProfile.logo_image ||
-        null;
+  const ensureSpaceWithHeader = (neededHeight, printHeaderFn) => {
+    const bottom = doc.page.height - doc.page.margins.bottom;
+    if (doc.y + neededHeight > bottom) {
+      doc.addPage();
+      if (typeof printHeaderFn === "function") printHeaderFn();
+    }
+  };
 
-      let logoBuf = null;
+  /* ---------- Header (logo + company) ---------- */
+  if (companyProfile) {
+    const startY = doc.y;
+    const logoSize = 52;
+    const gap = 10;
+
+    const logoRef =
+      companyProfile.logo_url ||
+      companyProfile.logo ||
+      companyProfile.logo_path ||
+      companyProfile.logo_image ||
+      null;
+
+    let logoBuf = null;
+    try {
+      logoBuf = await loadLogoBuffer(logoRef);
+    } catch {
+      logoBuf = null;
+    }
+
+    const logoX = pageLeft;
+    const logoY = startY;
+    const textX = logoBuf ? logoX + logoSize + gap : pageLeft;
+    const textWidth = pageRight - textX;
+
+    if (logoBuf) {
       try {
-        logoBuf = await loadLogoBuffer(logoRef);
-      } catch {
-        logoBuf = null;
-      }
-
-      const logoX = pageLeft;
-      const logoY = startY;
-      const textX = logoBuf ? logoX + logoSize + gap : pageLeft;
-      const textWidth = pageRight - textX;
-
-      if (logoBuf) {
-        try {
-          doc.image(logoBuf, logoX, logoY, { fit: [logoSize, logoSize] });
-        } catch {}
-      }
-
-      const addrParts = [];
-      if (companyProfile.address_line1) addrParts.push(companyProfile.address_line1);
-      if (companyProfile.address_line2) addrParts.push(companyProfile.address_line2);
-
-      const cityStatePin = [companyProfile.city, companyProfile.state, companyProfile.pincode]
-        .filter(Boolean)
-        .join(", ");
-      if (cityStatePin) addrParts.push(cityStatePin);
-
-      const lines = [];
-      if (companyProfile.name)
-        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
-      if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
-
-      const contactParts = [];
-      if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
-      if (companyProfile.email) contactParts.push(`Email: ${companyProfile.email}`);
-      if (contactParts.length)
-        lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
-
-      if (companyProfile.gstin)
-        lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
-
-      let yCursor = startY;
-      for (const ln of lines) {
-        doc.font(ln.font).fontSize(ln.size).fillColor("#000");
-        doc.text(safeText(ln.text), textX, yCursor, { width: textWidth, align: "left" });
-        const h = doc.heightOfString(safeText(ln.text), { width: textWidth });
-        yCursor += h + 2;
-      }
-
-      const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 12;
-      doc.y = headerBottom;
-
-      drawHR();
-      doc.moveDown(0.35);
+        doc.image(logoBuf, logoX, logoY, { fit: [logoSize, logoSize] });
+      } catch {}
     }
 
-    /* ---------- Title ---------- */
-    doc.font("Helvetica-Bold").fontSize(isPurchaseOrder ? 16 : 14).fillColor("#000");
-    const titleBoxW = Math.floor(contentWidth * 0.72);
-    const titleX = pageLeft + Math.floor((contentWidth - titleBoxW) / 2);
-    doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
-    doc.moveDown(0.5);
+    const addrParts = [];
+    if (companyProfile.address_line1) addrParts.push(companyProfile.address_line1);
+    if (companyProfile.address_line2) addrParts.push(companyProfile.address_line2);
 
-    /* ---------- TOP: Order No (left) + Date (right) ---------- */
-    const topY = doc.y;
-    const leftTopW = Math.floor(contentWidth * 0.6);
-    const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
-    const rightTopW = pageRight - rightTopX;
+    const cityStatePin = [companyProfile.city, companyProfile.state, companyProfile.pincode]
+      .filter(Boolean)
+      .join(", ");
+    if (cityStatePin) addrParts.push(cityStatePin);
 
-    const orderNoText = safeText(order.order_no || order.id);
+    const lines = [];
+    if (companyProfile.name)
+      lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
+    if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
 
-    doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
-    doc.text(`Order No: ${orderNoText}`, pageLeft, topY, { width: leftTopW, align: "left" });
+    const contactParts = [];
+    if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
+    if (companyProfile.email) contactParts.push(`Email: ${companyProfile.email}`);
+    if (contactParts.length)
+      lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
 
-    doc.font("Helvetica").fontSize(9).fillColor("#000");
-    doc.text(`Order Date: ${safeText(orderDate)}`, rightTopX, topY + 1, {
-      width: rightTopW,
-      align: "right",
-    });
-    if (showPrintDate) {
-      doc.text(`Print Date: ${safeText(dateStr)}`, rightTopX, doc.y + 2, {
-        width: rightTopW,
-        align: "right",
-      });
+    if (companyProfile.gstin)
+      lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
+
+    let yCursor = startY;
+    for (const ln of lines) {
+      doc.font(ln.font).fontSize(ln.size).fillColor("#000");
+      doc.text(safeText(ln.text), textX, yCursor, { width: textWidth, align: "left" });
+      const h = doc.heightOfString(safeText(ln.text), { width: textWidth });
+      yCursor += h + 2;
     }
 
-    const leftH = doc.heightOfString(`Order No: ${orderNoText}`, { width: leftTopW });
-    const rightText = showPrintDate
-      ? `Order Date: ${safeText(orderDate)}\nPrint Date: ${safeText(dateStr)}`
-      : `Order Date: ${safeText(orderDate)}`;
-    const rightH = doc.heightOfString(rightText, { width: rightTopW });
-
-    doc.y = topY + Math.max(leftH, rightH) + 8;
-
-    const drawHR2 = () => {
-      doc.save();
-      doc.lineWidth(0.6);
-      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
-      doc.restore();
-    };
+    const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 12;
+    doc.y = headerBottom;
 
     drawHR();
     doc.moveDown(0.35);
+  }
 
-    /* ---------- To (Supplier) ---------- */
-    if (toParty && toParty.name) {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
-      doc.text("To:", pageLeft, doc.y);
+  /* ---------- Title ---------- */
+  doc.font("Helvetica-Bold").fontSize(isPurchaseOrder ? 16 : 14).fillColor("#000");
+  const titleBoxW = Math.floor(contentWidth * 0.72);
+  const titleX = pageLeft + Math.floor((contentWidth - titleBoxW) / 2);
+  doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
+  doc.moveDown(0.5);
 
-      doc.font("Helvetica").fontSize(10).fillColor("#000");
-      doc.text(safeText(toParty.name), pageLeft, doc.y);
+  /* ---------- TOP: Order No (left) + Date (right) ---------- */
+  const topY = doc.y;
+  const leftTopW = Math.floor(contentWidth * 0.6);
+  const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
+  const rightTopW = pageRight - rightTopX;
+
+  const orderNoText = safeText(order.order_no || order.id);
+
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
+  doc.text(`Order No: ${orderNoText}`, pageLeft, topY, { width: leftTopW, align: "left" });
+
+  doc.fillColor("#000");
+  doc.font(L.boldOrderDate ? "Helvetica-Bold" : "Helvetica").fontSize(9);
+  doc.text(`Order Date: ${safeText(orderDate)}`, rightTopX, topY + 1, {
+    width: rightTopW,
+    align: "right",
+  });
+
+  if (showPrintDate) {
+    doc.font("Helvetica").fontSize(9);
+    doc.text(`Print Date: ${safeText(dateStr)}`, rightTopX, doc.y + 2, {
+      width: rightTopW,
+      align: "right",
+    });
+  }
+
+  const leftH = doc.heightOfString(`Order No: ${orderNoText}`, { width: leftTopW });
+  const rightText = showPrintDate
+    ? `Order Date: ${safeText(orderDate)}\nPrint Date: ${safeText(dateStr)}`
+    : `Order Date: ${safeText(orderDate)}`;
+  const rightH = doc.heightOfString(rightText, { width: rightTopW });
+
+  doc.y = topY + Math.max(leftH, rightH) + 8;
+
+  drawHR();
+  doc.moveDown(0.35);
+
+  /* ---------- To (Supplier) ---------- */
+  if (toParty && toParty.name) {
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+    doc.text("To:", pageLeft, doc.y);
+
+    const boxTop = doc.y + 2;
+
+    // helper: transport block text from order.transport / order.transport2
+    const buildTransportText = () => {
+      const t1 = order?.transport || null;
+      const t2 = order?.transport2 || null;
+
+      const lines = [];
+
+      const fmtOne = (t, label) => {
+        if (!t) return null;
+        const name = safeText(t.name || "");
+        const city = safeText(t.city || "");
+        const phone = safeText(t.phone || "");
+        if (!name && !city && !phone) return null;
+
+        const parts = [];
+        if (name) parts.push(name);
+        if (city) parts.push(city);
+        const main = parts.join(" - ");
+
+        const phoneLine = phone ? `Phone: ${phone}` : "";
+        return `${label}: ${main || "-"}${phoneLine ? `\n${phoneLine}` : ""}`;
+      };
+
+      const one1 = fmtOne(t1, "Transport");
+      const one2 = fmtOne(t2, "Transport 2");
+
+      if (one1) lines.push(one1);
+      if (one2) lines.push(one2);
+
+      return lines.join("\n\n");
+    };
+
+    if (L.supplierAddressSecondColumn) {
+      const colGap = 12;
+      const colW = Math.floor((contentWidth - colGap) / 2);
+      const col1X = pageLeft;
+      const col2X = pageLeft + colW + colGap;
+
+      const name = safeText(toParty.name);
+
+      // ✅ Address should be directly below name
+      const addr = safeText(toParty.address || "");
+
+      const phoneLine = toParty.phone ? `Phone: ${safeText(toParty.phone)}` : "";
+      const emailLine = toParty.email ? `Email: ${safeText(toParty.email)}` : "";
+
+      // ✅ Transport on right side (same row)
+      const transportText = safeText(buildTransportText());
+
+      // ---- Measure heights (left supplier)
+      doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10);
+      const hName = doc.heightOfString(name, { width: colW });
+
+      doc.font("Helvetica").fontSize(9);
+      const hAddr = addr ? doc.heightOfString(addr, { width: colW }) : 0;
+
+      const metaLines = [phoneLine, emailLine].filter(Boolean).join("\n");
+      const hMeta = metaLines ? doc.heightOfString(metaLines, { width: colW }) : 0;
+
+      const leftH = hName + (addr ? 2 + hAddr : 0) + (metaLines ? 2 + hMeta : 0);
+
+      // ---- Measure heights (right transport)
+      doc.font("Helvetica-Bold").fontSize(9);
+      const transportTitle = transportText ? "Transport Details" : "";
+      const hTRTitle = transportTitle ? doc.heightOfString(transportTitle, { width: colW }) : 0;
+
+      doc.font("Helvetica").fontSize(9);
+      const hTRBody = transportText ? doc.heightOfString(transportText, { width: colW }) : 0;
+
+      const rightH = (transportTitle ? hTRTitle + 2 : 0) + (transportText ? hTRBody : 0);
+
+      // ---- Draw LEFT (Supplier)
+      doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10).fillColor("#000");
+      doc.text(name, col1X, boxTop, { width: colW });
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      let yL = boxTop + hName + 2;
+
+      // ✅ Address directly below name
+      if (addr) {
+        doc.text(addr, col1X, yL, { width: colW });
+        yL = doc.y + 2;
+      }
+
+      if (phoneLine) {
+        doc.text(phoneLine, col1X, yL, { width: colW });
+        yL = doc.y;
+      }
+      if (emailLine) {
+        doc.text(emailLine, col1X, yL, { width: colW });
+        yL = doc.y;
+      }
+
+      // ---- Draw RIGHT (Transport)
+      if (transportText) {
+        doc.font("Helvetica-Bold").fontSize(9).fillColor("#000");
+        doc.text("Transport Details", col2X, boxTop, { width: colW });
+
+        doc.font("Helvetica").fontSize(9).fillColor("#000");
+        doc.text(transportText, col2X, doc.y + 2, { width: colW });
+      }
+
+      // ✅ push cursor to MAX height of both columns + padding
+      doc.y = boxTop + Math.max(leftH, rightH) + 8;
+    } else {
+      // fallback old single-column layout
+      doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10).fillColor("#000");
+      doc.text(safeText(toParty.name), pageLeft, boxTop);
 
       const subLines = [];
       if (toParty.address) subLines.push(safeText(toParty.address));
@@ -1383,56 +1504,75 @@ function buildSchoolOrderPdfBuffer({
         doc.text(ln, pageLeft, doc.y, { width: Math.floor(contentWidth * 0.72) });
       }
     }
+  }
 
-    doc.moveDown(0.25);
-    drawHR();
-    doc.moveDown(0.4);
+  doc.moveDown(0.25);
+  drawHR();
+  doc.moveDown(0.4);
 
-    /* ---------- Summary ---------- */
-    const totalOrdered = items.reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
+  /* ---------- Summary ---------- */
+  const totalOrdered = (items || []).reduce((sum, it) => sum + (Number(it.total_order_qty) || 0), 0);
 
-    const boxY = doc.y;
-    const boxH = showReceivedPending ? 58 : 40;
+  const boxY = doc.y;
+  const boxH = L.summaryTotalOnly ? 28 : showReceivedPending ? 58 : 40;
 
-    doc.save();
-    doc.rect(pageLeft, boxY, contentWidth, boxH).fill("#f6f8fb");
-    doc.restore();
+  doc.save();
+  doc.rect(pageLeft, boxY, contentWidth, boxH).fill("#f6f8fb");
+  doc.restore();
 
-    doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+  doc.fillColor("#000");
+  if (!L.summaryTotalOnly) {
+    doc.font("Helvetica-Bold").fontSize(10);
     doc.text("Summary", pageLeft + 10, boxY + 8);
+  }
 
-    doc.font("Helvetica").fontSize(9).fillColor("#000");
-    doc.text(`Total Ordered: ${totalOrdered}`, pageLeft + 10, boxY + 26, {
-      width: contentWidth - 20,
+  doc.font("Helvetica").fontSize(9);
+  doc.text(`Total Ordered: ${totalOrdered}`, pageLeft + 10, boxY + (L.summaryTotalOnly ? 10 : 26), {
+    width: contentWidth - 20,
+  });
+
+  if (!L.summaryTotalOnly && showReceivedPending) {
+    const totalReceived = (items || []).reduce((sum, it) => sum + (Number(it.received_qty) || 0), 0);
+    const totalPending = Math.max(totalOrdered - totalReceived, 0);
+    const completion = totalOrdered > 0 ? Math.round((totalReceived / totalOrdered) * 100) : 0;
+
+    doc.text(`Completion: ${completion}%`, pageLeft + contentWidth / 2, boxY + 26, {
+      width: contentWidth / 2 - 10,
+      align: "right",
     });
 
-    if (showReceivedPending) {
-      const totalReceived = items.reduce((sum, it) => sum + (Number(it.received_qty) || 0), 0);
-      const totalPending = Math.max(totalOrdered - totalReceived, 0);
-      const completion = totalOrdered > 0 ? Math.round((totalReceived / totalOrdered) * 100) : 0;
+    doc.text(`Total Received: ${totalReceived}`, pageLeft + 10, boxY + 40, {
+      width: contentWidth / 2 - 10,
+    });
 
-      doc.text(`Completion: ${completion}%`, pageLeft + contentWidth / 2, boxY + 26, {
-        width: contentWidth / 2 - 10,
-        align: "right",
-      });
+    doc.text(`Total Pending: ${totalPending}`, pageLeft + contentWidth / 2, boxY + 40, {
+      width: contentWidth / 2 - 10,
+      align: "right",
+    });
+  }
 
-      doc.text(`Total Received: ${totalReceived}`, pageLeft + 10, boxY + 40, {
-        width: contentWidth / 2 - 10,
-      });
+  doc.y = boxY + boxH + 10;
 
-      doc.text(`Total Pending: ${totalPending}`, pageLeft + contentWidth / 2, boxY + 40, {
-        width: contentWidth / 2 - 10,
-        align: "right",
-      });
-    }
+  /* ---------- Table ---------- */
+  const hideSubject = L.hideSubject === true;
 
-    doc.y = boxY + boxH + 10;
+  let W, X;
 
-    /* ---------- Table ---------- */
-    let W, X;
-
-    if (showReceivedPending) {
-      // Internal / old layout
+  if (showReceivedPending) {
+    if (hideSubject) {
+      // Sr | Title | Ordered | Received | Pending
+      W = { sr: 26, title: 0, ord: 85, rec: 85, pend: 85 };
+      W.title = contentWidth - (W.sr + W.ord + W.rec + W.pend);
+      if (W.title < 200) W.title = Math.max(200, W.title);
+      X = {
+        sr: pageLeft,
+        title: pageLeft + W.sr,
+        ord: pageLeft + W.sr + W.title,
+        rec: pageLeft + W.sr + W.title + W.ord,
+        pend: pageLeft + W.sr + W.title + W.ord + W.rec,
+      };
+    } else {
+      // Sr | Title | Subject | Ordered | Received | Pending
       W = { sr: 26, title: 0, subject: 70, ord: 85, rec: 85, pend: 85 };
       W.title = contentWidth - (W.sr + W.subject + W.ord + W.rec + W.pend);
       if (W.title < 140) {
@@ -1448,8 +1588,14 @@ function buildSchoolOrderPdfBuffer({
         rec: pageLeft + W.sr + W.title + W.subject + W.ord,
         pend: pageLeft + W.sr + W.title + W.subject + W.ord + W.rec,
       };
+    }
+  } else {
+    // Supplier PO layout (ONLY ordered)
+    if (hideSubject) {
+      W = { sr: 26, title: 0, ord: 90 };
+      W.title = contentWidth - (W.sr + W.ord);
+      X = { sr: pageLeft, title: pageLeft + W.sr, ord: pageLeft + W.sr + W.title };
     } else {
-      // ✅ Supplier PO layout (ONLY ordered)
       W = { sr: 26, title: 0, subject: 90, ord: 90 };
       W.title = contentWidth - (W.sr + W.subject + W.ord);
       if (W.title < 160) {
@@ -1464,108 +1610,389 @@ function buildSchoolOrderPdfBuffer({
         ord: pageLeft + W.sr + W.title + W.subject,
       };
     }
+  }
 
-    const printTableHeader = () => {
-      const y = doc.y;
-      doc.save();
-      doc.rect(pageLeft, y - 2, contentWidth, 18).fill("#f2f2f2");
-      doc.restore();
+  const printTableHeader = () => {
+    const y = doc.y;
+    doc.save();
+    doc.rect(pageLeft, y - 2, contentWidth, 18).fill("#f2f2f2");
+    doc.restore();
 
-      doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
-      doc.text("Sr", X.sr, y, { width: W.sr });
-      doc.text("Book Title", X.title, y, { width: W.title });
-      doc.text("Subject", X.subject, y, { width: W.subject });
+    doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
 
-      doc.font("Helvetica-Bold").fontSize(10);
-      doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
+    if (showReceivedPending) {
+      if (hideSubject) {
+        doc.text("Sr", X.sr, y, { width: W.sr });
+        doc.text("Book Title", X.title, y, { width: W.title });
+        doc.font("Helvetica-Bold").fontSize(10);
+        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
+        doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
+        doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
+      } else {
+        doc.text("Sr", X.sr, y, { width: W.sr });
+        doc.text("Book Title", X.title, y, { width: W.title });
+        doc.text("Subject", X.subject, y, { width: W.subject });
 
-      if (showReceivedPending) {
+        doc.font("Helvetica-Bold").fontSize(10);
+        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
         doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
         doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
       }
-
-      doc.moveDown(1.1);
-      drawHR2();
-      doc.moveDown(0.25);
-    };
-
-    const rowHeight = (cells, fontSize = 9) => {
-      doc.font("Helvetica").fontSize(fontSize);
-      const h1 = doc.heightOfString(cells.title, { width: W.title });
-      const h2 = doc.heightOfString(cells.subject, { width: W.subject });
-      return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
-    };
-
-    printTableHeader();
-
-    if (!items.length) {
-      doc.font("Helvetica").fontSize(10).fillColor("#000");
-      doc.text("No items found in this order.", { align: "left" });
     } else {
-      let sr = 1;
-      for (const it of items) {
-        const orderedQty = Number(it.total_order_qty) || 0;
-        const receivedQty = Number(it.received_qty) || 0;
-        const pendingQty = Math.max(orderedQty - receivedQty, 0);
-
-        const cells = {
-          title: safeText(it.book?.title || `Book #${it.book_id}`),
-          subject: safeText(it.book?.subject || "-"),
-        };
-
-        const rh = rowHeight(cells, 9);
-        ensureSpaceWithHeader(rh, printTableHeader);
-
-        const y = doc.y;
-
-        doc.font("Helvetica").fontSize(9).fillColor("#000");
-        doc.text(String(sr), X.sr, y, { width: W.sr });
-        doc.text(cells.title, X.title, y, { width: W.title });
-        doc.text(cells.subject, X.subject, y, { width: W.subject });
-
+      if (hideSubject) {
+        doc.text("Sr", X.sr, y, { width: W.sr });
+        doc.text("Book Title", X.title, y, { width: W.title });
         doc.font("Helvetica-Bold").fontSize(10);
-        doc.text(String(orderedQty), X.ord, y - 1, { width: W.ord, align: "center" });
-
-        if (showReceivedPending) {
-          doc.text(String(receivedQty), X.rec, y - 1, { width: W.rec, align: "center" });
-          doc.text(String(pendingQty), X.pend, y - 1, { width: W.pend, align: "center" });
-        }
-
-        doc.y = y + rh - 3;
-        sr++;
+        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
+      } else {
+        doc.text("Sr", X.sr, y, { width: W.sr });
+        doc.text("Book Title", X.title, y, { width: W.title });
+        doc.text("Subject", X.subject, y, { width: W.subject });
+        doc.font("Helvetica-Bold").fontSize(10);
+        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
       }
     }
 
-    /* ---------- Notes ---------- */
-    if (order.notes) {
-      const noteText = safeText(order.notes);
-      const noteH = Math.max(38, doc.heightOfString(noteText, { width: contentWidth - 20 }) + 22);
+    doc.moveDown(1.1);
+    drawHR2();
+    doc.moveDown(0.25);
+  };
 
-      const bottom = doc.page.height - doc.page.margins.bottom;
-      if (doc.y + noteH + 10 > bottom) doc.addPage();
+  const rowHeight = (cells, fontSize = 9) => {
+    doc.font("Helvetica").fontSize(fontSize);
+    const h1 = doc.heightOfString(cells.title, { width: W.title });
+    if (hideSubject) return Math.ceil(Math.max(h1, fontSize + 2)) + 6;
+    const h2 = doc.heightOfString(cells.subject, { width: W.subject });
+    return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
+  };
 
-      doc.moveDown(0.5);
+  printTableHeader();
+
+  if (!items || !items.length) {
+    doc.font("Helvetica").fontSize(10).fillColor("#000");
+    doc.text("No items found in this order.", { align: "left" });
+  } else {
+    let sr = 1;
+    for (const it of items) {
+      const orderedQty = Number(it.total_order_qty) || 0;
+      const receivedQty = Number(it.received_qty) || 0;
+      const pendingQty = Math.max(orderedQty - receivedQty, 0);
+
+      const cells = {
+        title: safeText(it.book?.title || `Book #${it.book_id}`),
+        subject: safeText(it.book?.subject || "-"),
+      };
+
+      const rh = rowHeight(cells, 9);
+      ensureSpaceWithHeader(rh, printTableHeader);
 
       const y = doc.y;
-      doc.save();
-      doc.rect(pageLeft, y, contentWidth, noteH).fill("#fff3cd");
-      doc.restore();
-
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
-      doc.text("Notes", pageLeft + 10, y + 8);
 
       doc.font("Helvetica").fontSize(9).fillColor("#000");
-      doc.text(noteText, pageLeft + 10, y + 22, {
-        width: contentWidth - 20,
-        align: "left",
-      });
+      doc.text(String(sr), X.sr, y, { width: W.sr });
+      doc.text(cells.title, X.title, y, { width: W.title });
 
-      doc.y = y + noteH + 2;
+      if (!hideSubject && X.subject != null) {
+        doc.text(cells.subject, X.subject, y, { width: W.subject });
+      }
+
+      doc.font("Helvetica-Bold").fontSize(10);
+      doc.text(String(orderedQty), X.ord, y - 1, { width: W.ord, align: "center" });
+
+      if (showReceivedPending) {
+        doc.text(String(receivedQty), X.rec, y - 1, { width: W.rec, align: "center" });
+        doc.text(String(pendingQty), X.pend, y - 1, { width: W.pend, align: "center" });
+      }
+
+      doc.y = y + rh - 3;
+      sr++;
+    }
+  }
+
+  /* ---------- Notes ---------- */
+  const note1FromOrder = safeText(order?.notes || "");
+  const note2FromOrder = safeText(order?.notes_2 || "");
+
+  const note1 = safeText(notes?.note1 ?? notes?.note_1 ?? note1FromOrder);
+  const note2 = safeText(notes?.note2 ?? notes?.note_2 ?? note2FromOrder);
+
+  if (note1 || note2) {
+    const combined =
+      (note1 ? `Note 1: ${note1}` : "") +
+      (note1 && note2 ? "\n\n" : "") +
+      (note2 ? `Note 2: ${note2}` : "");
+
+    const noteH = Math.max(38, doc.heightOfString(combined, { width: contentWidth - 20 }) + 22);
+
+    const bottom = doc.page.height - doc.page.margins.bottom;
+    if (doc.y + noteH + 10 > bottom) doc.addPage();
+
+    doc.moveDown(0.5);
+
+    const y = doc.y;
+    doc.save();
+    doc.rect(pageLeft, y, contentWidth, noteH).fill("#fff3cd");
+    doc.restore();
+
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+    doc.text("Notes", pageLeft + 10, y + 8);
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(combined, pageLeft + 10, y + 22, {
+      width: contentWidth - 20,
+      align: "left",
+    });
+
+    doc.y = y + noteH + 2;
+  }
+}
+
+/* ============================================================
+ * PDF builder -> Buffer (single order)
+ * ============================================================ */
+function buildSchoolOrderPdfBuffer({
+  order,
+  companyProfile,
+  items,
+  pdfTitle,
+  toParty,
+  dateStr,
+  orderDate,
+  isPurchaseOrder = false,
+  showPrintDate = false,
+  showReceivedPending = true,
+  notes = null,
+  layout = {},
+}) {
+  return new Promise(async (resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const chunks = [];
+
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    try {
+      await renderSchoolOrderToDoc(doc, {
+        order,
+        companyProfile,
+        items,
+        pdfTitle,
+        toParty,
+        dateStr,
+        orderDate,
+        isPurchaseOrder,
+        showPrintDate,
+        showReceivedPending,
+        notes,
+        layout,
+      });
+      doc.end();
+    } catch (e) {
+      try {
+        doc.end();
+      } catch {}
+      reject(e);
+    }
+  });
+}
+
+/* ============================================
+ * ✅ NEW: GET /api/school-orders/pdf/all
+ * One click -> download ALL orders in ONE PDF (each order starts on a new page)
+ * ============================================ */
+exports.printAllOrdersPdf = async (request, reply) => {
+  try {
+    const {
+      academic_session,
+      school_id,
+      supplier_id,
+      status,
+      order_type,
+      view = "SUPPLIER",
+      inline = "1",
+    } = request.query || {};
+
+    const where = {};
+    if (academic_session) where.academic_session = String(academic_session).trim();
+    if (school_id) where.school_id = Number(school_id);
+    if (supplier_id) where.supplier_id = Number(supplier_id);
+    if (status) where.status = String(status).trim();
+    if (order_type) where.order_type = String(order_type).trim();
+
+    const orders = await SchoolOrder.findAll({
+      where,
+      include: [
+        { model: School, as: "school", attributes: ["id", "name", "city"] },
+        { model: Supplier, as: "supplier" },
+        {
+          model: SchoolOrderItem,
+          as: "items",
+          include: [
+            {
+              model: Book,
+              as: "book",
+              attributes: ["id", "title", "class_name", "subject", "code", "isbn", "publisher_id"],
+              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+            },
+          ],
+        },
+        { model: Transport, as: "transport" },
+        ...(SchoolOrder.associations?.transport2 ? [{ model: Transport, as: "transport2" }] : []),
+      ],
+      order: [
+        [{ model: School, as: "school" }, "name", "ASC"],
+        [{ model: Supplier, as: "supplier" }, "name", "ASC"],
+        ["order_date", "DESC"],
+        ["createdAt", "DESC"],
+        [{ model: SchoolOrderItem, as: "items" }, "id", "ASC"],
+      ],
+    });
+
+    const companyProfile = await CompanyProfile.findOne({
+      where: { is_active: true },
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
+    });
+
+    const today = new Date();
+    const dateStr = today.toLocaleDateString("en-IN");
+
+    const viewMode = String(view || "SUPPLIER").toUpperCase();
+    const showReceivedPending = viewMode === "INTERNAL";
+    const pdfTitle = showReceivedPending ? "SCHOOL ORDER" : "PURCHASE ORDER";
+
+    // Client requested layout:
+    const layout = {
+      hideSubject: true,
+      summaryTotalOnly: true,
+      supplierAddressSecondColumn: true,
+      boldSupplierName: true,
+      boldOrderDate: true,
+    };
+
+    // Build one PDF
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const chunks = [];
+    doc.on("data", (c) => chunks.push(c));
+
+    const bufPromise = new Promise((resolve, reject) => {
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+    });
+
+    if (!orders.length) {
+      doc.font("Helvetica-Bold").fontSize(16).text("No orders found for selected filters.");
+      doc.end();
+      const pdfBuffer = await bufPromise;
+
+      const fname = `all-school-orders-${dateStr.replace(/[^\d]+/g, "-")}.pdf`;
+      reply
+        .header("Content-Type", "application/pdf")
+        .header(
+          "Content-Disposition",
+          `${String(inline) === "1" ? "inline" : "attachment"}; filename="${fname}"`
+        )
+        .send(pdfBuffer);
+      return reply;
+    }
+
+    for (let i = 0; i < orders.length; i++) {
+      const o = orders[i];
+      const orderForPdf = o.toJSON();
+
+      orderForPdf.transport = o.transport?.toJSON?.() || o.transport || null;
+      if (o.transport2) orderForPdf.transport2 = o.transport2?.toJSON?.() || o.transport2 || null;
+
+      const orderDate = o.order_date ? new Date(o.order_date).toLocaleDateString("en-IN") : "-";
+
+      const supplier = o.supplier;
+      const supplierName = supplier?.name || "Supplier";
+      const supplierAddress =
+        supplier?.address || supplier?.address_line1 || supplier?.full_address || "";
+      const supplierPhone = supplier?.phone || supplier?.phone_primary || "";
+      const supplierEmail = supplier?.email || "";
+
+      const toParty = {
+        name: supplierName,
+        address: supplierAddress,
+        phone: supplierPhone,
+        email: supplierEmail,
+      };
+
+      // per-order notes: support order notes, else company profile defaults (optional)
+      const pickStr = (v) => String(v ?? "").trim();
+      const note1 =
+        pickStr(orderForPdf.note_1) ||
+        pickStr(orderForPdf.notes_1) ||
+        pickStr(orderForPdf.note1) ||
+        pickStr(orderForPdf.notes) ||
+        "";
+      const note2 =
+        pickStr(orderForPdf.note_2) ||
+        pickStr(orderForPdf.notes_2) ||
+        pickStr(orderForPdf.note2) ||
+        pickStr(orderForPdf.notes2) ||
+        "";
+
+      const defaultNote1 =
+        pickStr(companyProfile?.note_1) ||
+        pickStr(companyProfile?.notes_1) ||
+        pickStr(companyProfile?.note1) ||
+        "";
+      const defaultNote2 =
+        pickStr(companyProfile?.note_2) ||
+        pickStr(companyProfile?.notes_2) ||
+        pickStr(companyProfile?.note2) ||
+        "";
+
+      const notes = {
+        note1: note1 || defaultNote1,
+        note2: note2 || defaultNote2,
+      };
+
+      if (i > 0) doc.addPage();
+
+      await renderSchoolOrderToDoc(doc, {
+        order: orderForPdf,
+        companyProfile,
+        items: o.items || [],
+        pdfTitle,
+        toParty,
+        dateStr,
+        orderDate,
+        isPurchaseOrder: !showReceivedPending,
+        showPrintDate: false,
+        showReceivedPending,
+        notes,
+        layout,
+      });
     }
 
     doc.end();
-  });
-}
+    const pdfBuffer = await bufPromise;
+
+    const fname = `all-school-orders-${dateStr.replace(/[^\d]+/g, "-")}.pdf`;
+
+    reply
+      .header("Content-Type", "application/pdf")
+      .header(
+        "Content-Disposition",
+        `${String(inline) === "1" ? "inline" : "attachment"}; filename="${fname}"`
+      )
+      .send(pdfBuffer);
+
+    return reply;
+  } catch (err) {
+    request.log.error({ err }, "Error in printAllOrdersPdf");
+    return reply.code(500).send({
+      error: "InternalServerError",
+      message: err.message || "Failed to generate bulk orders PDF",
+    });
+  }
+};
 
 /* ============================================
  * ✅ NEW: GET /api/school-orders/:orderId/email-preview
@@ -1710,10 +2137,12 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     // default TO if empty
     if (!to) to = supplier.email ? String(supplier.email).trim() : "";
-    if (!to) return reply.code(400).send({ message: `Supplier email not set for "${supplier.name}".` });
+    if (!to)
+      return reply.code(400).send({ message: `Supplier email not set for "${supplier.name}".` });
 
     if (!validateEmailList(to)) return reply.code(400).send({ message: "Invalid To email(s)." });
-    if (cc && !validateEmailList(cc)) return reply.code(400).send({ message: "Invalid CC email(s)." });
+    if (cc && !validateEmailList(cc))
+      return reply.code(400).send({ message: "Invalid CC email(s)." });
 
     const today = new Date();
     const todayStr = today.toLocaleDateString("en-IN");
@@ -1784,6 +2213,10 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
 
     const orderForPdf = order.toJSON();
     orderForPdf.transport = order.transport ? order.transport.toJSON?.() || order.transport : null;
+    // ✅ FIX: pass transport2 also so PDF right-side shows it
+    if (order.transport2) {
+      orderForPdf.transport2 = order.transport2?.toJSON?.() || order.transport2;
+    }
 
     // ✅ Supplier PDF should NOT show received/pending
     const pdfBuffer = await buildSchoolOrderPdfBuffer({
@@ -1797,6 +2230,15 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
       isPurchaseOrder: true,
       showPrintDate: false,
       showReceivedPending: false,
+
+      // client layout
+      layout: {
+        hideSubject: true,
+        summaryTotalOnly: true,
+        supplierAddressSecondColumn: true,
+        boldSupplierName: true,
+        boldOrderDate: true,
+      },
     });
 
     const filename = `school-order-${safeOrderNo}-supplier-${order.supplier_id}.pdf`;
@@ -1917,18 +2359,23 @@ exports.printOrderPdf = async (request, reply) => {
     });
 
     if (!order) {
-      return reply.code(404).send({ error: "NotFound", message: "School order not found" });
+      return reply.code(404).send({
+        error: "NotFound",
+        message: "School order not found",
+      });
     }
 
     const items = order.items || [];
+
     const today = new Date();
     const dateStr = today.toLocaleDateString("en-IN");
     const orderDate = order.order_date ? new Date(order.order_date).toLocaleDateString("en-IN") : "-";
 
     const supplier = order.supplier;
     const supplierName = supplier?.name || "Supplier";
-    const supplierAddress = supplier?.address || "";
-    const supplierPhone = supplier?.phone || "";
+    const supplierAddress =
+      supplier?.address || supplier?.address_line1 || supplier?.full_address || "";
+    const supplierPhone = supplier?.phone || supplier?.phone_primary || "";
     const supplierEmail = supplier?.email || "";
 
     const toParty = {
@@ -1938,8 +2385,45 @@ exports.printOrderPdf = async (request, reply) => {
       email: supplierEmail,
     };
 
+    // Two Notes Support (fallback company profile defaults)
+    const pickStr = (v) => String(v ?? "").trim();
+
+    const note1 =
+      pickStr(order.note_1) ||
+      pickStr(order.notes_1) ||
+      pickStr(order.note1) ||
+      pickStr(order.notes) ||
+      "";
+
+    const note2 =
+      pickStr(order.note_2) ||
+      pickStr(order.notes_2) ||
+      pickStr(order.note2) ||
+      pickStr(order.notes2) ||
+      "";
+
+    const defaultNote1 =
+      pickStr(companyProfile?.note_1) ||
+      pickStr(companyProfile?.notes_1) ||
+      pickStr(companyProfile?.note1) ||
+      "";
+
+    const defaultNote2 =
+      pickStr(companyProfile?.note_2) ||
+      pickStr(companyProfile?.notes_2) ||
+      pickStr(companyProfile?.note2) ||
+      "";
+
+    const notesForPdf = {
+      note1: note1 || defaultNote1,
+      note2: note2 || defaultNote2,
+    };
+
+    // For PDF
     const orderForPdf = order.toJSON();
-    orderForPdf.transport = order.transport ? order.transport.toJSON?.() || order.transport : null;
+    orderForPdf.transport = order.transport?.toJSON?.() || order.transport || null;
+    if (order.transport2)
+      orderForPdf.transport2 = order.transport2?.toJSON?.() || order.transport2 || null;
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
 
@@ -1955,6 +2439,14 @@ exports.printOrderPdf = async (request, reply) => {
       isPurchaseOrder: true,
       showPrintDate: false,
       showReceivedPending: false,
+      notes: notesForPdf,
+      layout: {
+        hideSubject: true,
+        summaryTotalOnly: true,
+        supplierAddressSecondColumn: true,
+        boldSupplierName: true,
+        boldOrderDate: true,
+      },
     });
 
     reply

@@ -1,11 +1,14 @@
 // src/controllers/supplierController.js
+"use strict";
+
+const { Op } = require("sequelize");
 const {
   Supplier,
   Publisher,
   SupplierReceipt,
   SupplierReceiptItem,
   Book,
-  // ✅ NEW (optional models - if exist in your project)
+  // ✅ optional models (if exist in your project)
   School,
   SchoolOrder,
   sequelize,
@@ -39,7 +42,9 @@ const toBool = (v, defaultValue = true) => {
  */
 function findAssocAlias(sourceModel, targetModel) {
   if (!sourceModel?.associations || !targetModel) return null;
-  const assoc = Object.values(sourceModel.associations).find((a) => a?.target === targetModel);
+  const assoc = Object.values(sourceModel.associations).find(
+    (a) => a?.target === targetModel
+  );
   return assoc?.as || null;
 }
 
@@ -65,7 +70,10 @@ function extractSchoolMeta({ receipt, schoolAlias, orderAlias, orderSchoolAlias 
   if (!receipt) return { school_id: null, school_name: null };
 
   // 1) Direct receipt -> School
-  const direct = schoolAlias ? receipt[schoolAlias] : receipt.school || receipt.School;
+  const direct = schoolAlias
+    ? receipt[schoolAlias]
+    : receipt.school || receipt.School;
+
   if (direct?.id || direct?.name) {
     return {
       school_id: direct.id ?? null,
@@ -74,7 +82,10 @@ function extractSchoolMeta({ receipt, schoolAlias, orderAlias, orderSchoolAlias 
   }
 
   // 2) receipt -> SchoolOrder -> School
-  const ord = orderAlias ? receipt[orderAlias] : receipt.school_order || receipt.SchoolOrder;
+  const ord = orderAlias
+    ? receipt[orderAlias]
+    : receipt.school_order || receipt.SchoolOrder;
+
   const ordSchool = ord
     ? orderSchoolAlias
       ? ord[orderSchoolAlias]
@@ -91,15 +102,56 @@ function extractSchoolMeta({ receipt, schoolAlias, orderAlias, orderSchoolAlias 
   return { school_id: null, school_name: null };
 }
 
+/* ---------------- Publisher helper ---------------- */
+
+/**
+ * ✅ Creates publisher if not exists (by name), returns publisher instance or null.
+ * NOTE: This assumes MySQL collation is case-insensitive (common). If yours is case-sensitive,
+ * you can enhance it with LOWER() comparison later.
+ */
+async function findOrCreatePublisherByName(publisher_name, t) {
+  const name = cleanStr(publisher_name);
+  if (!name) return null;
+
+  const existing = await Publisher.findOne({
+    where: { name: { [Op.eq]: name } },
+    transaction: t,
+  });
+
+  if (existing) return existing;
+
+  const pub = await Publisher.create(
+    {
+      name,
+      is_active: true,
+    },
+    { transaction: t }
+  );
+
+  return pub;
+}
+
 /* =========================================
  * CREATE Supplier
- * → Auto-create Publisher with same details
+ * ✅ supports publisher_name in body
+ * - finds/creates publisher
+ * - links supplier.publisher_id
  * Fastify handler: (request, reply)
  * ========================================= */
 exports.create = async (request, reply) => {
   const t = await sequelize.transaction();
   try {
-    const { name, contact_person, phone, email, address, is_active = true } = request.body || {};
+    const {
+      name,
+      contact_person,
+      phone,
+      email,
+      address,
+      is_active = true,
+
+      // ✅ NEW from frontend
+      publisher_name,
+    } = request.body || {};
 
     const cleanName = cleanStr(name);
     if (!cleanName) {
@@ -107,7 +159,8 @@ exports.create = async (request, reply) => {
       return reply.code(400).send({ error: "Supplier name is required." });
     }
 
-    // 1️⃣ Create Supplier
+    const pub = await findOrCreatePublisherByName(publisher_name, t);
+
     const supplier = await Supplier.create(
       {
         name: cleanName,
@@ -116,19 +169,9 @@ exports.create = async (request, reply) => {
         email: cleanNullable(email),
         address: cleanNullable(address),
         is_active: toBool(is_active, true),
-      },
-      { transaction: t }
-    );
 
-    // 2️⃣ Auto-create Publisher (same details)
-    await Publisher.create(
-      {
-        name: supplier.name,
-        contact_person: supplier.contact_person,
-        phone: supplier.phone,
-        email: supplier.email,
-        address: supplier.address,
-        is_active: supplier.is_active,
+        // ✅ link (needs suppliers.publisher_id column in DB)
+        publisher_id: pub ? pub.id : null,
       },
       { transaction: t }
     );
@@ -136,15 +179,20 @@ exports.create = async (request, reply) => {
     await t.commit();
 
     return reply.code(201).send({
-      message: "Supplier created successfully. Publisher auto-created.",
+      message: pub
+        ? "Supplier created successfully. Publisher linked/created."
+        : "Supplier created successfully.",
       supplier,
+      publisher: pub ? { id: pub.id, name: pub.name } : null,
     });
   } catch (err) {
     await t.rollback();
     request.log?.error({ err }, "Create Supplier Error");
 
     if (err?.name === "SequelizeUniqueConstraintError") {
-      return reply.code(409).send({ error: "Supplier with this name already exists." });
+      return reply
+        .code(409)
+        .send({ error: "Supplier with this name already exists." });
     }
 
     return reply.code(500).send({ error: "Failed to create supplier." });
@@ -153,14 +201,36 @@ exports.create = async (request, reply) => {
 
 /* =========================================
  * READ – List all suppliers
+ * ✅ includes publisher_name (if association exists)
  * ========================================= */
 exports.list = async (request, reply) => {
   try {
+    const pubAlias = findAssocAlias(Supplier, Publisher);
+
     const suppliers = await Supplier.findAll({
       order: [["id", "DESC"]],
+      include: pubAlias
+        ? [
+            {
+              model: Publisher,
+              as: pubAlias,
+              attributes: ["id", "name"],
+              required: false,
+            },
+          ]
+        : [],
     });
 
-    return reply.send(suppliers);
+    const rows = (suppliers || []).map((s) => {
+      const json = s.toJSON();
+      const pub = pubAlias ? json[pubAlias] : json.publisher;
+      return {
+        ...json,
+        publisher_name: pub?.name ?? null,
+      };
+    });
+
+    return reply.send(rows);
   } catch (err) {
     request.log?.error({ err }, "List Suppliers Error");
     return reply.code(500).send({ error: "Failed to fetch suppliers." });
@@ -169,16 +239,36 @@ exports.list = async (request, reply) => {
 
 /* =========================================
  * READ – Get supplier by ID
+ * ✅ includes publisher_name (if association exists)
  * ========================================= */
 exports.getById = async (request, reply) => {
   try {
-    const supplier = await Supplier.findByPk(request.params.id);
+    const pubAlias = findAssocAlias(Supplier, Publisher);
+
+    const supplier = await Supplier.findByPk(request.params.id, {
+      include: pubAlias
+        ? [
+            {
+              model: Publisher,
+              as: pubAlias,
+              attributes: ["id", "name"],
+              required: false,
+            },
+          ]
+        : [],
+    });
 
     if (!supplier) {
       return reply.code(404).send({ error: "Supplier not found." });
     }
 
-    return reply.send(supplier);
+    const json = supplier.toJSON();
+    const pub = pubAlias ? json[pubAlias] : json.publisher;
+
+    return reply.send({
+      ...json,
+      publisher_name: pub?.name ?? null,
+    });
   } catch (err) {
     request.log?.error({ err }, "Get Supplier Error");
     return reply.code(500).send({ error: "Failed to fetch supplier." });
@@ -187,40 +277,85 @@ exports.getById = async (request, reply) => {
 
 /* =========================================
  * UPDATE Supplier
- * (Does NOT touch Publisher)
+ * ✅ if publisher_name is passed => relink (find/create publisher)
  * ========================================= */
 exports.update = async (request, reply) => {
+  const t = await sequelize.transaction();
   try {
-    const supplier = await Supplier.findByPk(request.params.id);
+    const supplier = await Supplier.findByPk(request.params.id, {
+      transaction: t,
+    });
 
     if (!supplier) {
+      await t.rollback();
       return reply.code(404).send({ error: "Supplier not found." });
     }
 
-    const { name, contact_person, phone, email, address, is_active } = request.body || {};
+    const {
+      name,
+      contact_person,
+      phone,
+      email,
+      address,
+      is_active,
+
+      // ✅ NEW
+      publisher_name,
+    } = request.body || {};
 
     if (name !== undefined && !cleanStr(name)) {
+      await t.rollback();
       return reply.code(400).send({ error: "Supplier name cannot be empty." });
     }
 
-    await supplier.update({
-      name: name !== undefined ? cleanStr(name) : supplier.name,
-      contact_person: contact_person !== undefined ? cleanNullable(contact_person) : supplier.contact_person,
-      phone: phone !== undefined ? cleanNullable(phone) : supplier.phone,
-      email: email !== undefined ? cleanNullable(email) : supplier.email,
-      address: address !== undefined ? cleanNullable(address) : supplier.address,
-      is_active: is_active !== undefined ? toBool(is_active, supplier.is_active) : supplier.is_active,
-    });
+    const pub =
+      publisher_name !== undefined
+        ? await findOrCreatePublisherByName(publisher_name, t)
+        : null;
+
+    await supplier.update(
+      {
+        name: name !== undefined ? cleanStr(name) : supplier.name,
+        contact_person:
+          contact_person !== undefined
+            ? cleanNullable(contact_person)
+            : supplier.contact_person,
+        phone: phone !== undefined ? cleanNullable(phone) : supplier.phone,
+        email: email !== undefined ? cleanNullable(email) : supplier.email,
+        address: address !== undefined ? cleanNullable(address) : supplier.address,
+        is_active:
+          is_active !== undefined
+            ? toBool(is_active, supplier.is_active)
+            : supplier.is_active,
+
+        // ✅ update publisher_id only if publisher_name was provided
+        ...(publisher_name !== undefined
+          ? { publisher_id: pub ? pub.id : null }
+          : {}),
+      },
+      { transaction: t }
+    );
+
+    await t.commit();
 
     return reply.send({
       message: "Supplier updated successfully.",
       supplier,
+      publisher:
+        publisher_name !== undefined
+          ? pub
+            ? { id: pub.id, name: pub.name }
+            : null
+          : undefined,
     });
   } catch (err) {
+    await t.rollback();
     request.log?.error({ err }, "Update Supplier Error");
 
     if (err?.name === "SequelizeUniqueConstraintError") {
-      return reply.code(409).send({ error: "Supplier with this name already exists." });
+      return reply
+        .code(409)
+        .send({ error: "Supplier with this name already exists." });
     }
 
     return reply.code(500).send({ error: "Failed to update supplier." });
@@ -253,7 +388,7 @@ exports.remove = async (request, reply) => {
 /* =========================================
  * ✅ Supplier Invoices List
  * GET /api/suppliers/:id/invoices
- * ✅ Now returns school_name also
+ * ✅ returns school_name also
  * ========================================= */
 exports.listInvoices = async (request, reply) => {
   try {
@@ -269,7 +404,6 @@ exports.listInvoices = async (request, reply) => {
       return reply.code(404).send({ error: "Supplier not found." });
     }
 
-    // ✅ Fix alias issue automatically
     const itemsAlias = findAssocAlias(SupplierReceipt, SupplierReceiptItem);
 
     // ✅ School include support (direct OR via SchoolOrder)
@@ -334,12 +468,13 @@ exports.listInvoices = async (request, reply) => {
         doc_no: r.doc_no ?? r.bill_no ?? r.invoice_no ?? null,
         doc_date: r.doc_date ?? r.invoice_date ?? null,
 
-        // ✅ NEW
+        // ✅ school
         school_id,
         school_name,
 
         sub_total: r.sub_total ?? null,
-        bill_discount_amount: r.bill_discount_amount ?? r.discount_amount ?? null,
+        bill_discount_amount:
+          r.bill_discount_amount ?? r.discount_amount ?? null,
         shipping_charge: r.shipping_charge ?? null,
         other_charge: r.other_charge ?? null,
         round_off: r.round_off ?? null,
@@ -362,7 +497,7 @@ exports.listInvoices = async (request, reply) => {
 /* =========================================
  * ✅ Supplier Invoice Detail
  * GET /api/suppliers/:id/invoices/:invoiceId
- * ✅ Now returns school_name also
+ * ✅ returns school_name also
  * ========================================= */
 exports.getInvoiceDetail = async (request, reply) => {
   try {
@@ -441,13 +576,16 @@ exports.getInvoiceDetail = async (request, reply) => {
     const items = (rawItems || []).map((it) => {
       const bk = bookAlias ? it[bookAlias] : it.Book;
 
-      const qty = it.qty ?? it.quantity ?? it.received_qty ?? it.ordered_qty ?? null;
+      const qty =
+        it.qty ?? it.quantity ?? it.received_qty ?? it.ordered_qty ?? null;
       const rate = it.rate ?? it.unit_price ?? it.price ?? null;
 
       const amount =
         it.amount ??
         it.line_total ??
-        (qty != null && rate != null ? safeNumber(qty) * safeNumber(rate) : null);
+        (qty != null && rate != null
+          ? safeNumber(qty) * safeNumber(rate)
+          : null);
 
       return {
         id: it.id,
@@ -471,7 +609,7 @@ exports.getInvoiceDetail = async (request, reply) => {
 
     return reply.send({
       supplier: { id: supplierId },
-      school: school_name ? { id: school_id, name: school_name } : null, // ✅ NEW (easy for frontend)
+      school: school_name ? { id: school_id, name: school_name } : null,
       invoice: {
         id: receipt.id,
         receipt_no: receipt.receipt_no ?? receipt.invoice_no ?? null,
@@ -480,12 +618,13 @@ exports.getInvoiceDetail = async (request, reply) => {
         doc_no: receipt.doc_no ?? receipt.bill_no ?? receipt.invoice_no ?? null,
         doc_date: receipt.doc_date ?? receipt.invoice_date ?? null,
 
-        // ✅ NEW
+        // ✅ school
         school_id,
         school_name,
 
         sub_total: receipt.sub_total ?? null,
-        bill_discount_amount: receipt.bill_discount_amount ?? receipt.discount_amount ?? null,
+        bill_discount_amount:
+          receipt.bill_discount_amount ?? receipt.discount_amount ?? null,
         shipping_charge: receipt.shipping_charge ?? null,
         other_charge: receipt.other_charge ?? null,
         round_off: receipt.round_off ?? null,
