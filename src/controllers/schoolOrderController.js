@@ -1262,7 +1262,9 @@ async function renderSchoolOrderToDoc(doc, opts) {
     if (doc.y + neededHeight > bottom) {
       doc.addPage();
       if (typeof printHeaderFn === "function") printHeaderFn();
+      return true;
     }
+    return false;
   };
 
   /* ---------- Header (logo + company) ---------- */
@@ -1385,7 +1387,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
     const boxTop = doc.y + 2;
 
-    // helper: transport block text from order.transport / order.transport2
+    // ✅ transport block text from order.transport / order.transport2 (WITH ADDRESS)
     const buildTransportText = () => {
       const t1 = order?.transport || null;
       const t2 = order?.transport2 || null;
@@ -1394,18 +1396,37 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
       const fmtOne = (t, label) => {
         if (!t) return null;
+
         const name = safeText(t.name || "");
         const city = safeText(t.city || "");
         const phone = safeText(t.phone || "");
-        if (!name && !city && !phone) return null;
+        const contact = safeText(t.contact_person || "");
+        const email = safeText(t.email || "");
 
-        const parts = [];
-        if (name) parts.push(name);
-        if (city) parts.push(city);
-        const main = parts.join(" - ");
+        const addrParts = [];
+        if (t.address) addrParts.push(safeText(t.address));
+        const csp = [t.city, t.state, t.pincode].filter(Boolean).join(", ");
+        if (csp) addrParts.push(safeText(csp));
+        const addressLine = addrParts.join(", ");
 
-        const phoneLine = phone ? `Phone: ${phone}` : "";
-        return `${label}: ${main || "-"}${phoneLine ? `\n${phoneLine}` : ""}`;
+        const remarks = safeText(t.remarks || "");
+
+        if (!name && !city && !phone && !addressLine && !remarks && !contact && !email) return null;
+
+        const headParts = [];
+        if (name) headParts.push(name);
+        if (city) headParts.push(city);
+        const head = headParts.join(" - ") || "-";
+
+        const out = [];
+        out.push(`${label}: ${head}`);
+        if (contact) out.push(`Contact: ${contact}`);
+        if (phone) out.push(`Phone: ${phone}`);
+        if (email) out.push(`Email: ${email}`);
+        if (addressLine) out.push(`Address: ${addressLine}`);
+        if (remarks) out.push(`Remarks: ${remarks}`);
+
+        return out.join("\n");
       };
 
       const one1 = fmtOne(t1, "Transport");
@@ -1424,17 +1445,13 @@ async function renderSchoolOrderToDoc(doc, opts) {
       const col2X = pageLeft + colW + colGap;
 
       const name = safeText(toParty.name);
-
-      // ✅ Address should be directly below name
       const addr = safeText(toParty.address || "");
-
       const phoneLine = toParty.phone ? `Phone: ${safeText(toParty.phone)}` : "";
       const emailLine = toParty.email ? `Email: ${safeText(toParty.email)}` : "";
 
-      // ✅ Transport on right side (same row)
       const transportText = safeText(buildTransportText());
 
-      // ---- Measure heights (left supplier)
+      // measure left height
       doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10);
       const hName = doc.heightOfString(name, { width: colW });
 
@@ -1446,7 +1463,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
       const leftH = hName + (addr ? 2 + hAddr : 0) + (metaLines ? 2 + hMeta : 0);
 
-      // ---- Measure heights (right transport)
+      // measure right height
       doc.font("Helvetica-Bold").fontSize(9);
       const transportTitle = transportText ? "Transport Details" : "";
       const hTRTitle = transportTitle ? doc.heightOfString(transportTitle, { width: colW }) : 0;
@@ -1456,19 +1473,17 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
       const rightH = (transportTitle ? hTRTitle + 2 : 0) + (transportText ? hTRBody : 0);
 
-      // ---- Draw LEFT (Supplier)
+      // draw LEFT
       doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10).fillColor("#000");
       doc.text(name, col1X, boxTop, { width: colW });
 
       doc.font("Helvetica").fontSize(9).fillColor("#000");
       let yL = boxTop + hName + 2;
 
-      // ✅ Address directly below name
       if (addr) {
         doc.text(addr, col1X, yL, { width: colW });
         yL = doc.y + 2;
       }
-
       if (phoneLine) {
         doc.text(phoneLine, col1X, yL, { width: colW });
         yL = doc.y;
@@ -1478,7 +1493,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
         yL = doc.y;
       }
 
-      // ---- Draw RIGHT (Transport)
+      // draw RIGHT
       if (transportText) {
         doc.font("Helvetica-Bold").fontSize(9).fillColor("#000");
         doc.text("Transport Details", col2X, boxTop, { width: colW });
@@ -1487,7 +1502,6 @@ async function renderSchoolOrderToDoc(doc, opts) {
         doc.text(transportText, col2X, doc.y + 2, { width: colW });
       }
 
-      // ✅ push cursor to MAX height of both columns + padding
       doc.y = boxTop + Math.max(leftH, rightH) + 8;
     } else {
       // fallback old single-column layout
@@ -1666,25 +1680,82 @@ async function renderSchoolOrderToDoc(doc, opts) {
     return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
   };
 
+  // ✅ publisher grouping helpers
+  const getPublisherName = (it) =>
+    safeText(it?.book?.publisher?.name || it?.book?.publisher_name || "Other / Unknown");
+  const getBookTitle = (it) => safeText(it?.book?.title || `Book #${it?.book_id}`);
+
+  const printPublisherHeader = (publisherName) => {
+    const y = doc.y;
+    const h = 18;
+
+    doc.save();
+    doc.rect(pageLeft, y - 1, contentWidth, h).fill("#e9ecef");
+    doc.restore();
+
+    doc.fillColor("#000").font("Helvetica-Bold").fontSize(10);
+    doc.text(`Publisher: ${publisherName}`, pageLeft + 6, y + 3, {
+      width: contentWidth - 12,
+      align: "left",
+    });
+
+    doc.y = y + h + 2;
+  };
+
   printTableHeader();
 
   if (!items || !items.length) {
     doc.font("Helvetica").fontSize(10).fillColor("#000");
     doc.text("No items found in this order.", { align: "left" });
   } else {
+    // ✅ sort publisher A→Z then title A→Z
+    const sortedItems = [...items].sort((a, b) => {
+      const pa = getPublisherName(a).toLowerCase();
+      const pb = getPublisherName(b).toLowerCase();
+      const pc = pa.localeCompare(pb, "en", { sensitivity: "base" });
+      if (pc !== 0) return pc;
+
+      const ta = getBookTitle(a).toLowerCase();
+      const tb = getBookTitle(b).toLowerCase();
+      return ta.localeCompare(tb, "en", { sensitivity: "base" });
+    });
+
+    const ensureSpaceWithHeaderAndGroup = (neededHeight, currentPublisher) => {
+      const bottom = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + neededHeight > bottom) {
+        doc.addPage();
+        printTableHeader();
+        if (currentPublisher) printPublisherHeader(currentPublisher);
+        return true;
+      }
+      return false;
+    };
+
+    let currentPublisher = null;
     let sr = 1;
-    for (const it of items) {
+
+    for (const it of sortedItems) {
+      const publisherName = getPublisherName(it);
+
+      if (publisherName !== currentPublisher) {
+        currentPublisher = publisherName;
+        sr = 1;
+
+        ensureSpaceWithHeaderAndGroup(26, null);
+        printPublisherHeader(currentPublisher);
+      }
+
       const orderedQty = Number(it.total_order_qty) || 0;
       const receivedQty = Number(it.received_qty) || 0;
       const pendingQty = Math.max(orderedQty - receivedQty, 0);
 
       const cells = {
-        title: safeText(it.book?.title || `Book #${it.book_id}`),
+        title: getBookTitle(it),
         subject: safeText(it.book?.subject || "-"),
       };
 
       const rh = rowHeight(cells, 9);
-      ensureSpaceWithHeader(rh, printTableHeader);
+      ensureSpaceWithHeaderAndGroup(rh, currentPublisher);
 
       const y = doc.y;
 
@@ -1746,6 +1817,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
     doc.y = y + noteH + 2;
   }
 }
+
 
 /* ============================================================
  * PDF builder -> Buffer (single order)
@@ -2466,5 +2538,315 @@ exports.printOrderPdf = async (request, reply) => {
         message: err.message || "Failed to generate supplier order PDF",
       });
     }
+  }
+};
+
+
+/* ============================================================
+ * ✅ NEW: Supplier + Order No Index PDF (2 columns only)
+ * GET /api/school-orders/pdf/supplier-order-index
+ * Query: academic_session, school_id, supplier_id, status, order_type, inline
+ * ============================================================ */
+exports.printSupplierOrderIndexPdf = async (request, reply) => {
+  try {
+    const {
+      academic_session,
+      school_id,
+      supplier_id,
+      status,
+      order_type,
+      inline = "1",
+    } = request.query || {};
+
+    const where = {};
+    if (academic_session) where.academic_session = String(academic_session).trim();
+    if (school_id) where.school_id = Number(school_id);
+    if (supplier_id) where.supplier_id = Number(supplier_id);
+    if (status) where.status = String(status).trim();
+    if (order_type) where.order_type = String(order_type).trim();
+
+    const orders = await SchoolOrder.findAll({
+      where,
+      include: [{ model: Supplier, as: "supplier", attributes: ["id", "name"] }],
+      attributes: ["id", "order_no", "order_date", "supplier_id", "academic_session", "status"],
+      order: [
+        [{ model: Supplier, as: "supplier" }, "name", "ASC"],
+        ["order_date", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+    });
+
+    const companyProfile = await CompanyProfile.findOne({
+      where: { is_active: true },
+      order: [
+        ["is_default", "DESC"],
+        ["id", "ASC"],
+      ],
+    });
+
+    const today = new Date();
+    const dateStr = today.toLocaleDateString("en-IN");
+
+    // ---- PDF helpers ----
+    const safeText = (v) => String(v ?? "").trim();
+
+    async function printCompanyHeader(doc) {
+      const pageLeft = doc.page.margins.left;
+      const pageRight = doc.page.width - doc.page.margins.right;
+      const contentWidth = pageRight - pageLeft;
+
+      const drawHR = () => {
+        doc.save();
+        doc.lineWidth(0.7);
+        doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+        doc.restore();
+      };
+
+      if (!companyProfile) return;
+
+      const startY = doc.y;
+      const logoSize = 52;
+      const gap = 10;
+
+      const logoRef =
+        companyProfile.logo_url ||
+        companyProfile.logo ||
+        companyProfile.logo_path ||
+        companyProfile.logo_image ||
+        null;
+
+      let logoBuf = null;
+      try {
+        logoBuf = await loadLogoBuffer(logoRef);
+      } catch {
+        logoBuf = null;
+      }
+
+      const logoX = pageLeft;
+      const logoY = startY;
+      const textX = logoBuf ? logoX + logoSize + gap : pageLeft;
+      const textWidth = pageRight - textX;
+
+      if (logoBuf) {
+        try {
+          doc.image(logoBuf, logoX, logoY, { fit: [logoSize, logoSize] });
+        } catch {}
+      }
+
+      const addrParts = [];
+      if (companyProfile.address_line1) addrParts.push(companyProfile.address_line1);
+      if (companyProfile.address_line2) addrParts.push(companyProfile.address_line2);
+
+      const cityStatePin = [companyProfile.city, companyProfile.state, companyProfile.pincode]
+        .filter(Boolean)
+        .join(", ");
+      if (cityStatePin) addrParts.push(cityStatePin);
+
+      const lines = [];
+      if (companyProfile.name)
+        lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
+      if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
+
+      const contactParts = [];
+      if (companyProfile.phone_primary) contactParts.push(`Phone: ${companyProfile.phone_primary}`);
+      if (companyProfile.email) contactParts.push(`Email: ${companyProfile.email}`);
+      if (contactParts.length)
+        lines.push({ text: contactParts.join(" | "), font: "Helvetica", size: 9 });
+
+      if (companyProfile.gstin)
+        lines.push({ text: `GSTIN: ${companyProfile.gstin}`, font: "Helvetica", size: 9 });
+
+      let yCursor = startY;
+      for (const ln of lines) {
+        doc.font(ln.font).fontSize(ln.size).fillColor("#000");
+        doc.text(safeText(ln.text), textX, yCursor, { width: textWidth, align: "left" });
+        const h = doc.heightOfString(safeText(ln.text), { width: textWidth });
+        yCursor += h + 2;
+      }
+
+      const headerBottom = Math.max(startY + (logoBuf ? logoSize : 0), yCursor) + 12;
+      doc.y = headerBottom;
+
+      drawHR();
+      doc.moveDown(0.35);
+    }
+
+    function ensureSpace(doc, neededHeight, headerFn) {
+      const bottom = doc.page.height - doc.page.margins.bottom;
+      if (doc.y + neededHeight > bottom) {
+        doc.addPage();
+        if (typeof headerFn === "function") headerFn();
+        return true;
+      }
+      return false;
+    }
+
+    function printTitleBlock(doc) {
+      const pageLeft = doc.page.margins.left;
+      const pageRight = doc.page.width - doc.page.margins.right;
+      const contentWidth = pageRight - pageLeft;
+
+      doc.font("Helvetica-Bold").fontSize(15).fillColor("#000");
+      doc.text("SUPPLIER ORDER NUMBER LIST", pageLeft, doc.y, {
+        width: contentWidth,
+        align: "center",
+      });
+      doc.moveDown(0.3);
+
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      const filters = [
+        academic_session ? `Session: ${safeText(academic_session)}` : null,
+        school_id ? `School ID: ${safeText(school_id)}` : null,
+        supplier_id ? `Supplier ID: ${safeText(supplier_id)}` : null,
+        status ? `Status: ${safeText(status)}` : null,
+        order_type ? `Type: ${safeText(order_type)}` : null,
+        `Print Date: ${safeText(dateStr)}`,
+      ].filter(Boolean);
+
+      doc.text(filters.join("  |  "), pageLeft, doc.y, { width: contentWidth, align: "center" });
+      doc.moveDown(0.6);
+
+      doc.save();
+      doc.lineWidth(0.7);
+      doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+      doc.restore();
+      doc.moveDown(0.5);
+    }
+
+    function renderTable(doc) {
+      const pageLeft = doc.page.margins.left;
+      const pageRight = doc.page.width - doc.page.margins.right;
+      const contentWidth = pageRight - pageLeft;
+
+      // column widths
+      const W = {
+        sr: 30,
+        supplier: Math.floor(contentWidth * 0.62),
+        order: contentWidth - (30 + Math.floor(contentWidth * 0.62)),
+      };
+      const X = {
+        sr: pageLeft,
+        supplier: pageLeft + W.sr,
+        order: pageLeft + W.sr + W.supplier,
+      };
+
+      const drawRowBg = (y, h, isAlt) => {
+        if (!isAlt) return;
+        doc.save();
+        doc.rect(pageLeft, y - 2, contentWidth, h).fill("#f6f8fb");
+        doc.restore();
+      };
+
+      const drawHeader = () => {
+        const y = doc.y;
+        doc.save();
+        doc.rect(pageLeft, y - 2, contentWidth, 18).fill("#e9ecef");
+        doc.restore();
+
+        doc.fillColor("#000").font("Helvetica-Bold").fontSize(10);
+        doc.text("Sr", X.sr, y, { width: W.sr });
+        doc.text("Supplier", X.supplier, y, { width: W.supplier });
+        doc.text("Order No", X.order, y, { width: W.order, align: "right" });
+
+        doc.moveDown(1.1);
+
+        doc.save();
+        doc.lineWidth(0.6);
+        doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+        doc.restore();
+
+        doc.moveDown(0.25);
+      };
+
+      const headerFn = () => {
+        // only table header on new page (company header is already printed separately)
+        drawHeader();
+      };
+
+      drawHeader();
+
+      if (!orders.length) {
+        doc.font("Helvetica").fontSize(11).fillColor("#000");
+        doc.text("No orders found for selected filters.", pageLeft, doc.y);
+        return;
+      }
+
+      // Build rows
+      const rows = orders.map((o) => {
+        const sName = safeText(o?.supplier?.name || "Supplier");
+        const ordNo = safeText(o?.order_no || o?.id);
+        return { supplier: sName, orderNo: ordNo };
+      });
+
+      let sr = 1;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+
+        // dynamic row height
+        doc.font("Helvetica").fontSize(10);
+        const hSup = doc.heightOfString(r.supplier, { width: W.supplier });
+        const hOrd = doc.heightOfString(r.orderNo, { width: W.order });
+        const rowH = Math.max(hSup, hOrd, 12) + 10;
+
+        ensureSpace(doc, rowH + 10, headerFn);
+
+        const y = doc.y;
+        drawRowBg(y, rowH, i % 2 === 1);
+
+        doc.fillColor("#000");
+        doc.font("Helvetica").fontSize(10);
+        doc.text(String(sr), X.sr, y, { width: W.sr });
+        doc.text(r.supplier, X.supplier, y, { width: W.supplier });
+
+        doc.font("Helvetica-Bold").fontSize(11);
+        doc.text(r.orderNo, X.order, y - 1, { width: W.order, align: "right" });
+
+        doc.y = y + rowH - 4;
+
+        // light divider line
+        doc.save();
+        doc.lineWidth(0.3);
+        doc.moveTo(pageLeft, doc.y).lineTo(pageRight, doc.y).stroke();
+        doc.restore();
+
+        doc.moveDown(0.15);
+        sr++;
+      }
+    }
+
+    // ---- Build PDF ----
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const chunks = [];
+    doc.on("data", (c) => chunks.push(c));
+
+    const bufPromise = new Promise((resolve, reject) => {
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+    });
+
+    await printCompanyHeader(doc);
+    printTitleBlock(doc);
+    renderTable(doc);
+
+    doc.end();
+    const pdfBuffer = await bufPromise;
+
+    const fname = `supplier-order-index-${dateStr.replace(/[^\d]+/g, "-")}.pdf`;
+
+    reply
+      .header("Content-Type", "application/pdf")
+      .header(
+        "Content-Disposition",
+        `${String(inline) === "1" ? "inline" : "attachment"}; filename="${fname}"`
+      )
+      .send(pdfBuffer);
+
+    return reply;
+  } catch (err) {
+    request.log.error({ err }, "Error in printSupplierOrderIndexPdf");
+    return reply.code(500).send({
+      error: "InternalServerError",
+      message: err.message || "Failed to generate Supplier Order Index PDF",
+    });
   }
 };

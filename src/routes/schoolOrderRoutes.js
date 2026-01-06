@@ -25,10 +25,19 @@ module.exports = async function (fastify, opts) {
   fastify.get("/availability", availabilityController.schoolAvailability);
 
   /**
-   * ✅ NEW: Print ALL orders in ONE PDF (each order on new page)
+   * ✅ Bulk PDF: Print ALL orders in ONE PDF (each order on new page)
    * GET /api/school-orders/pdf/all?academic_session=&school_id=&supplier_id=&status=&order_type=&view=SUPPLIER|INTERNAL&inline=1
    */
   fastify.get("/pdf/all", schoolOrderController.printAllOrdersPdf);
+
+  /**
+   * ✅ NEW PDF: Supplier + Order No Index (2 columns only)
+   * GET /api/school-orders/pdf/supplier-order-index?academic_session=&school_id=&supplier_id=&status=&order_type=&inline=1
+   */
+  fastify.get(
+    "/pdf/supplier-order-index",
+    schoolOrderController.printSupplierOrderIndexPdf
+  );
 
   // ======================================================
   // ✅ PARAM ROUTES (Grouped)
@@ -60,7 +69,7 @@ module.exports = async function (fastify, opts) {
   // ======================================================
 
   /**
-   * ✅ NEW: Copy reorder with manual qty
+   * ✅ Copy reorder with manual qty
    * (does NOT touch old order, does NOT change pending)
    * POST /api/school-orders/:orderId/reorder-copy
    * body: { items: [{ item_id, total_order_qty }] }
