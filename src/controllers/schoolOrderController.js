@@ -2093,7 +2093,7 @@ exports.getOrderEmailPreview = async (request, reply) => {
     });
 
     const cp = companyProfile ? companyProfile.toJSON?.() || companyProfile : null;
-    const cpName = cp?.name || "EduBridge ERP";
+    const cpName = cp?.name || "Sumeet Book Store";
     const cpEmail =
       cp?.email ||
       process.env.ORDER_SUPPORT_EMAIL ||
@@ -2231,7 +2231,7 @@ exports.sendOrderEmailForOrder = async (request, reply) => {
     const supplierName = supplier.name;
 
     const cp = companyProfile ? companyProfile.toJSON?.() || companyProfile : null;
-    const cpName = cp?.name || "EduBridge ERP";
+    const cpName = cp?.name || "Sumeet Book Store";
     const cpPhone = cp?.phone_primary || "";
     const cpEmail =
       cp?.email ||

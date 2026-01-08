@@ -50,7 +50,7 @@ async function sendMail({ to, subject, html, text, cc, bcc, attachments }) {
   const t = getTransporter();
 
   const fromEmail = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const fromName = process.env.SMTP_FROM_NAME || "EduBridge ERP";
+  const fromName = process.env.SMTP_FROM_NAME || "Sumeet Book Store";
 
   const mailOptions = {
     from: `"${fromName}" <${fromEmail}>`,

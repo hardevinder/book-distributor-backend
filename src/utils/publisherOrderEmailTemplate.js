@@ -1,34 +1,85 @@
 // src/utils/publisherOrderEmailTemplate.js
 
-function buildPublisherOrderEmailHtml(order) {
+"use strict";
+
+/**
+ * Publisher Order Email Template (HTML)
+ * ✅ Removes hard-coded "EduBridge ERP" branding
+ * ✅ Supports branding via:
+ *    1) companyProfile (preferred)  -> { name, email, phone_primary, address_line1, address_line2, city, state, pincode, gstin }
+ *    2) env fallback                -> MAIL_FROM_NAME / ORDER_SUPPORT_EMAIL / SMTP_FROM / SMTP_USER
+ * ✅ Safe HTML escaping for dynamic text
+ * ✅ Keeps your table + totals same
+ */
+
+function escapeHtml(input) {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function fmtDateIN(d) {
+  const raw = d ? new Date(d) : null;
+  const dt = raw && !Number.isNaN(raw.getTime()) ? raw : new Date();
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function buildCompanyFooter(companyProfile) {
+  const name =
+    companyProfile?.name ||
+    process.env.MAIL_FROM_NAME ||
+    "Sumeet Book Store";
+
+  const email =
+    companyProfile?.email ||
+    process.env.ORDER_SUPPORT_EMAIL ||
+    process.env.SMTP_FROM ||
+    process.env.SMTP_USER ||
+    "";
+
+  const phone = companyProfile?.phone_primary || companyProfile?.phone || "";
+  const gstin = companyProfile?.gstin || "";
+
+  const addr = [
+    companyProfile?.address_line1,
+    companyProfile?.address_line2,
+    [companyProfile?.city, companyProfile?.state, companyProfile?.pincode].filter(Boolean).join(", "),
+  ]
+    .filter(Boolean)
+    .join(", ");
+
+  const lines = [
+    `<strong>${escapeHtml(name)}</strong>`,
+    addr ? escapeHtml(addr) : "",
+    phone ? `Phone: ${escapeHtml(phone)}` : "",
+    email ? `Email: ${escapeHtml(email)}` : "",
+    gstin ? `GSTIN: ${escapeHtml(gstin)}` : "",
+  ].filter(Boolean);
+
+  return lines.join("<br/>");
+}
+
+// ✅ UPDATED signature: accept companyProfile optionally
+function buildPublisherOrderEmailHtml(order, companyProfile = null) {
   const publisherName = order?.publisher?.name || "Publisher";
   const session = order?.academic_session || "-";
   const orderNo = order?.order_no || order?.id;
-  const orderDateRaw = order?.order_date || order?.createdAt || null;
+  const orderDate = fmtDateIN(order?.order_date || order?.createdAt || null);
 
-  const orderDate = orderDateRaw
-    ? new Date(orderDateRaw).toLocaleDateString("en-IN", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      })
-    : new Date().toLocaleDateString("en-IN", {
-        day: "2-digit",
-        month: "short",
-        year: "numeric",
-      });
-
-  const items = order.items || [];
+  const items = Array.isArray(order?.items) ? order.items : [];
 
   const rows = items
     .map((item, idx) => {
-      const bookTitle = item.book?.title || `Book #${item.book_id}`;
-      const className = item.book?.class_name || "";
-      const subject = item.book?.subject || "";
-      const codeOrIsbn = item.book?.code || item.book?.isbn || "";
+      const bookTitle = item?.book?.title || `Book #${item?.book_id}`;
+      const className = item?.book?.class_name || "";
+      const subject = item?.book?.subject || "";
+      const codeOrIsbn = item?.book?.code || item?.book?.isbn || "";
 
-      const ordered = Number(item.total_order_qty) || 0; // ✅ main qty
-      const received = Number(item.received_qty || 0) || 0;
+      const ordered = Number(item?.total_order_qty) || 0;
+      const received = Number(item?.received_qty) || 0;
       const pending = Math.max(ordered - received, 0);
 
       return `
@@ -37,16 +88,16 @@ function buildPublisherOrderEmailHtml(order) {
             ${idx + 1}
           </td>
           <td style="padding:6px;border:1px solid #e5e7eb;">
-            ${bookTitle}
+            ${escapeHtml(bookTitle)}
           </td>
           <td style="padding:6px;border:1px solid #e5e7eb;">
-            ${className}
+            ${escapeHtml(className)}
           </td>
           <td style="padding:6px;border:1px solid #e5e7eb;">
-            ${subject}
+            ${escapeHtml(subject)}
           </td>
           <td style="padding:6px;border:1px solid #e5e7eb;">
-            ${codeOrIsbn}
+            ${escapeHtml(codeOrIsbn)}
           </td>
           <td style="padding:6px;border:1px solid #e5e7eb;text-align:right;">
             ${ordered}
@@ -62,29 +113,25 @@ function buildPublisherOrderEmailHtml(order) {
     })
     .join("");
 
-  const totalOrdered = items.reduce(
-    (sum, i) => sum + (Number(i.total_order_qty) || 0),
-    0
-  );
-  const totalReceived = items.reduce(
-    (sum, i) => sum + (Number(i.received_qty || 0) || 0),
-    0
-  );
+  const totalOrdered = items.reduce((sum, i) => sum + (Number(i?.total_order_qty) || 0), 0);
+  const totalReceived = items.reduce((sum, i) => sum + (Number(i?.received_qty) || 0), 0);
   const totalPending = Math.max(totalOrdered - totalReceived, 0);
+
+  const footerHtml = buildCompanyFooter(companyProfile);
 
   return `
     <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color:#0f172a; font-size:13px;">
-      <p>Dear ${publisherName},</p>
+      <p>Dear ${escapeHtml(publisherName)},</p>
 
       <p>
         Please find below the purchase order for the academic session
-        <strong>${session}</strong>.
+        <strong>${escapeHtml(session)}</strong>.
       </p>
 
       <p style="margin-top:4px;">
-        <strong>PO No:</strong> ${orderNo}<br/>
-        <strong>PO Date:</strong> ${orderDate}<br/>
-        <strong>Status:</strong> ${order.status || "-"}
+        <strong>PO No:</strong> ${escapeHtml(orderNo)}<br/>
+        <strong>PO Date:</strong> ${escapeHtml(orderDate)}<br/>
+        <strong>Status:</strong> ${escapeHtml(order?.status || "-")}
       </p>
 
       <table cellpadding="0" cellspacing="0" style="border-collapse:collapse; margin-top:10px; width:100%; max-width:800px;">
@@ -132,8 +179,7 @@ function buildPublisherOrderEmailHtml(order) {
 
       <p style="margin-top:16px;">
         Regards,<br/>
-        <strong>EduBridge ERP – Book Distribution</strong><br/>
-        info@edubridgeerp.in
+        ${footerHtml}
       </p>
     </div>
   `;
