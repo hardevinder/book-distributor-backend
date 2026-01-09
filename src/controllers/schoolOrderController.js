@@ -1205,10 +1205,13 @@ exports.getSchoolBookAvailability = async (request, reply) => {
   }
 };
 
-/* ============================================================
- * PDF renderer (draws ONE order into an existing doc)
- * - Used for single-PDF and bulk-PDF
- * ============================================================ */
+// ✅ UPDATED: renderSchoolOrderToDoc (NO GAP BETWEEN ROWS + PROPER CONTINUOUS GRIDS)
+// - Company name BIGGER (20)
+// - Proper TABLE GRIDS (outer border + vertical + horizontal lines)
+// - Ordered list (Sr. continuous across whole order; NOT reset per publisher)
+// - ✅ Rows do NOT "break" (no space between rows)
+// - Works with page breaks (reprints header + keeps grids aligned)
+
 async function renderSchoolOrderToDoc(doc, opts) {
   const {
     order,
@@ -1235,6 +1238,14 @@ async function renderSchoolOrderToDoc(doc, opts) {
     supplierAddressSecondColumn: Boolean(layout?.supplierAddressSecondColumn),
     boldSupplierName: Boolean(layout?.boldSupplierName),
     boldOrderDate: Boolean(layout?.boldOrderDate),
+
+    // ✅ continuous Sr by default
+    resetSrPerPublisher: Boolean(layout?.resetSrPerPublisher), // default false
+    gridLineWidth: Number(layout?.gridLineWidth || 0.6),
+
+    // ✅ tighter row padding (optional)
+    rowPadY: Number(layout?.rowPadY ?? 3), // top padding inside row
+    rowPadX: Number(layout?.rowPadX ?? 4), // left padding inside cell
   };
 
   const pageLeft = doc.page.margins.left;
@@ -1265,6 +1276,30 @@ async function renderSchoolOrderToDoc(doc, opts) {
       return true;
     }
     return false;
+  };
+
+  // ✅ Draw table grid for a block [topY..bottomY] with vertical lines at Xs
+  const drawTableGrid = (topY, bottomY, Xs, outerLeft, outerRight) => {
+    doc.save();
+    doc.lineWidth(L.gridLineWidth);
+    doc.strokeColor("#000");
+
+    // outer border
+    doc
+      .moveTo(outerLeft, topY)
+      .lineTo(outerRight, topY)
+      .lineTo(outerRight, bottomY)
+      .lineTo(outerLeft, bottomY)
+      .closePath()
+      .stroke();
+
+    // verticals
+    for (const x of Xs) {
+      if (x <= outerLeft || x >= outerRight) continue;
+      doc.moveTo(x, topY).lineTo(x, bottomY).stroke();
+    }
+
+    doc.restore();
   };
 
   /* ---------- Header (logo + company) ---------- */
@@ -1308,8 +1343,11 @@ async function renderSchoolOrderToDoc(doc, opts) {
     if (cityStatePin) addrParts.push(cityStatePin);
 
     const lines = [];
+
+    // ✅ Bigger company name
     if (companyProfile.name)
-      lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 16 });
+      lines.push({ text: companyProfile.name, font: "Helvetica-Bold", size: 20 });
+
     if (addrParts.length) lines.push({ text: addrParts.join(", "), font: "Helvetica", size: 9 });
 
     const contactParts = [];
@@ -1349,7 +1387,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
   const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
   const rightTopW = pageRight - rightTopX;
 
-  const orderNoText = safeText(order.order_no || order.id);
+  const orderNoText = safeText(order?.order_no || order?.id);
 
   doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
   doc.text(`Order No: ${orderNoText}`, pageLeft, topY, { width: leftTopW, align: "left" });
@@ -1387,12 +1425,9 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
     const boxTop = doc.y + 2;
 
-    // ✅ transport block text from order.transport / order.transport2 (WITH ADDRESS)
     const buildTransportText = () => {
       const t1 = order?.transport || null;
       const t2 = order?.transport2 || null;
-
-      const lines = [];
 
       const fmtOne = (t, label) => {
         if (!t) return null;
@@ -1429,13 +1464,12 @@ async function renderSchoolOrderToDoc(doc, opts) {
         return out.join("\n");
       };
 
+      const blocks = [];
       const one1 = fmtOne(t1, "Transport");
       const one2 = fmtOne(t2, "Transport 2");
-
-      if (one1) lines.push(one1);
-      if (one2) lines.push(one2);
-
-      return lines.join("\n\n");
+      if (one1) blocks.push(one1);
+      if (one2) blocks.push(one2);
+      return blocks.join("\n\n");
     };
 
     if (L.supplierAddressSecondColumn) {
@@ -1461,7 +1495,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
       const metaLines = [phoneLine, emailLine].filter(Boolean).join("\n");
       const hMeta = metaLines ? doc.heightOfString(metaLines, { width: colW }) : 0;
 
-      const leftH = hName + (addr ? 2 + hAddr : 0) + (metaLines ? 2 + hMeta : 0);
+      const leftBlockH = hName + (addr ? 2 + hAddr : 0) + (metaLines ? 2 + hMeta : 0);
 
       // measure right height
       doc.font("Helvetica-Bold").fontSize(9);
@@ -1471,7 +1505,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
       doc.font("Helvetica").fontSize(9);
       const hTRBody = transportText ? doc.heightOfString(transportText, { width: colW }) : 0;
 
-      const rightH = (transportTitle ? hTRTitle + 2 : 0) + (transportText ? hTRBody : 0);
+      const rightBlockH = (transportTitle ? hTRTitle + 2 : 0) + (transportText ? hTRBody : 0);
 
       // draw LEFT
       doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10).fillColor("#000");
@@ -1502,9 +1536,8 @@ async function renderSchoolOrderToDoc(doc, opts) {
         doc.text(transportText, col2X, doc.y + 2, { width: colW });
       }
 
-      doc.y = boxTop + Math.max(leftH, rightH) + 8;
+      doc.y = boxTop + Math.max(leftBlockH, rightBlockH) + 8;
     } else {
-      // fallback old single-column layout
       doc.font(L.boldSupplierName ? "Helvetica-Bold" : "Helvetica").fontSize(10).fillColor("#000");
       doc.text(safeText(toParty.name), pageLeft, boxTop);
 
@@ -1574,8 +1607,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
   if (showReceivedPending) {
     if (hideSubject) {
-      // Sr | Title | Ordered | Received | Pending
-      W = { sr: 26, title: 0, ord: 85, rec: 85, pend: 85 };
+      W = { sr: 32, title: 0, ord: 85, rec: 85, pend: 85 };
       W.title = contentWidth - (W.sr + W.ord + W.rec + W.pend);
       if (W.title < 200) W.title = Math.max(200, W.title);
       X = {
@@ -1586,8 +1618,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
         pend: pageLeft + W.sr + W.title + W.ord + W.rec,
       };
     } else {
-      // Sr | Title | Subject | Ordered | Received | Pending
-      W = { sr: 26, title: 0, subject: 70, ord: 85, rec: 85, pend: 85 };
+      W = { sr: 32, title: 0, subject: 70, ord: 85, rec: 85, pend: 85 };
       W.title = contentWidth - (W.sr + W.subject + W.ord + W.rec + W.pend);
       if (W.title < 140) {
         const need = 140 - W.title;
@@ -1604,13 +1635,12 @@ async function renderSchoolOrderToDoc(doc, opts) {
       };
     }
   } else {
-    // Supplier PO layout (ONLY ordered)
     if (hideSubject) {
-      W = { sr: 26, title: 0, ord: 90 };
+      W = { sr: 32, title: 0, ord: 90 };
       W.title = contentWidth - (W.sr + W.ord);
       X = { sr: pageLeft, title: pageLeft + W.sr, ord: pageLeft + W.sr + W.title };
     } else {
-      W = { sr: 26, title: 0, subject: 90, ord: 90 };
+      W = { sr: 32, title: 0, subject: 90, ord: 90 };
       W.title = contentWidth - (W.sr + W.subject + W.ord);
       if (W.title < 160) {
         const need = 160 - W.title;
@@ -1626,61 +1656,21 @@ async function renderSchoolOrderToDoc(doc, opts) {
     }
   }
 
-  const printTableHeader = () => {
-    const y = doc.y;
-    doc.save();
-    doc.rect(pageLeft, y - 2, contentWidth, 18).fill("#f2f2f2");
-    doc.restore();
-
-    doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
-
+  // ✅ vertical lines X list
+  const gridXs = (() => {
+    const arr = [pageLeft];
+    arr.push(X.title);
+    if (!hideSubject && X.subject != null) arr.push(X.subject);
+    arr.push(X.ord);
     if (showReceivedPending) {
-      if (hideSubject) {
-        doc.text("Sr", X.sr, y, { width: W.sr });
-        doc.text("Book Title", X.title, y, { width: W.title });
-        doc.font("Helvetica-Bold").fontSize(10);
-        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
-        doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
-        doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
-      } else {
-        doc.text("Sr", X.sr, y, { width: W.sr });
-        doc.text("Book Title", X.title, y, { width: W.title });
-        doc.text("Subject", X.subject, y, { width: W.subject });
-
-        doc.font("Helvetica-Bold").fontSize(10);
-        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
-        doc.text("Received", X.rec, y - 1, { width: W.rec, align: "center", lineBreak: false });
-        doc.text("Pending", X.pend, y - 1, { width: W.pend, align: "center", lineBreak: false });
-      }
-    } else {
-      if (hideSubject) {
-        doc.text("Sr", X.sr, y, { width: W.sr });
-        doc.text("Book Title", X.title, y, { width: W.title });
-        doc.font("Helvetica-Bold").fontSize(10);
-        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
-      } else {
-        doc.text("Sr", X.sr, y, { width: W.sr });
-        doc.text("Book Title", X.title, y, { width: W.title });
-        doc.text("Subject", X.subject, y, { width: W.subject });
-        doc.font("Helvetica-Bold").fontSize(10);
-        doc.text("Ordered", X.ord, y - 1, { width: W.ord, align: "center", lineBreak: false });
-      }
+      arr.push(X.rec);
+      arr.push(X.pend);
     }
+    arr.push(pageRight);
+    return Array.from(new Set(arr)).sort((a, b) => a - b);
+  })();
 
-    doc.moveDown(1.1);
-    drawHR2();
-    doc.moveDown(0.25);
-  };
-
-  const rowHeight = (cells, fontSize = 9) => {
-    doc.font("Helvetica").fontSize(fontSize);
-    const h1 = doc.heightOfString(cells.title, { width: W.title });
-    if (hideSubject) return Math.ceil(Math.max(h1, fontSize + 2)) + 6;
-    const h2 = doc.heightOfString(cells.subject, { width: W.subject });
-    return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 6;
-  };
-
-  // ✅ publisher grouping helpers
+  // helpers
   const getPublisherName = (it) =>
     safeText(it?.book?.publisher?.name || it?.book?.publisher_name || "Other / Unknown");
   const getBookTitle = (it) => safeText(it?.book?.title || `Book #${it?.book_id}`);
@@ -1690,25 +1680,84 @@ async function renderSchoolOrderToDoc(doc, opts) {
     const h = 18;
 
     doc.save();
-    doc.rect(pageLeft, y - 1, contentWidth, h).fill("#e9ecef");
+    doc.rect(pageLeft, y, contentWidth, h).fill("#e9ecef");
+    doc.restore();
+
+    doc.save();
+    doc.lineWidth(0.7);
+    doc.rect(pageLeft, y, contentWidth, h).stroke();
     doc.restore();
 
     doc.fillColor("#000").font("Helvetica-Bold").fontSize(10);
-    doc.text(`Publisher: ${publisherName}`, pageLeft + 6, y + 3, {
+    doc.text(`Publisher: ${publisherName}`, pageLeft + 6, y + 4, {
       width: contentWidth - 12,
       align: "left",
     });
 
-    doc.y = y + h + 2;
+    doc.y = y + h; // ✅ no extra gap here (tight)
   };
 
+  const printTableHeader = () => {
+    const y = doc.y;
+    const headerH = 20;
+
+    doc.save();
+    doc.rect(pageLeft, y, contentWidth, headerH).fill("#f2f2f2");
+    doc.restore();
+
+    doc.fillColor("#000").font("Helvetica-Bold").fontSize(10);
+
+    const padX = L.rowPadX;
+    const textY = y + 5;
+
+    doc.text("Sr", X.sr + padX, textY, { width: W.sr - padX * 2 });
+    doc.text("Book Title", X.title + padX, textY, { width: W.title - padX * 2 });
+
+    if (!hideSubject && X.subject != null) {
+      doc.text("Subject", X.subject + padX, textY, { width: W.subject - padX * 2 });
+    }
+
+    doc.text("Ordered", X.ord, textY, { width: W.ord, align: "center", lineBreak: false });
+
+    if (showReceivedPending) {
+      doc.text("Received", X.rec, textY, { width: W.rec, align: "center", lineBreak: false });
+      doc.text("Pending", X.pend, textY, { width: W.pend, align: "center", lineBreak: false });
+    }
+
+    drawTableGrid(y, y + headerH, gridXs, pageLeft, pageRight);
+
+    doc.y = y + headerH; // ✅ NO GAP after header
+  };
+
+  const rowHeight = (cells, fontSize = 9) => {
+    doc.font("Helvetica").fontSize(fontSize);
+    const h1 = doc.heightOfString(cells.title, { width: Math.max(10, W.title - 8) });
+    if (hideSubject) return Math.ceil(Math.max(h1, fontSize + 2)) + 8;
+    const h2 = doc.heightOfString(cells.subject, { width: Math.max(10, W.subject - 8) });
+    return Math.ceil(Math.max(h1, h2, fontSize + 2)) + 8;
+  };
+
+  const ensureSpaceWithHeaderAndGroup = (neededHeight, currentPublisher) => {
+    const bottom = doc.page.height - doc.page.margins.bottom;
+    if (doc.y + neededHeight > bottom) {
+      doc.addPage();
+      printTableHeader();
+      if (currentPublisher) {
+        doc.y += 6; // little breathing before publisher box
+        printPublisherHeader(currentPublisher);
+      }
+      return true;
+    }
+    return false;
+  };
+
+  // Print header
   printTableHeader();
 
   if (!items || !items.length) {
     doc.font("Helvetica").fontSize(10).fillColor("#000");
-    doc.text("No items found in this order.", { align: "left" });
+    doc.text("No items found in this order.", pageLeft, doc.y + 8);
   } else {
-    // ✅ sort publisher A→Z then title A→Z
     const sortedItems = [...items].sort((a, b) => {
       const pa = getPublisherName(a).toLowerCase();
       const pb = getPublisherName(b).toLowerCase();
@@ -1720,17 +1769,6 @@ async function renderSchoolOrderToDoc(doc, opts) {
       return ta.localeCompare(tb, "en", { sensitivity: "base" });
     });
 
-    const ensureSpaceWithHeaderAndGroup = (neededHeight, currentPublisher) => {
-      const bottom = doc.page.height - doc.page.margins.bottom;
-      if (doc.y + neededHeight > bottom) {
-        doc.addPage();
-        printTableHeader();
-        if (currentPublisher) printPublisherHeader(currentPublisher);
-        return true;
-      }
-      return false;
-    };
-
     let currentPublisher = null;
     let sr = 1;
 
@@ -1739,10 +1777,16 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
       if (publisherName !== currentPublisher) {
         currentPublisher = publisherName;
-        sr = 1;
+        if (L.resetSrPerPublisher) sr = 1;
 
-        ensureSpaceWithHeaderAndGroup(26, null);
+        ensureSpaceWithHeaderAndGroup(28, null);
+
+        // small gap after header before first group box
+        // doc.y += 6;
         printPublisherHeader(currentPublisher);
+
+        // small gap after publisher box before first row
+        // doc.y += 6;
       }
 
       const orderedQty = Number(it.total_order_qty) || 0;
@@ -1751,31 +1795,49 @@ async function renderSchoolOrderToDoc(doc, opts) {
 
       const cells = {
         title: getBookTitle(it),
-        subject: safeText(it.book?.subject || "-"),
+        subject: safeText(it?.book?.subject || "-"),
       };
 
       const rh = rowHeight(cells, 9);
       ensureSpaceWithHeaderAndGroup(rh, currentPublisher);
 
-      const y = doc.y;
+      const rowTop = doc.y;
+      const rowBottom = rowTop + rh;
 
-      doc.font("Helvetica").fontSize(9).fillColor("#000");
-      doc.text(String(sr), X.sr, y, { width: W.sr });
-      doc.text(cells.title, X.title, y, { width: W.title });
+      // alternate background
+      const isAlt = sr % 2 === 0;
+      if (isAlt) {
+        doc.save();
+        doc.rect(pageLeft, rowTop, contentWidth, rh).fill("#fbfcfe");
+        doc.restore();
+      }
+
+      const padX = L.rowPadX;
+      const textY = rowTop + L.rowPadY;
+
+      doc.fillColor("#000");
+      doc.font("Helvetica").fontSize(9);
+      doc.text(String(sr), X.sr + padX, textY, { width: W.sr - padX * 2 });
+      doc.text(cells.title, X.title + padX, textY, { width: W.title - padX * 2 });
 
       if (!hideSubject && X.subject != null) {
-        doc.text(cells.subject, X.subject, y, { width: W.subject });
+        doc.text(cells.subject, X.subject + padX, textY, { width: W.subject - padX * 2 });
       }
 
       doc.font("Helvetica-Bold").fontSize(10);
-      doc.text(String(orderedQty), X.ord, y - 1, { width: W.ord, align: "center" });
+      doc.text(String(orderedQty), X.ord, textY - 1, { width: W.ord, align: "center" });
 
       if (showReceivedPending) {
-        doc.text(String(receivedQty), X.rec, y - 1, { width: W.rec, align: "center" });
-        doc.text(String(pendingQty), X.pend, y - 1, { width: W.pend, align: "center" });
+        doc.text(String(receivedQty), X.rec, textY - 1, { width: W.rec, align: "center" });
+        doc.text(String(pendingQty), X.pend, textY - 1, { width: W.pend, align: "center" });
       }
 
-      doc.y = y + rh - 3;
+      // ✅ SINGLE grid draw; NO extra bottom line
+      drawTableGrid(rowTop, rowBottom, gridXs, pageLeft, pageRight);
+
+      // ✅ IMPORTANT: next row starts EXACTLY at rowBottom (NO SPACE)
+      doc.y = rowBottom;
+
       sr++;
     }
   }
@@ -1798,11 +1860,16 @@ async function renderSchoolOrderToDoc(doc, opts) {
     const bottom = doc.page.height - doc.page.margins.bottom;
     if (doc.y + noteH + 10 > bottom) doc.addPage();
 
-    doc.moveDown(0.5);
+    doc.y += 10;
 
     const y = doc.y;
     doc.save();
     doc.rect(pageLeft, y, contentWidth, noteH).fill("#fff3cd");
+    doc.restore();
+
+    doc.save();
+    doc.lineWidth(0.7);
+    doc.rect(pageLeft, y, contentWidth, noteH).stroke();
     doc.restore();
 
     doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
@@ -1817,6 +1884,7 @@ async function renderSchoolOrderToDoc(doc, opts) {
     doc.y = y + noteH + 2;
   }
 }
+
 
 
 /* ============================================================
