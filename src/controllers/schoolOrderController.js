@@ -214,13 +214,20 @@ async function recomputeOrderStatus(order, t) {
  * ============================================ */
 exports.listSchoolOrders = async (request, reply) => {
   try {
-    const { academic_session, school_id, status, supplier_id } = request.query || {};
+    const { academic_session, school_id, status, supplier_id, order_source } = request.query || {};
 
     const where = {};
     if (academic_session) where.academic_session = academic_session;
     if (school_id) where.school_id = school_id;
     if (status) where.status = status;
     if (supplier_id) where.supplier_id = supplier_id;
+    if (order_source) {
+    const src = String(order_source).trim();
+    const allowed = ["email", "whatsapp", "phone", "post", "in_person", "other"];
+    if (allowed.includes(src)) where.order_source = src;
+  }
+
+
 
     const orders = await SchoolOrder.findAll({
       where,
@@ -567,7 +574,7 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
   const { orderId } = request.params;
 
   // ✅ UPDATED: accept notes_2
-  const { transport_id, transport_id_2, notes, notes_2 } = request.body || {};
+  const { transport_id, transport_id_2, notes, notes_2, remarks, order_source } = request.body || {};
 
   try {
     const order = await SchoolOrder.findOne({ where: { id: orderId } });
@@ -597,6 +604,18 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
     if (typeof notes_2 !== "undefined") {
       order.notes_2 = notes_2 === null || notes_2 === "" ? null : String(notes_2).trim();
     }
+    // ✅ remarks (free text)
+      if (typeof remarks !== "undefined") {
+        order.remarks = remarks === null || remarks === "" ? null : String(remarks).trim();
+      }
+
+      // ✅ order_source (enum)
+      if (typeof order_source !== "undefined") {
+        const src = String(order_source || "").trim();
+        const allowed = ["email", "whatsapp", "phone", "post", "in_person", "other"];
+        order.order_source = allowed.includes(src) ? src : "email";
+      }
+
 
     await order.save();
 
@@ -2525,22 +2544,13 @@ exports.printOrderPdf = async (request, reply) => {
       email: supplierEmail,
     };
 
-    // Two Notes Support (fallback company profile defaults)
+    // ✅ Two Notes Support
+    // ✅ FIX: Your actual DB columns are order.notes and order.notes_2
+    // (fallback company profile defaults still supported)
     const pickStr = (v) => String(v ?? "").trim();
 
-    const note1 =
-      pickStr(order.note_1) ||
-      pickStr(order.notes_1) ||
-      pickStr(order.note1) ||
-      pickStr(order.notes) ||
-      "";
-
-    const note2 =
-      pickStr(order.note_2) ||
-      pickStr(order.notes_2) ||
-      pickStr(order.note2) ||
-      pickStr(order.notes2) ||
-      "";
+    const note1 = pickStr(order.notes) || "";
+    const note2 = pickStr(order.notes_2) || "";
 
     const defaultNote1 =
       pickStr(companyProfile?.note_1) ||
@@ -2562,8 +2572,9 @@ exports.printOrderPdf = async (request, reply) => {
     // For PDF
     const orderForPdf = order.toJSON();
     orderForPdf.transport = order.transport?.toJSON?.() || order.transport || null;
-    if (order.transport2)
+    if (order.transport2) {
       orderForPdf.transport2 = order.transport2?.toJSON?.() || order.transport2 || null;
+    }
 
     const safeOrderNo = String(order.order_no || `order-${order.id}`).replace(/[^\w\-]+/g, "_");
 
@@ -2608,6 +2619,7 @@ exports.printOrderPdf = async (request, reply) => {
     }
   }
 };
+
 
 
 /* ============================================================

@@ -21,7 +21,7 @@ const {
   // Optional (if exists)
   SchoolOrderItem,
 
-  // ✅ NEW (optional but recommended for School return + PDF)
+  // Optional (School link)
   School,
   SchoolOrder,
 } = require("../models");
@@ -43,100 +43,16 @@ function now() {
 
 const safeText = (v) => String(v ?? "").trim();
 
-// ✅ Money formatting (₹)
-const money = (v) => {
-  const n = round2(v);
-  return `₹ ${n.toFixed(2)}`;
-};
-
 const formatDateIN = (d) => {
   if (!d) return "-";
   try {
-    return new Date(d).toLocaleDateString("en-IN");
+    const dt = d instanceof Date ? d : new Date(d);
+    if (Number.isNaN(dt.getTime())) return "-";
+    return dt.toLocaleDateString("en-IN");
   } catch {
     return "-";
   }
 };
-
-async function makeReceiptNo(t) {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-
-  const last = await SupplierReceipt.findOne({
-    order: [["id", "DESC"]],
-    transaction: t,
-    lock: t.LOCK.UPDATE,
-  });
-
-  const lastSeq = last && last.receipt_no ? String(last.receipt_no).split("-").pop() : "0";
-  const seq = String(num(lastSeq) + 1).padStart(6, "0");
-  return `SR-${yyyy}-${mm}-${seq}`;
-}
-
-/**
- * NOTE:
- * - We keep legacy logic for discount:
- *   - PERCENT => % of gross line
- *   - AMOUNT  => line discount amount (NOT per-unit)
- */
-function calcItemLine({ qty, rate, discType, discVal }) {
-  const q = Math.max(0, Math.floor(num(qty)));
-  const r = Math.max(0, num(rate));
-
-  const gross = round2(q * r);
-
-  let discount = 0;
-  const t = String(discType || "NONE").toUpperCase();
-  const v = num(discVal);
-
-  if (t === "PERCENT") {
-    discount = round2(gross * (Math.max(0, v) / 100));
-  } else if (t === "AMOUNT") {
-    discount = round2(Math.max(0, v));
-  }
-
-  if (discount > gross) discount = gross;
-  const net = round2(gross - discount);
-
-  return {
-    qty: q,
-    rate: round2(r),
-    gross_amount: gross,
-    discount_amount: discount,
-    net_amount: net,
-  };
-}
-
-function calcHeaderTotals({
-  itemsNetSum,
-  billDiscountType,
-  billDiscountValue,
-  shipping_charge,
-  other_charge,
-  round_off,
-}) {
-  const sub_total = round2(itemsNetSum);
-
-  const t = String(billDiscountType || "NONE").toUpperCase();
-  const v = num(billDiscountValue);
-
-  let bill_discount_amount = 0;
-  if (t === "PERCENT") {
-    bill_discount_amount = round2(sub_total * (Math.max(0, v) / 100));
-  } else if (t === "AMOUNT") {
-    bill_discount_amount = round2(Math.max(0, v));
-  }
-
-  if (bill_discount_amount > sub_total) bill_discount_amount = sub_total;
-
-  const ship = round2(Math.max(0, num(shipping_charge)));
-  const other = round2(Math.max(0, num(other_charge)));
-  const ro = round2(num(round_off)); // can be negative/positive
-
-  const grand_total = round2(sub_total - bill_discount_amount + ship + other + ro);
-  return { sub_total, bill_discount_amount, grand_total };
-}
 
 /**
  * Pick only columns that exist in model
@@ -148,6 +64,10 @@ function pickAttrs(model, payload) {
     if (attrs[k]) out[k] = payload[k];
   }
   return out;
+}
+
+function hasCol(model, col) {
+  return !!(model?.rawAttributes || {})[col];
 }
 
 /* ============================================================
@@ -167,14 +87,51 @@ function docNarration(receipt) {
 }
 
 /* ============================================================
- * ✅ School helpers (return school in API + print in PDF)
+ * ✅ Purchase Mode helpers (NO DB change required)
+ * - If DB has purchase_mode column -> we store it
+ * - Otherwise we compute and return in API
+ * ============================================================ */
+
+function normalizePurchaseMode(v) {
+  const s = String(v || "").trim().toUpperCase();
+  if (s === "ORDER_BASED" || s === "ORDER") return "ORDER_BASED";
+  return "DIRECT";
+}
+
+function computePurchaseModeFromReceipt(receiptLike) {
+  const hasOrder = !!num(receiptLike?.school_order_id);
+  return hasOrder ? "ORDER_BASED" : "DIRECT";
+}
+
+function attachPurchaseMode(receiptJson) {
+  const r = receiptJson || {};
+  const fromDb = r.purchase_mode ? normalizePurchaseMode(r.purchase_mode) : null;
+  const mode = fromDb || computePurchaseModeFromReceipt(r);
+  return { ...r, purchase_mode: mode };
+}
+
+/* ============================================================
+ * ✅ School helpers
+ * - Priority:
+ *   1) receipt.school_id (if column exists and set)  ✅ supports DIRECT purchase tagging
+ *   2) SchoolOrder.school_id via receipt.school_order_id
  * ============================================================ */
 
 async function fetchSchoolForReceipt(receiptLike, opts = {}) {
   try {
+    if (!School) return null;
+
+    // 1) Direct link (if you add school_id column in SupplierReceipt)
+    const receiptSchoolId = num(receiptLike?.school_id);
+    if (receiptSchoolId) {
+      const s = await School.findByPk(receiptSchoolId, opts);
+      return s ? (s.toJSON ? s.toJSON() : s) : null;
+    }
+
+    // 2) From order link
     const schoolOrderId = num(receiptLike?.school_order_id);
     if (!schoolOrderId) return null;
-    if (!SchoolOrder || !School) return null;
+    if (!SchoolOrder) return null;
 
     const so = await SchoolOrder.findByPk(schoolOrderId, opts);
     if (!so) return null;
@@ -193,9 +150,10 @@ async function fetchSchoolForReceipt(receiptLike, opts = {}) {
 }
 
 async function attachSchoolToReceiptJson(receiptInstanceOrJson) {
-  const r = receiptInstanceOrJson?.toJSON ? receiptInstanceOrJson.toJSON() : receiptInstanceOrJson;
-  const school = await fetchSchoolForReceipt(r);
-  return { ...(r || {}), school };
+  const r0 = receiptInstanceOrJson?.toJSON ? receiptInstanceOrJson.toJSON() : receiptInstanceOrJson;
+  const school = await fetchSchoolForReceipt(r0);
+  const r1 = { ...(r0 || {}), school };
+  return attachPurchaseMode(r1);
 }
 
 /* ============================================================
@@ -211,11 +169,9 @@ function fetchUrlBuffer(url) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           return resolve(fetchUrlBuffer(res.headers.location));
         }
-
         if (res.statusCode !== 200) {
           return reject(new Error(`Logo download failed. HTTP ${res.statusCode}`));
         }
-
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => resolve(Buffer.concat(chunks)));
@@ -263,6 +219,86 @@ async function loadLogoBuffer(logoRef) {
   }
 
   return null;
+}
+
+/* ============================================================
+ * Receipt no
+ * ============================================================ */
+
+async function makeReceiptNo(t) {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+
+  const last = await SupplierReceipt.findOne({
+    order: [["id", "DESC"]],
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+
+  const lastSeq = last && last.receipt_no ? String(last.receipt_no).split("-").pop() : "0";
+  const seq = String(num(lastSeq) + 1).padStart(6, "0");
+  return `SR-${yyyy}-${mm}-${seq}`;
+}
+
+/* ============================================================
+ * Discount + totals
+ * ============================================================ */
+
+/**
+ * NOTE:
+ * - PERCENT => % of gross line
+ * - AMOUNT  => line discount amount (NOT per-unit)
+ */
+function calcItemLine({ qty, rate, discType, discVal }) {
+  const q = Math.max(0, Math.floor(num(qty)));
+  const r = Math.max(0, num(rate));
+
+  const gross = round2(q * r);
+
+  let discount = 0;
+  const t = String(discType || "NONE").toUpperCase();
+  const v = num(discVal);
+
+  if (t === "PERCENT") {
+    discount = round2(gross * (Math.max(0, v) / 100));
+  } else if (t === "AMOUNT") {
+    discount = round2(Math.max(0, v));
+  }
+
+  if (discount > gross) discount = gross;
+  const net = round2(gross - discount);
+
+  return {
+    qty: q,
+    rate: round2(r),
+    gross_amount: gross,
+    discount_amount: discount,
+    net_amount: net,
+  };
+}
+
+function calcHeaderTotals({ itemsNetSum, billDiscountType, billDiscountValue, shipping_charge, other_charge, round_off }) {
+  const sub_total = round2(itemsNetSum);
+
+  const t = String(billDiscountType || "NONE").toUpperCase();
+  const v = num(billDiscountValue);
+
+  let bill_discount_amount = 0;
+  if (t === "PERCENT") {
+    bill_discount_amount = round2(sub_total * (Math.max(0, v) / 100));
+  } else if (t === "AMOUNT") {
+    bill_discount_amount = round2(Math.max(0, v));
+  }
+
+  if (bill_discount_amount > sub_total) bill_discount_amount = sub_total;
+
+  const ship = round2(Math.max(0, num(shipping_charge)));
+  const other = round2(Math.max(0, num(other_charge)));
+  const ro = round2(num(round_off)); // can be negative/positive
+
+  const grand_total = round2(sub_total - bill_discount_amount + ship + other + ro);
+  return { sub_total, bill_discount_amount, grand_total };
 }
 
 /* ============================================================
@@ -536,37 +572,23 @@ function validateReadyToReceive({ receipt, lineItems }) {
 
 /* ============================================================
  * ✅ RECEIPT PDF builder -> Buffer
- * ✅ Updated:
- * - show School name
- * - show Academic session + Status
- * - currency formatting ₹
+ * ✅ Updated for DIRECT PURCHASE:
+ * - Shows Purchase Type: DIRECT / ORDER_BASED
+ * - If no school, prints "School: -"
  * ============================================================ */
 
 function buildSupplierReceiptPdfBuffer({
   receipt,
   supplier,
-  school, // ✅ NEW
+  school,
   companyProfile,
   items,
   pdfTitle = "SUPPLIER RECEIPT",
   showPrintDate = true,
 }) {
-  // ✅ NO ₹ SYMBOL: numbers only (2 decimals)
   const money = (v) => {
     const n = round2(v);
     return Number.isFinite(n) ? n.toFixed(2) : "0.00";
-  };
-
-  // ✅ Safe date formatting (en-IN)
-  const formatDateIN = (d) => {
-    if (!d) return "-";
-    try {
-      const dt = d instanceof Date ? d : new Date(d);
-      if (Number.isNaN(dt.getTime())) return "-";
-      return dt.toLocaleDateString("en-IN");
-    } catch {
-      return "-";
-    }
   };
 
   return new Promise(async (resolve, reject) => {
@@ -666,31 +688,30 @@ function buildSupplierReceiptPdfBuffer({
     doc.text(safeText(pdfTitle), titleX, doc.y, { width: titleBoxW, align: "center" });
     doc.moveDown(0.5);
 
-    /* ---------- TOP: Receipt No + School + Doc + Dates ---------- */
+    /* ---------- TOP ---------- */
     const topY = doc.y;
     const leftTopW = Math.floor(contentWidth * 0.65);
     const rightTopX = pageLeft + Math.floor(contentWidth * 0.65);
     const rightTopW = pageRight - rightTopX;
 
     const receiptNo = safeText(receipt.receipt_no || receipt.id);
-
     const rType = normalizeDocType(receipt.receive_doc_type);
     const dNo = safeText(receipt.doc_no || receipt.invoice_no || "-");
 
     const dDate = formatDateIN(receipt.doc_date || receipt.invoice_date);
     const recvDate = formatDateIN(receipt.received_date);
 
-    // ✅ School name (from school object)
     const schoolName = safeText(school?.name || school?.school_name || "");
+    const purchaseMode = normalizePurchaseMode(receipt.purchase_mode || computePurchaseModeFromReceipt(receipt));
 
     doc.font("Helvetica-Bold").fontSize(13).fillColor("#000");
     doc.text(`Receipt No: ${receiptNo}`, pageLeft, topY, { width: leftTopW, align: "left" });
 
-    // ✅ School line (left)
-    if (schoolName) {
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
-      doc.text(`School: ${schoolName}`, pageLeft, doc.y + 3, { width: leftTopW, align: "left" });
-    }
+    doc.font("Helvetica-Bold").fontSize(10).fillColor("#000");
+    doc.text(`Purchase Type: ${purchaseMode}`, pageLeft, doc.y + 3, { width: leftTopW, align: "left" });
+
+    doc.font("Helvetica").fontSize(9).fillColor("#000");
+    doc.text(`School: ${schoolName || "-"}`, pageLeft, doc.y + 3, { width: leftTopW, align: "left" });
 
     doc.font("Helvetica").fontSize(9).fillColor("#000");
     doc.text(`${rType === "INVOICE" ? "Invoice" : "Challan"} No: ${dNo}`, pageLeft, doc.y + 3, {
@@ -705,7 +726,6 @@ function buildSupplierReceiptPdfBuffer({
     });
     doc.text(`Received Date: ${recvDate}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
 
-    // ✅ Academic Session + Status
     const ac = safeText(receipt.academic_session || "");
     const st = safeText(receipt.status || "");
     if (ac) doc.text(`Academic Session: ${ac}`, rightTopX, doc.y + 2, { width: rightTopW, align: "right" });
@@ -720,7 +740,7 @@ function buildSupplierReceiptPdfBuffer({
     drawHR();
     doc.moveDown(0.35);
 
-    /* ---------- ✅ Highlighted Supplier Box ---------- */
+    /* ---------- Supplier Box ---------- */
     const supplierName = safeText(supplier?.name || "");
     if (supplierName) {
       const addr = safeText(supplier.address || supplier.address_line1 || supplier.full_address || "");
@@ -742,7 +762,6 @@ function buildSupplierReceiptPdfBuffer({
 
       doc.font("Helvetica").fontSize(10);
       const linesH = lines.reduce((sum, ln) => sum + doc.heightOfString(String(ln), { width: boxW - 20 }) + 2, 0);
-
       const boxH = Math.max(70, 18 + nameH + linesH + 14);
 
       ensureSpace(boxH + 8);
@@ -881,7 +900,7 @@ function buildSupplierReceiptPdfBuffer({
       }
     }
 
-    /* ---------- Totals (bottom right) ---------- */
+    /* ---------- Totals ---------- */
     const ship = round2(receipt.shipping_charge);
     const other = round2(receipt.other_charge);
     const ro = round2(receipt.round_off);
@@ -936,19 +955,22 @@ function buildSupplierReceiptPdfBuffer({
   });
 }
 
-
 /* ============================================================
  * Controller
  * ============================================================ */
 
 /**
  * POST /api/supplier-receipts
+ * ✅ Supports DIRECT PURCHASE (no school_order_id)
+ * ✅ Optional: purchase_mode (stored only if column exists)
+ * ✅ Optional: school_id (stored only if column exists) -> direct purchase tagging
  */
 exports.create = async (request, reply) => {
   const body = request.body || {};
 
   const supplier_id = num(body.supplier_id);
   const school_order_id = body.school_order_id ? num(body.school_order_id) : null;
+  const school_id = body.school_id ? num(body.school_id) : null; // ✅ optional for DIRECT purchase
 
   const receive_doc_type = normalizeDocType(body.receive_doc_type);
   const doc_no = body.doc_no != null ? String(body.doc_no).trim() : null;
@@ -977,12 +999,8 @@ exports.create = async (request, reply) => {
   if (!items.length) return reply.code(400).send({ error: "At least one item is required" });
 
   for (const [i, it] of items.entries()) {
-    if (!it || !num(it.book_id)) {
-      return reply.code(400).send({ error: `items[${i}].book_id is required` });
-    }
-    if (num(it.qty) <= 0) {
-      return reply.code(400).send({ error: `items[${i}].qty must be > 0` });
-    }
+    if (!it || !num(it.book_id)) return reply.code(400).send({ error: `items[${i}].book_id is required` });
+    if (num(it.qty) <= 0) return reply.code(400).send({ error: `items[${i}].qty must be > 0` });
   }
 
   // INVOICE strict requirement
@@ -991,9 +1009,7 @@ exports.create = async (request, reply) => {
     if (!invNo) return reply.code(400).send({ error: "Invoice No is required." });
 
     for (const [i, it] of items.entries()) {
-      if (num(it.rate) <= 0) {
-        return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
-      }
+      if (num(it.rate) <= 0) return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
     }
   }
 
@@ -1004,27 +1020,48 @@ exports.create = async (request, reply) => {
   if (receive_doc_type === "CHALLAN" && anyMissingRate) finalStatus = "draft";
   if (!["draft", "received"].includes(finalStatus)) finalStatus = "draft";
 
+  // ✅ Determine purchase mode (always consistent)
+  // If school_order_id is provided => ORDER_BASED (forced)
+  const effectiveMode = school_order_id ? "ORDER_BASED" : normalizePurchaseMode(body.purchase_mode || "DIRECT");
+
   const t = await sequelize.transaction();
   try {
-    const supplier = await Supplier.findByPk(supplier_id, {
-      transaction: t,
-      lock: t.LOCK.UPDATE,
-    });
+    const supplier = await Supplier.findByPk(supplier_id, { transaction: t, lock: t.LOCK.UPDATE });
     if (!supplier) {
       await t.rollback();
       return reply.code(404).send({ error: "Supplier not found" });
+    }
+
+    // Optional: validate school order exists (if passed)
+    if (school_order_id) {
+      const so = SchoolOrder ? await SchoolOrder.findByPk(school_order_id, { transaction: t }) : null;
+      if (SchoolOrder && !so) {
+        await t.rollback();
+        return reply.code(400).send({ error: "Invalid school_order_id" });
+      }
+
+      // if order-based, school_id should not be separately set (avoid mismatch)
+      // we ignore provided school_id safely (order will decide school)
+    } else {
+      // Direct purchase: validate school_id only if column exists and provided
+      if (school_id && hasCol(SupplierReceipt, "school_id")) {
+        if (!School) {
+          await t.rollback();
+          return reply.code(400).send({ error: "School model not available, cannot set school_id." });
+        }
+        const sch = await School.findByPk(school_id, { transaction: t });
+        if (!sch) {
+          await t.rollback();
+          return reply.code(400).send({ error: "Invalid school_id" });
+        }
+      }
     }
 
     const calcLines = items.map((it) => {
       const discType = it.item_discount_type || "NONE";
       const discVal = it.item_discount_value ?? null;
 
-      const line = calcItemLine({
-        qty: it.qty,
-        rate: it.rate,
-        discType,
-        discVal,
-      });
+      const line = calcItemLine({ qty: it.qty, rate: it.rate, discType, discVal });
 
       return {
         book_id: num(it.book_id),
@@ -1059,9 +1096,12 @@ exports.create = async (request, reply) => {
     const final_doc_no = doc_no || invoice_no || null;
     const final_doc_date = doc_date || invoice_date || null;
 
-    const receiptPayload = {
+    const receiptPayloadBase = {
       supplier_id,
       school_order_id,
+      // ✅ optional school_id only for DIRECT (and only if column exists)
+      school_id: school_order_id ? null : school_id || null,
+
       receipt_no,
 
       receive_doc_type,
@@ -1089,8 +1129,12 @@ exports.create = async (request, reply) => {
       round_off: round2(num(round_off)),
 
       grand_total: totals.grand_total,
+
+      // ✅ Optional column (only saved if exists)
+      purchase_mode: effectiveMode,
     };
 
+    const receiptPayload = pickAttrs(SupplierReceipt, receiptPayloadBase);
     const receipt = await SupplierReceipt.create(receiptPayload, { transaction: t });
 
     await SupplierReceiptItem.bulkCreate(
@@ -1098,13 +1142,14 @@ exports.create = async (request, reply) => {
       { transaction: t }
     );
 
+    // Update book master rate (if positive)
     for (const r of calcLines) {
       if (num(r.rate) > 0) {
         await Book.update({ rate: round2(r.rate) }, { where: { id: r.book_id }, transaction: t });
       }
     }
 
-    if (receipt.status === "received") {
+    if (String(receipt.status).toLowerCase() === "received") {
       const lineItems = calcLines.map((x) => ({
         book_id: num(x.book_id),
         qty: Math.max(0, Math.floor(num(x.qty))),
@@ -1129,9 +1174,7 @@ exports.create = async (request, reply) => {
       ],
     });
 
-    // ✅ attach school
     const fullWithSchool = await attachSchoolToReceiptJson(full);
-
     return reply.code(201).send({ receipt: fullWithSchool });
   } catch (err) {
     try {
@@ -1148,6 +1191,9 @@ exports.create = async (request, reply) => {
 
 /**
  * ✅ PATCH /api/supplier-receipts/:id
+ * ✅ Allows setting school_order_id ONLY when not posted AND DRAFT
+ * ✅ Allows setting school_id (only if column exists) for DIRECT receipts (DRAFT + not posted)
+ * ✅ Supports purchase_mode update only if column exists (and not order-based)
  */
 exports.update = async (request, reply) => {
   const id = num(request.params?.id);
@@ -1155,23 +1201,77 @@ exports.update = async (request, reply) => {
 
   const t = await sequelize.transaction();
   try {
-    const receipt = await SupplierReceipt.findByPk(id, {
-      transaction: t,
-      lock: t.LOCK.UPDATE,
-    });
+    const receipt = await SupplierReceipt.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
     if (!receipt) {
       await t.rollback();
       return reply.code(404).send({ error: "Receipt not found" });
     }
 
-    if (String(receipt.status).toLowerCase() === "cancelled") {
+    const prevStatus = String(receipt.status || "").toLowerCase();
+    if (prevStatus === "cancelled") {
       await t.rollback();
       return reply.code(400).send({ error: "Cancelled receipt cannot be updated." });
     }
 
     const attrs = SupplierReceipt?.rawAttributes || {};
     const isPosted = hasPostedFlag(receipt);
-    const statusLower = String(receipt.status || "").toLowerCase();
+
+    // ✅ Allow change link to order only when DRAFT and not posted
+    if (body.school_order_id !== undefined) {
+      if (isPosted || prevStatus !== "draft") {
+        await t.rollback();
+        return reply.code(400).send({ error: "school_order_id can be changed only for DRAFT (not posted) receipt." });
+      }
+
+      const nextSo = body.school_order_id ? num(body.school_order_id) : null;
+
+      if (nextSo) {
+        if (SchoolOrder) {
+          const so = await SchoolOrder.findByPk(nextSo, { transaction: t });
+          if (!so) {
+            await t.rollback();
+            return reply.code(400).send({ error: "Invalid school_order_id" });
+          }
+        }
+      }
+
+      if (attrs.school_order_id) receipt.school_order_id = nextSo;
+
+      // if now order-based, wipe direct school_id to avoid mismatch
+      if (attrs.school_id && nextSo) receipt.school_id = null;
+
+      // keep purchase_mode consistent
+      if (attrs.purchase_mode) receipt.purchase_mode = nextSo ? "ORDER_BASED" : "DIRECT";
+    }
+
+    // ✅ Allow school_id update ONLY for DIRECT receipts, DRAFT, not posted
+    if (body.school_id !== undefined && attrs.school_id) {
+      if (isPosted || prevStatus !== "draft") {
+        await t.rollback();
+        return reply.code(400).send({ error: "school_id can be changed only for DRAFT (not posted) receipt." });
+      }
+
+      const linkedToOrder = !!num(receipt.school_order_id);
+      if (linkedToOrder) {
+        await t.rollback();
+        return reply.code(400).send({ error: "school_id cannot be set when school_order_id is present." });
+      }
+
+      const nextSchoolId = body.school_id ? num(body.school_id) : null;
+      if (nextSchoolId) {
+        if (!School) {
+          await t.rollback();
+          return reply.code(400).send({ error: "School model not available, cannot set school_id." });
+        }
+        const sch = await School.findByPk(nextSchoolId, { transaction: t });
+        if (!sch) {
+          await t.rollback();
+          return reply.code(400).send({ error: "Invalid school_id" });
+        }
+      }
+
+      receipt.school_id = nextSchoolId;
+    }
 
     // Always-allowed fields
     if (body.receive_doc_type != null && attrs.receive_doc_type) {
@@ -1199,6 +1299,13 @@ exports.update = async (request, reply) => {
     if (body.remarks !== undefined && attrs.remarks) {
       const v = String(body.remarks || "").trim();
       receipt.remarks = v ? v : null;
+    }
+
+    // Optional: purchase_mode (only if column exists) — but don't allow forcing DIRECT when linked to order
+    if (body.purchase_mode !== undefined && attrs.purchase_mode) {
+      const linked = !!num(receipt.school_order_id);
+      const wants = normalizePurchaseMode(body.purchase_mode);
+      receipt.purchase_mode = linked ? "ORDER_BASED" : wants;
     }
 
     // backward compat sync
@@ -1233,12 +1340,13 @@ exports.update = async (request, reply) => {
         });
       }
     } else {
-      if (statusLower !== "draft") {
+      if (prevStatus !== "draft") {
         if (wantsItemsEdit || wantsHeaderMoneyEdit) {
           await t.rollback();
           return reply.code(400).send({ error: "Only DRAFT receipt can be edited for qty/price/discount/charges." });
         }
       } else {
+        // header money edits
         if (body.bill_discount_type !== undefined && attrs.bill_discount_type) {
           receipt.bill_discount_type = String(body.bill_discount_type || "NONE").toUpperCase();
         }
@@ -1289,12 +1397,7 @@ exports.update = async (request, reply) => {
             const discType = it.item_discount_type || "NONE";
             const discVal = it.item_discount_value ?? null;
 
-            const line = calcItemLine({
-              qty: it.qty,
-              rate: it.rate,
-              discType,
-              discVal,
-            });
+            const line = calcItemLine({ qty: it.qty, rate: it.rate, discType, discVal });
 
             return {
               book_id: num(it.book_id),
@@ -1353,6 +1456,11 @@ exports.update = async (request, reply) => {
       }
     }
 
+    // ✅ final safety: keep purchase_mode consistent even if client sends wrong
+    if (attrs.purchase_mode) {
+      receipt.purchase_mode = num(receipt.school_order_id) ? "ORDER_BASED" : normalizePurchaseMode(receipt.purchase_mode);
+    }
+
     await receipt.save({ transaction: t });
     await t.commit();
 
@@ -1363,9 +1471,7 @@ exports.update = async (request, reply) => {
       ],
     });
 
-    // ✅ attach school
     const fullWithSchool = await attachSchoolToReceiptJson(full);
-
     return reply.send({ receipt: fullWithSchool });
   } catch (err) {
     try {
@@ -1382,11 +1488,14 @@ exports.update = async (request, reply) => {
 
 /**
  * GET /api/supplier-receipts
- * ✅ includes supplier + (school if available)
+ * ✅ includes supplier + purchase_mode + (school if available)
+ * ✅ filters:
+ *    - purchase_mode=DIRECT|ORDER_BASED
+ *    - school_id (if column exists)
  */
 exports.list = async (request, reply) => {
   try {
-    const { supplier_id, status, from, to, q, receive_doc_type, doc_no } = request.query || {};
+    const { supplier_id, status, from, to, q, receive_doc_type, doc_no, purchase_mode, school_id } = request.query || {};
 
     const where = {};
     if (supplier_id) where.supplier_id = num(supplier_id);
@@ -1394,6 +1503,21 @@ exports.list = async (request, reply) => {
 
     if (receive_doc_type) where.receive_doc_type = normalizeDocType(receive_doc_type);
     if (doc_no && String(doc_no).trim()) where.doc_no = { [Op.like]: `%${String(doc_no).trim()}%` };
+
+    // ✅ school_id filter (only if column exists)
+    if (school_id && hasCol(SupplierReceipt, "school_id")) {
+      where.school_id = num(school_id);
+    }
+
+    // ✅ purchase_mode filter (works even if column doesn't exist)
+    const wantsMode = purchase_mode ? normalizePurchaseMode(purchase_mode) : null;
+    const hasPurchaseModeCol = hasCol(SupplierReceipt, "purchase_mode");
+    if (wantsMode && hasPurchaseModeCol) {
+      where.purchase_mode = wantsMode;
+    } else if (wantsMode && !hasPurchaseModeCol) {
+      if (wantsMode === "DIRECT") where.school_order_id = { [Op.or]: [null, 0] };
+      if (wantsMode === "ORDER_BASED") where.school_order_id = { [Op.ne]: null };
+    }
 
     if (from || to) {
       where.received_date = {};
@@ -1417,7 +1541,6 @@ exports.list = async (request, reply) => {
       limit: 200,
     });
 
-    // ✅ attach school for each row (best-effort)
     const receipts = [];
     for (const r of rows) {
       receipts.push(await attachSchoolToReceiptJson(r));
@@ -1433,7 +1556,7 @@ exports.list = async (request, reply) => {
 
 /**
  * GET /api/supplier-receipts/:id
- * ✅ includes supplier + items + (school if available)
+ * ✅ includes supplier + items + purchase_mode + (school if available)
  */
 exports.getById = async (request, reply) => {
   try {
@@ -1459,8 +1582,8 @@ exports.getById = async (request, reply) => {
 
 /**
  * ✅ GET /api/supplier-receipts/:id/pdf
- * ✅ Title & filename auto by doc type
- * ✅ Adds school name
+ * ✅ Adds school name (from receipt.school_id OR order->school)
+ * ✅ Adds Purchase Type in PDF (DIRECT/ORDER_BASED)
  */
 exports.printReceiptPdf = async (request, reply) => {
   const id = num(request.params?.id);
@@ -1486,11 +1609,12 @@ exports.printReceiptPdf = async (request, reply) => {
       ],
     });
 
-    const r = receipt.toJSON();
+    const r0 = receipt.toJSON();
+    const r = attachPurchaseMode(r0);
+
     const supplier = r.supplier || null;
     const items = r.items || [];
 
-    // ✅ fetch school (best-effort)
     const school = await fetchSchoolForReceipt(r);
 
     const docType = normalizeDocType(r.receive_doc_type);
@@ -1540,10 +1664,7 @@ exports.updateStatus = async (request, reply) => {
 
   const t = await sequelize.transaction();
   try {
-    const receipt = await SupplierReceipt.findByPk(id, {
-      transaction: t,
-      lock: t.LOCK.UPDATE,
-    });
+    const receipt = await SupplierReceipt.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
     if (!receipt) {
       await t.rollback();
       return reply.code(404).send({ error: "Receipt not found" });
@@ -1580,6 +1701,11 @@ exports.updateStatus = async (request, reply) => {
         await t.rollback();
         return reply.code(400).send({ error: errMsg });
       }
+    }
+
+    // keep purchase_mode consistent if column exists
+    if (hasCol(SupplierReceipt, "purchase_mode")) {
+      receipt.purchase_mode = num(receipt.school_order_id) ? "ORDER_BASED" : normalizePurchaseMode(receipt.purchase_mode);
     }
 
     receipt.status = nextStatus;

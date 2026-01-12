@@ -16,9 +16,10 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
+      // ✅ Match DB (your desc shows supplier_id is nullable)
       supplier_id: {
         type: DataTypes.INTEGER.UNSIGNED,
-        allowNull: false,
+        allowNull: true,
       },
 
       order_no: {
@@ -48,6 +49,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ DB generated column (keep it as-is)
+      original_guard: {
+        type: DataTypes.TINYINT,
+        allowNull: true,
+      },
+
       order_date: {
         type: DataTypes.DATE,
         allowNull: false,
@@ -55,18 +62,23 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       status: {
-        type: DataTypes.ENUM(
-          "draft",
-          "sent",
-          "partial_received",
-          "completed",
-          "cancelled",
-          "reordered"
-        ),
+        type: DataTypes.ENUM("draft", "sent", "partial_received", "completed", "cancelled", "reordered"),
         allowNull: false,
         defaultValue: "draft",
       },
 
+      /**
+       * Helps reporting/filtering: Email/WhatsApp/Phone etc.
+       */
+      order_source: {
+        type: DataTypes.ENUM("email", "whatsapp", "phone", "post", "in_person", "other"),
+        allowNull: false,
+        defaultValue: "email",
+      },
+
+      /**
+       * ✅ Internal only (office memory) — never print in supplier PDF/email
+       */
       remarks: {
         type: DataTypes.TEXT,
         allowNull: true,
@@ -82,13 +94,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ Note 1 (existing)
+      // Notes for PDF footer (can be shown to supplier)
       notes: {
         type: DataTypes.TEXT,
         allowNull: true,
       },
 
-      // ✅ Note 2 (new)
       notes_2: {
         type: DataTypes.TEXT,
         allowNull: true,
@@ -195,16 +206,11 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ["supplier_receipt_id"] },
         { fields: ["email_sent_count"] },
         { fields: ["last_email_sent_at"] },
+        { fields: ["order_source"] },
 
-        // ✅ helpful compound indexes for reports
         { fields: ["school_id", "order_date"] },
         { fields: ["supplier_id", "order_date"] },
         { fields: ["school_id", "supplier_id", "academic_session"] },
-
-        // ✅ IMPORTANT:
-        // We REMOVED uniq_school_session_supplier_type because it blocks multiple reorders.
-        // We will enforce "only 1 ORIGINAL per school+session+supplier" via DB migration (generated column trick).
-        // And we enforce reorder sequencing per parent via uq_parent_reorder_seq (migration).
       ],
     }
   );
@@ -218,8 +224,6 @@ module.exports = (sequelize, DataTypes) => {
       SchoolOrder.belongsTo(models.Transport, { foreignKey: "transport_id_2", as: "transport2" });
     }
 
-    // ✅ CRITICAL for ORDERED-side report
-    // Ensures SchoolOrder.associations includes target SchoolOrderItem so your dynamic alias detection works.
     if (models.SchoolOrderItem) {
       SchoolOrder.hasMany(models.SchoolOrderItem, {
         foreignKey: "school_order_id",
@@ -236,7 +240,6 @@ module.exports = (sequelize, DataTypes) => {
       });
     }
 
-    // self references for reorders
     SchoolOrder.belongsTo(models.SchoolOrder, { foreignKey: "parent_order_id", as: "parentOrder" });
     SchoolOrder.hasMany(models.SchoolOrder, { foreignKey: "parent_order_id", as: "reorders" });
 
