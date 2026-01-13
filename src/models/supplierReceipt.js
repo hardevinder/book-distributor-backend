@@ -20,37 +20,34 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ NEW: Direct purchase tagging
+      school_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
       receipt_no: {
         type: DataTypes.STRING(50),
         allowNull: false,
         unique: true,
       },
 
-      /* =========================
-         ✅ NEW: Challan vs Invoice
-         ========================= */
       receive_doc_type: {
         type: DataTypes.ENUM("CHALLAN", "INVOICE"),
         allowNull: false,
         defaultValue: "CHALLAN",
       },
 
-      // store challan/invoice number in one place
       doc_no: {
         type: DataTypes.STRING(100),
         allowNull: true,
       },
 
-      // optional challan/invoice date
       doc_date: {
         type: DataTypes.DATEONLY,
         allowNull: true,
       },
 
-      /* =========================
-         ✅ Backward-compat fields
-         (keep if old data exists)
-         ========================= */
       invoice_no: {
         type: DataTypes.STRING(50),
         allowNull: true,
@@ -66,9 +63,6 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ Keep only one "received date" (GRN date)
-      // NOTE: DATEONLY + NOW can create "Incorrect date value"
-      // so we use CURRENT_DATE literal.
       received_date: {
         type: DataTypes.DATEONLY,
         allowNull: false,
@@ -86,17 +80,10 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      /* =========================
-         ✅ Posting Guard
-         Inventory/Ledger posting must happen only once.
-         If later you attach invoice details, no reposting.
-         ========================= */
       posted_at: {
         type: DataTypes.DATE,
         allowNull: true,
       },
-
-      /* -------- totals -------- */
 
       sub_total: {
         type: DataTypes.DECIMAL(12, 2),
@@ -151,13 +138,11 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         { fields: ["supplier_id", "received_date"] },
         { fields: ["supplier_id", "status"] },
-        { fields: ["school_order_id"] }, // ✅ NOT unique (multiple receipts per order allowed)
+        { fields: ["school_order_id"] },
+        { fields: ["school_id"] }, // ✅ NEW index
         { fields: ["supplier_id", "receive_doc_type"] },
         { fields: ["supplier_id", "doc_no"] },
         { fields: ["posted_at"] },
-
-        // ✅ optional: prevent duplicate doc number per supplier+type
-        // { unique: true, fields: ["supplier_id", "receive_doc_type", "doc_no"] },
       ],
     }
   );
@@ -167,6 +152,14 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: "supplier_id",
       as: "supplier",
     });
+
+    // ✅ NEW: Direct purchase school link
+    if (models.School) {
+      SupplierReceipt.belongsTo(models.School, {
+        foreignKey: "school_id",
+        as: "school",
+      });
+    }
 
     if (models.SchoolOrder) {
       SupplierReceipt.belongsTo(models.SchoolOrder, {

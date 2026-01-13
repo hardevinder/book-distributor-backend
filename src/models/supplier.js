@@ -1,4 +1,5 @@
-// src/models/supplier.js
+"use strict";
+
 module.exports = (sequelize, DataTypes) => {
   const Supplier = sequelize.define(
     "Supplier",
@@ -34,7 +35,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ NEW: Supplier -> Publisher (FK)
+      // ✅ Supplier → Publisher
       publisher_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
@@ -50,31 +51,47 @@ module.exports = (sequelize, DataTypes) => {
       tableName: "suppliers",
       timestamps: true,
       indexes: [
-        // helpful for joins
         { fields: ["publisher_id"] },
+        { fields: ["is_active"] },
       ],
     }
   );
 
-  // ✅ Associations
+  /* ============================
+   * Associations
+   * ============================ */
   Supplier.associate = (models) => {
-    // Supplier -> SchoolOrders
-    Supplier.hasMany(models.SchoolOrder, {
-      foreignKey: "supplier_id",
-      as: "schoolOrders",
-    });
+    // ✅ Supplier → SupplierReceipts (IMPORTANT)
+    if (models.SupplierReceipt) {
+      Supplier.hasMany(models.SupplierReceipt, {
+        foreignKey: "supplier_id",
+        as: "receipts",
+      });
+    }
 
-    // Supplier -> Books (Catalogue)
-    Supplier.hasMany(models.Book, {
-      foreignKey: "supplier_id",
-      as: "books",
-    });
+    // Supplier → SchoolOrders
+    if (models.SchoolOrder) {
+      Supplier.hasMany(models.SchoolOrder, {
+        foreignKey: "supplier_id",
+        as: "schoolOrders",
+      });
+    }
 
-    // ✅ Supplier -> Publisher
-    Supplier.belongsTo(models.Publisher, {
-      foreignKey: "publisher_id",
-      as: "publisher",
-    });
+    // Supplier → Books (catalogue)
+    if (models.Book) {
+      Supplier.hasMany(models.Book, {
+        foreignKey: "supplier_id",
+        as: "books",
+      });
+    }
+
+    // Supplier → Publisher
+    if (models.Publisher) {
+      Supplier.belongsTo(models.Publisher, {
+        foreignKey: "publisher_id",
+        as: "publisher",
+      });
+    }
   };
 
   return Supplier;

@@ -15,14 +15,19 @@ module.exports = async function supplierReceiptsRoutes(fastify) {
   fastify.get("/:id/pdf", supplierReceiptController.printReceiptPdf);
 
   /* ===============================
+   * STATUS UPDATE (keep before :id)
+   * =============================== */
+  fastify.patch("/:id/status", supplierReceiptController.updateStatus);
+
+  /* ===============================
    * UPDATE RECEIPT FIELDS (doc_no/doc_date etc.)
    * =============================== */
   fastify.patch("/:id", supplierReceiptController.update);
 
   /* ===============================
-   * STATUS UPDATE
+   * ✅ DELETE RECEIPT (only DRAFT + not posted)
    * =============================== */
-  fastify.patch("/:id/status", supplierReceiptController.updateStatus);
+  fastify.delete("/:id", supplierReceiptController.remove);
 
   /* ===============================
    * GET BY ID (keep LAST)

@@ -1535,11 +1535,22 @@ exports.list = async (request, reply) => {
     }
 
     const rows = await SupplierReceipt.findAll({
-      where,
-      order: [["id", "DESC"]],
-      include: [{ model: Supplier, as: "supplier" }],
-      limit: 200,
-    });
+    where,
+    order: [["id", "DESC"]],
+    include: [
+      { model: Supplier, as: "supplier" },
+
+      // ✅ include receipt items + book so listing shows titles immediately
+      {
+        model: SupplierReceiptItem,
+        as: "items",
+        separate: true,          // ✅ prevents huge join & duplicate rows
+        order: [["id", "ASC"]],
+        include: [{ model: Book, as: "book", attributes: ["id", "title"] }],
+      },
+    ],
+    limit: 200,
+  });
 
     const receipts = [];
     for (const r of rows) {
@@ -1752,3 +1763,72 @@ exports.updateStatus = async (request, reply) => {
     });
   }
 };
+
+/**
+ * ✅ DELETE /api/supplier-receipts/:id
+ * Hard delete ONLY allowed for DRAFT + NOT POSTED receipts.
+ * - Removes items
+ * - Removes ledger rows (safety)
+ * - Removes receipt
+ *
+ * NOTE: For RECEIVED receipts use "cancelled" status (reversal) instead of delete.
+ */
+exports.remove = async (request, reply) => {
+  const id = num(request.params?.id);
+
+  const t = await sequelize.transaction();
+  try {
+    const receipt = await SupplierReceipt.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
+    if (!receipt) {
+      await t.rollback();
+      return reply.code(404).send({ error: "Receipt not found" });
+    }
+
+    const status = String(receipt.status || "").toLowerCase();
+
+    // ✅ allow delete only for draft
+    if (status !== "draft") {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "Only DRAFT receipt can be deleted. For RECEIVED receipt, use Cancel option.",
+      });
+    }
+
+    // ✅ if posted_at column exists, block delete when posted
+    if (hasPostedFlag(receipt)) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "This receipt is already posted (inventory/ledger). Please Cancel it instead of deleting.",
+      });
+    }
+
+    // safety: remove ledger rows if any exist (should normally be none for draft)
+    await removePurchaseLedger({ receipt, t });
+
+    // delete receipt items
+    await SupplierReceiptItem.destroy({
+      where: { supplier_receipt_id: receipt.id },
+      transaction: t,
+    });
+
+    // finally delete receipt
+    await SupplierReceipt.destroy({
+      where: { id: receipt.id },
+      transaction: t,
+    });
+
+    await t.commit();
+    return reply.send({ ok: true, deleted: true, id });
+  } catch (err) {
+    try {
+      await t.rollback();
+    } catch (_) {}
+    request.log?.error?.(err);
+    console.error("❌ deleteSupplierReceipt error:", err);
+    return reply.code(500).send({
+      error: "Failed to delete receipt",
+      details: err?.message || String(err),
+    });
+  }
+};
+
