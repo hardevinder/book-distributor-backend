@@ -1,4 +1,6 @@
 // src/models/school.js
+"use strict";
+
 module.exports = (sequelize, DataTypes) => {
   const School = sequelize.define(
     "School",
@@ -27,7 +29,9 @@ module.exports = (sequelize, DataTypes) => {
       email: {
         type: DataTypes.STRING(150),
         allowNull: true,
-        validate: { isEmail: true },
+        validate: {
+          isEmail: true,
+        },
       },
 
       address: {
@@ -67,6 +71,23 @@ module.exports = (sequelize, DataTypes) => {
       timestamps: true,
     }
   );
+
+  /* ============================
+   * Associations
+   * ============================ */
+  School.associate = (models) => {
+    // ✅ School → Bundles
+    School.hasMany(models.Bundle, {
+      foreignKey: "school_id",
+      as: "bundles",
+    });
+
+    // (Optional – future ready)
+    // School.hasMany(models.SchoolOrder, {
+    //   foreignKey: "school_id",
+    //   as: "orders",
+    // });
+  };
 
   return School;
 };

@@ -12,6 +12,8 @@ const {
   sequelize,
 } = require("../models");
 
+/* ---------------- Helpers ---------------- */
+
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -79,7 +81,6 @@ exports.createBundle = async (request, reply) => {
     const book_id = num(it.book_id);
     const qty = Math.max(0, num(it.qty)); // incoming still "qty" from frontend
     if (!book_id || qty <= 0) continue;
-
     agg.set(book_id, (agg.get(book_id) || 0) + qty);
   }
 
@@ -209,16 +210,59 @@ exports.listBundles = async (request, reply) => {
     if (academic_session) where.academic_session = String(academic_session);
     if (status) where.status = String(status);
 
+    // ✅ Strongest include style: use registered associations (prevents eager loading errors)
+    const include = [];
+
+    // Bundle -> School (belongsTo as: "school")
+    if (Bundle.associations?.school) {
+      include.push({
+        association: Bundle.associations.school,
+        attributes: ["id", "name"],
+      });
+    } else {
+      // Return a clear message instead of Sequelize cryptic error
+      return reply.code(500).send({
+        message:
+          "Bundle -> School association not registered. Ensure models/index.js calls .associate(db) for all models and that Bundle.associate is executed on startup.",
+        bundleAssociations: Object.keys(Bundle.associations || {}),
+      });
+    }
+
+    // Bundle -> Items (hasMany as: "items")
+    if (Bundle.associations?.items) {
+      const itemsInclude = {
+        association: Bundle.associations.items,
+        include: [],
+      };
+
+      // BundleItem -> Book (belongsTo as: "book")
+      if (BundleItem.associations?.book) {
+        itemsInclude.include.push({
+          association: BundleItem.associations.book,
+          attributes: ["id", "title"],
+        });
+      } else {
+        // fallback (still works if association exists but not loaded here)
+        itemsInclude.include.push({
+          model: Book,
+          as: "book",
+          attributes: ["id", "title"],
+        });
+      }
+
+      include.push(itemsInclude);
+    } else {
+      // fallback
+      include.push({
+        model: BundleItem,
+        as: "items",
+        include: [{ model: Book, as: "book", attributes: ["id", "title"] }],
+      });
+    }
+
     const rows = await Bundle.findAll({
       where,
-      include: [
-        { model: School, as: "school", attributes: ["id", "name"] },
-        {
-          model: BundleItem,
-          as: "items",
-          include: [{ model: Book, as: "book", attributes: ["id", "title"] }],
-        },
-      ],
+      include,
       order: [["id", "DESC"]],
     });
 
