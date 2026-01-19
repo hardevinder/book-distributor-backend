@@ -21,6 +21,20 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       /* =========================================================
+       * ✅ SPECIMEN FIELDS (NEW)
+       * ========================================================= */
+      is_specimen: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+
+      specimen_reason: {
+        type: DataTypes.STRING(255),
+        allowNull: true,
+      },
+
+      /* =========================================================
        * ✅ NEW STANDARD FIELDS (match SchoolOrderItem + controller)
        * ========================================================= */
 
@@ -68,24 +82,20 @@ module.exports = (sequelize, DataTypes) => {
 
       /* =========================================================
        * ✅ LEGACY FIELDS (keep for backward compatibility)
-       * - You can remove later after data migration + UI updates
        * ========================================================= */
 
-      // legacy single qty
       qty: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
         defaultValue: 0,
       },
 
-      // legacy unit rate
       rate: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      // legacy discount type/value
       item_discount_type: {
         type: DataTypes.ENUM("NONE", "PERCENT", "AMOUNT"),
         allowNull: false,
@@ -97,7 +107,6 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // legacy computed/stored
       gross_amount: {
         type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
@@ -122,9 +131,13 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         { fields: ["supplier_receipt_id"] },
         { fields: ["book_id"] },
+        { fields: ["is_specimen"] },
 
-        // ✅ prevent duplicates per receipt+book (recommended)
-        { unique: true, fields: ["supplier_receipt_id", "book_id"] },
+        // ✅ OPTIONAL (allowed): helps searching / listing
+        { fields: ["supplier_receipt_id", "book_id", "is_specimen"] },
+
+        // ❌ IMPORTANT: removed unique index on (supplier_receipt_id, book_id)
+        // because we need 2 rows for same book: paid + specimen
       ],
     }
   );

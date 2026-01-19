@@ -37,12 +37,12 @@ const SchoolOrderItem = require("./schoolOrderItem")(sequelize, DataTypes);
 const SchoolRequirementOrderLink = require("./schoolRequirementOrderLink")(sequelize, DataTypes);
 
 /* ======================
-   ✅ EMAIL LOGS (NEW)
+   EMAIL LOGS
    ====================== */
 const SchoolOrderEmailLog = require("./schoolOrderEmailLog")(sequelize, DataTypes);
 
 /* ======================
-   MODULE-2 INVENTORY
+   INVENTORY
    ====================== */
 const InventoryBatch = require("./inventoryBatch")(sequelize, DataTypes);
 const InventoryTxn = require("./inventoryTxn")(sequelize, DataTypes);
@@ -61,6 +61,7 @@ const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
    ====================== */
 const SupplierReceipt = require("./supplierReceipt")(sequelize, DataTypes);
 const SupplierReceiptItem = require("./supplierReceiptItem")(sequelize, DataTypes);
+const SupplierReceiptAllocation = require("./supplierReceiptAllocation")(sequelize, DataTypes); // ✅ FIXED
 const SupplierPayment = require("./supplierPayment")(sequelize, DataTypes);
 const SupplierLedgerTxn = require("./supplierLedgerTxn")(sequelize, DataTypes);
 
@@ -112,7 +113,7 @@ SchoolOrderItem.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "ord
 Book.hasMany(SchoolOrderItem, { foreignKey: "book_id", as: "school_order_items" });
 SchoolOrderItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
-/* ---------- ✅ School Orders ↔ Email Logs ---------- */
+/* ---------- School Orders ↔ Email Logs ---------- */
 SchoolOrder.hasMany(SchoolOrderEmailLog, {
   foreignKey: "school_order_id",
   as: "emailLogs",
@@ -122,12 +123,10 @@ SchoolOrderEmailLog.belongsTo(SchoolOrder, {
   as: "order",
 });
 
-/* ---------- School Orders ↔ Transport ---------- */
-// Option-1
+/* ---------- Transport ---------- */
 Transport.hasMany(SchoolOrder, { foreignKey: "transport_id", as: "schoolOrders_transport1" });
 SchoolOrder.belongsTo(Transport, { foreignKey: "transport_id", as: "transport" });
 
-// Option-2
 Transport.hasMany(SchoolOrder, { foreignKey: "transport_id_2", as: "schoolOrders_transport2" });
 SchoolOrder.belongsTo(Transport, { foreignKey: "transport_id_2", as: "transport2" });
 
@@ -141,7 +140,7 @@ InventoryBatch.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" }
 InventoryBatch.hasMany(InventoryTxn, { foreignKey: "batch_id", as: "txns" });
 InventoryTxn.belongsTo(InventoryBatch, { foreignKey: "batch_id", as: "batch" });
 
-/* ---------- Bundles / Dispatch ---------- */
+/* ---------- Bundles ---------- */
 Bundle.hasMany(BundleItem, { foreignKey: "bundle_id", as: "items" });
 BundleItem.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 
@@ -151,9 +150,7 @@ BundleIssue.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 BundleIssue.hasMany(BundleDispatch, { foreignKey: "bundle_issue_id", as: "dispatches" });
 BundleDispatch.belongsTo(BundleIssue, { foreignKey: "bundle_issue_id", as: "issue" });
 
-/* =====================================================
-   SUPPLIER RECEIPTS → DEBIT
-   ===================================================== */
+/* ---------- Supplier Receipts ---------- */
 Supplier.hasMany(SupplierReceipt, { foreignKey: "supplier_id", as: "receipts" });
 SupplierReceipt.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
@@ -171,19 +168,44 @@ SupplierReceiptItem.belongsTo(SupplierReceipt, { foreignKey: "supplier_receipt_i
 Book.hasMany(SupplierReceiptItem, { foreignKey: "book_id", as: "supplier_receipt_items" });
 SupplierReceiptItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
-/* =====================================================
-   SUPPLIER PAYMENTS → CREDIT
-   ===================================================== */
+/* ---------- ✅ Supplier Receipt Allocations ---------- */
+SupplierReceipt.hasMany(SupplierReceiptAllocation, {
+  foreignKey: "supplier_receipt_id",
+  as: "allocations",
+  onDelete: "CASCADE",
+  hooks: true,
+});
+SupplierReceiptAllocation.belongsTo(SupplierReceipt, {
+  foreignKey: "supplier_receipt_id",
+  as: "receipt",
+});
+
+School.hasMany(SupplierReceiptAllocation, {
+  foreignKey: "school_id",
+  as: "supplierReceiptAllocations",
+});
+SupplierReceiptAllocation.belongsTo(School, {
+  foreignKey: "school_id",
+  as: "school",
+});
+
+Book.hasMany(SupplierReceiptAllocation, {
+  foreignKey: "book_id",
+  as: "supplierReceiptAllocations",
+});
+SupplierReceiptAllocation.belongsTo(Book, {
+  foreignKey: "book_id",
+  as: "book",
+});
+
+/* ---------- Supplier Payments ---------- */
 Supplier.hasMany(SupplierPayment, { foreignKey: "supplier_id", as: "payments" });
 SupplierPayment.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
-/* =====================================================
-   SUPPLIER LEDGER (SINGLE SOURCE)
-   ===================================================== */
+/* ---------- Supplier Ledger ---------- */
 Supplier.hasMany(SupplierLedgerTxn, { foreignKey: "supplier_id", as: "ledgerTxns" });
 SupplierLedgerTxn.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
-// Receipt → Ledger (DEBIT)
 SupplierReceipt.hasMany(SupplierLedgerTxn, {
   foreignKey: "ref_id",
   sourceKey: "id",
@@ -192,7 +214,6 @@ SupplierReceipt.hasMany(SupplierLedgerTxn, {
   scope: { ref_table: "supplier_receipts" },
 });
 
-// Payment → Ledger (CREDIT)
 SupplierPayment.hasMany(SupplierLedgerTxn, {
   foreignKey: "ref_id",
   sourceKey: "id",
@@ -225,7 +246,6 @@ module.exports = {
   SchoolOrderItem,
   SchoolRequirementOrderLink,
 
-  // ✅ Email Logs
   SchoolOrderEmailLog,
 
   InventoryBatch,
@@ -237,9 +257,9 @@ module.exports = {
   BundleIssue,
   BundleDispatch,
 
-  // Supplier Accounting
   SupplierReceipt,
   SupplierReceiptItem,
+  SupplierReceiptAllocation,
   SupplierPayment,
   SupplierLedgerTxn,
 };

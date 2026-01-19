@@ -21,6 +21,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
+      // ✅ NEW: link batch to supplier_receipts (DIRECT / ORDER based both)
+      supplier_receipt_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
       school_order_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
@@ -64,6 +70,14 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: "supplier_id",
       as: "supplier",
     });
+
+    // ✅ NEW: source supplier receipt reference (optional)
+    if (models.SupplierReceipt) {
+      InventoryBatch.belongsTo(models.SupplierReceipt, {
+        foreignKey: "supplier_receipt_id",
+        as: "supplierReceipt",
+      });
+    }
 
     // Source order reference (optional)
     InventoryBatch.belongsTo(models.SchoolOrder, {

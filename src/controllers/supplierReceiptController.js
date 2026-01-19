@@ -250,21 +250,29 @@ async function makeReceiptNo(t) {
  * - PERCENT => % of gross line
  * - AMOUNT  => line discount amount (NOT per-unit)
  */
-function calcItemLine({ qty, rate, discType, discVal }) {
+function calcItemLine({ qty, rate, discType, discVal, isSpecimen = false }) {
   const q = Math.max(0, Math.floor(num(qty)));
-  const r = Math.max(0, num(rate));
 
+  // ✅ specimen = free copy
+  if (isSpecimen) {
+    return {
+      qty: q,
+      rate: 0,
+      gross_amount: 0,
+      discount_amount: 0,
+      net_amount: 0,
+    };
+  }
+
+  const r = Math.max(0, num(rate));
   const gross = round2(q * r);
 
   let discount = 0;
   const t = String(discType || "NONE").toUpperCase();
   const v = num(discVal);
 
-  if (t === "PERCENT") {
-    discount = round2(gross * (Math.max(0, v) / 100));
-  } else if (t === "AMOUNT") {
-    discount = round2(Math.max(0, v));
-  }
+  if (t === "PERCENT") discount = round2(gross * (Math.max(0, v) / 100));
+  else if (t === "AMOUNT") discount = round2(Math.max(0, v));
 
   if (discount > gross) discount = gross;
   const net = round2(gross - discount);
@@ -277,6 +285,7 @@ function calcItemLine({ qty, rate, discType, discVal }) {
     net_amount: net,
   };
 }
+
 
 function calcHeaderTotals({ itemsNetSum, billDiscountType, billDiscountValue, shipping_charge, other_charge, round_off }) {
   const sub_total = round2(itemsNetSum);
@@ -300,6 +309,13 @@ function calcHeaderTotals({ itemsNetSum, billDiscountType, billDiscountValue, sh
   const grand_total = round2(sub_total - bill_discount_amount + ship + other + ro);
   return { sub_total, bill_discount_amount, grand_total };
 }
+
+
+const asBool = (v) => {
+  if (v === true || v === 1 || v === "1") return true;
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "yes";
+};
 
 /* ============================================================
  * Order items received_qty helpers (optional)
@@ -392,12 +408,12 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
 
   const existingCount = await InventoryBatch.count({
     where: pickAttrs(InventoryBatch, {
-      ref_table: "supplier_receipts",
-      ref_id: receipt.id,
+      supplier_receipt_id: receipt.id,
     }),
     transaction: t,
     lock: t.LOCK.UPDATE,
   });
+
 
   if (existingCount > 0) return;
 
@@ -405,6 +421,8 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
     const batchPayload = pickAttrs(InventoryBatch, {
       book_id: r.book_id,
       supplier_id: receipt.supplier_id,
+      supplier_receipt_id: receipt.id,
+
 
       source_type: "SUPPLIER_RECEIPT",
       ref_table: "supplier_receipts",
@@ -435,6 +453,7 @@ async function ensureInventoryInForReceipt({ receipt, items, t }) {
       qty: r.qty,
       txn_type: "IN",
       type: "IN",
+      supplier_receipt_id: receipt.id,
 
       ref_type: "SUPPLIER_RECEIPT",
       ref_table: "supplier_receipts",
@@ -457,13 +476,13 @@ async function reverseInventoryForReceipt({ receipt, t }) {
 
   const batches = await InventoryBatch.findAll({
     where: pickAttrs(InventoryBatch, {
-      ref_table: "supplier_receipts",
-      ref_id: receipt.id,
+      supplier_receipt_id: receipt.id,
     }),
     transaction: t,
     lock: t.LOCK.UPDATE,
     order: [["id", "ASC"]],
   });
+
 
   if (!batches.length) return;
 
@@ -562,7 +581,10 @@ function validateReadyToReceive({ receipt, lineItems }) {
     return "Invoice No is required before marking received.";
   }
 
-  const anyZeroRate = (lineItems || []).some((x) => num(x.rate) <= 0);
+  const anyZeroRate = (lineItems || []).some(
+    (x) => !asBool(x.is_specimen) && num(x.rate) <= 0
+  );
+
   if (anyZeroRate) {
     return "One or more items have missing/zero rate. Fill price before marking received.";
   }
@@ -874,7 +896,11 @@ function buildSupplierReceiptPdfBuffer({
     } else {
       let sr = 1;
       for (const it of items) {
-        const title = safeText(it.book?.title || `Book #${it.book_id}`);
+        const isSpec = asBool(it.is_specimen);
+        const title =
+          safeText(it.book?.title || `Book #${it.book_id}`) +
+          (isSpec ? " (SPECIMEN)" : "");
+
         const qty = num(it.qty);
         const rate = round2(it.rate);
         const disc = round2(it.discount_amount);
@@ -1009,11 +1035,17 @@ exports.create = async (request, reply) => {
     if (!invNo) return reply.code(400).send({ error: "Invoice No is required." });
 
     for (const [i, it] of items.entries()) {
-      if (num(it.rate) <= 0) return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
-    }
+        const isSpec = asBool(it.is_specimen);
+        if (!isSpec && num(it.rate) <= 0) {
+          return reply
+            .code(400)
+            .send({ error: `items[${i}].rate is required for invoice (non-specimen).` });
+        }
+      }
+
   }
 
-  const anyMissingRate = items.some((it) => num(it.rate) <= 0);
+  const anyMissingRate = items.some((it) => !asBool(it.is_specimen) && num(it.rate) <= 0);
 
   let finalStatus = requestedStatus;
   if (receive_doc_type === "INVOICE") finalStatus = "received";
@@ -1057,25 +1089,44 @@ exports.create = async (request, reply) => {
       }
     }
 
-    const calcLines = items.map((it) => {
-      const discType = it.item_discount_type || "NONE";
-      const discVal = it.item_discount_value ?? null;
+const calcLines = items.map((it) => {
+  const isSpec = asBool(it.is_specimen);
+  const reason = it.specimen_reason ? String(it.specimen_reason).trim() : null;
 
-      const line = calcItemLine({ qty: it.qty, rate: it.rate, discType, discVal });
+  const discType = isSpec ? "NONE" : (it.item_discount_type || "NONE");
+  const discVal  = isSpec ? 0 : (it.item_discount_value ?? null);
+  const rate     = isSpec ? 0 : num(it.rate);
 
-      return {
-        book_id: num(it.book_id),
-        qty: line.qty,
-        rate: line.rate,
-        item_discount_type: String(discType).toUpperCase(),
-        item_discount_value: discVal === null || discVal === undefined ? null : round2(discVal),
-        gross_amount: line.gross_amount,
-        discount_amount: line.discount_amount,
-        net_amount: line.net_amount,
-      };
-    });
+  const line = calcItemLine({
+    qty: it.qty,
+    rate,
+    discType,
+    discVal,
+    isSpecimen: isSpec,
+  });
 
-    const itemsNetSum = calcLines.reduce((s, r) => s + num(r.net_amount), 0);
+  return {
+    book_id: num(it.book_id),
+    qty: line.qty,
+    rate: line.rate,
+    item_discount_type: String(discType).toUpperCase(),
+    item_discount_value: discVal === null || discVal === undefined ? null : round2(discVal),
+    gross_amount: line.gross_amount,
+    discount_amount: line.discount_amount,
+    net_amount: line.net_amount,
+
+    is_specimen: isSpec ? 1 : 0,
+    specimen_reason: reason,
+  };
+});
+
+
+
+    const itemsNetSum = calcLines.reduce(
+      (s, r) => s + (asBool(r.is_specimen) ? 0 : num(r.net_amount)),
+      0
+    );
+
 
     const totals = calcHeaderTotals({
       itemsNetSum,
@@ -1142,6 +1193,16 @@ exports.create = async (request, reply) => {
       { transaction: t }
     );
 
+    // ✅ Sync legacy fields used by allocation validation
+    await SupplierReceiptItem.update(
+      pickAttrs(SupplierReceiptItem, {
+        received_qty: sequelize.col("qty"),
+        unit_price: sequelize.col("rate"),
+      }),
+      { where: { supplier_receipt_id: receipt.id }, transaction: t }
+    );
+
+
     // Update book master rate (if positive)
     for (const r of calcLines) {
       if (num(r.rate) > 0) {
@@ -1154,13 +1215,24 @@ exports.create = async (request, reply) => {
         book_id: num(x.book_id),
         qty: Math.max(0, Math.floor(num(x.qty))),
         rate: round2(x.rate),
+        is_specimen: asBool(x.is_specimen),
       }));
+
 
       const errMsg = validateReadyToReceive({ receipt, lineItems });
       if (errMsg) {
         await t.rollback();
         return reply.code(400).send({ error: errMsg });
       }
+      // ✅ Sync legacy fields used by allocation validation (draft -> received)
+    await SupplierReceiptItem.update(
+      pickAttrs(SupplierReceiptItem, {
+        received_qty: sequelize.col("qty"),
+        unit_price: sequelize.col("rate"),
+      }),
+      { where: { supplier_receipt_id: receipt.id }, transaction: t }
+    );
+
 
       await postIfNotPosted({ receipt, lineItems, t });
     }
@@ -1385,37 +1457,60 @@ exports.update = async (request, reply) => {
               await t.rollback();
               return reply.code(400).send({ error: "Invoice No is required for INVOICE type." });
             }
-            for (const [i, it] of items.entries()) {
-              if (num(it.rate) <= 0) {
-                await t.rollback();
-                return reply.code(400).send({ error: `items[${i}].rate is required for invoice.` });
-              }
+          for (const [i, it] of items.entries()) {
+            if (!asBool(it.is_specimen) && num(it.rate) <= 0) {
+              await t.rollback();
+              return reply.code(400).send({ error: `items[${i}].rate is required for invoice (non-specimen).` });
             }
           }
 
-          calcLines = items.map((it) => {
-            const discType = it.item_discount_type || "NONE";
-            const discVal = it.item_discount_value ?? null;
+          }
+        calcLines = items.map((it) => {
+          const isSpec = asBool(it.is_specimen);
+          const reason = it.specimen_reason ? String(it.specimen_reason).trim() : null;
 
-            const line = calcItemLine({ qty: it.qty, rate: it.rate, discType, discVal });
+          const discType = isSpec ? "NONE" : (it.item_discount_type || "NONE");
+          const discVal  = isSpec ? 0 : (it.item_discount_value ?? null);
+          const rate     = isSpec ? 0 : num(it.rate);
 
-            return {
-              book_id: num(it.book_id),
-              qty: line.qty,
-              rate: line.rate,
-              item_discount_type: String(discType).toUpperCase(),
-              item_discount_value: discVal === null || discVal === undefined ? null : round2(discVal),
-              gross_amount: line.gross_amount,
-              discount_amount: line.discount_amount,
-              net_amount: line.net_amount,
-            };
+          const line = calcItemLine({
+            qty: it.qty,
+            rate,
+            discType,
+            discVal,
+            isSpecimen: isSpec,
           });
+
+          return {
+            book_id: num(it.book_id),
+            qty: line.qty,
+            rate: line.rate,
+            item_discount_type: String(discType).toUpperCase(),
+            item_discount_value: discVal === null || discVal === undefined ? null : round2(discVal),
+            gross_amount: line.gross_amount,
+            discount_amount: line.discount_amount,
+            net_amount: line.net_amount,
+
+            is_specimen: isSpec ? 1 : 0,
+            specimen_reason: reason,
+          };
+        });
+
 
           await SupplierReceiptItem.destroy({ where: { supplier_receipt_id: receipt.id }, transaction: t });
           await SupplierReceiptItem.bulkCreate(
             calcLines.map((r) => ({ ...r, supplier_receipt_id: receipt.id })),
             { transaction: t }
           );
+
+          await SupplierReceiptItem.update(
+            pickAttrs(SupplierReceiptItem, {
+              received_qty: sequelize.col("qty"),
+              unit_price: sequelize.col("rate"),
+            }),
+            { where: { supplier_receipt_id: receipt.id }, transaction: t }
+          );
+
 
           for (const r of calcLines) {
             if (num(r.rate) > 0) {
@@ -1433,7 +1528,11 @@ exports.update = async (request, reply) => {
               lock: t.LOCK.UPDATE,
             })).map((x) => x.toJSON());
 
-          const itemsNetSum = (itemsForTotals || []).reduce((s, r) => s + num(r.net_amount), 0);
+          const itemsNetSum = (itemsForTotals || []).reduce(
+          (s, r) => s + (asBool(r.is_specimen) ? 0 : num(r.net_amount)),
+          0
+        );
+
 
           const totals = calcHeaderTotals({
             itemsNetSum,
@@ -1700,11 +1799,13 @@ exports.updateStatus = async (request, reply) => {
         })
       : [];
 
-    const lineItems = (items || []).map((x) => ({
-      book_id: num(x.book_id),
-      qty: Math.max(0, Math.floor(num(x.qty))),
-      rate: round2(x.rate),
-    }));
+      const lineItems = (items || []).map((x) => ({
+        book_id: num(x.book_id),
+        qty: Math.max(0, Math.floor(num(x.qty))),
+        rate: round2(x.rate),
+        is_specimen: asBool(x.is_specimen),
+      }));
+
 
     if (prevStatus !== "received" && nextStatus === "received") {
       const errMsg = validateReadyToReceive({ receipt, lineItems });

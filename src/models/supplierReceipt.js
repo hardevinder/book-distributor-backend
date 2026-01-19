@@ -20,7 +20,7 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
-      // ✅ NEW: Direct purchase tagging
+      // ✅ Direct purchase tagging
       school_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
@@ -139,7 +139,7 @@ module.exports = (sequelize, DataTypes) => {
         { fields: ["supplier_id", "received_date"] },
         { fields: ["supplier_id", "status"] },
         { fields: ["school_order_id"] },
-        { fields: ["school_id"] }, // ✅ NEW index
+        { fields: ["school_id"] },
         { fields: ["supplier_id", "receive_doc_type"] },
         { fields: ["supplier_id", "doc_no"] },
         { fields: ["posted_at"] },
@@ -153,7 +153,7 @@ module.exports = (sequelize, DataTypes) => {
       as: "supplier",
     });
 
-    // ✅ NEW: Direct purchase school link
+    // ✅ Direct purchase school link
     if (models.School) {
       SupplierReceipt.belongsTo(models.School, {
         foreignKey: "school_id",
@@ -172,6 +172,16 @@ module.exports = (sequelize, DataTypes) => {
       SupplierReceipt.hasMany(models.SupplierReceiptItem, {
         foreignKey: "supplier_receipt_id",
         as: "items",
+        onDelete: "CASCADE",
+        hooks: true,
+      });
+    }
+
+    // ✅ NEW: Allocations (school-wise distribution)
+    if (models.SupplierReceiptAllocation) {
+      SupplierReceipt.hasMany(models.SupplierReceiptAllocation, {
+        foreignKey: "supplier_receipt_id",
+        as: "allocations",
         onDelete: "CASCADE",
         hooks: true,
       });

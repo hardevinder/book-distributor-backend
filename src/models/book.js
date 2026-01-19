@@ -1,4 +1,5 @@
-// src/models/book.js
+"use strict";
+
 module.exports = (sequelize, DataTypes) => {
   const Book = sequelize.define(
     "Book",
@@ -97,16 +98,28 @@ module.exports = (sequelize, DataTypes) => {
 
   Book.associate = (models) => {
     // Book -> Publisher
-    Book.belongsTo(models.Publisher, {
-      foreignKey: "publisher_id",
-      as: "publisher",
-    });
+    if (models.Publisher) {
+      Book.belongsTo(models.Publisher, {
+        foreignKey: "publisher_id",
+        as: "publisher",
+      });
+    }
 
     // ✅ Book -> Supplier
-    Book.belongsTo(models.Supplier, {
-      foreignKey: "supplier_id",
-      as: "supplier",
-    });
+    if (models.Supplier) {
+      Book.belongsTo(models.Supplier, {
+        foreignKey: "supplier_id",
+        as: "supplier",
+      });
+    }
+
+    // ✅ Book -> SupplierReceiptAllocation (school-wise distribution)
+    if (models.SupplierReceiptAllocation) {
+      Book.hasMany(models.SupplierReceiptAllocation, {
+        foreignKey: "book_id",
+        as: "supplierReceiptAllocations",
+      });
+    }
   };
 
   return Book;

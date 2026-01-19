@@ -77,16 +77,28 @@ module.exports = (sequelize, DataTypes) => {
    * ============================ */
   School.associate = (models) => {
     // ✅ School → Bundles
-    School.hasMany(models.Bundle, {
-      foreignKey: "school_id",
-      as: "bundles",
-    });
+    if (models.Bundle) {
+      School.hasMany(models.Bundle, {
+        foreignKey: "school_id",
+        as: "bundles",
+      });
+    }
+
+    // ✅ School → SupplierReceipt allocations (school-wise distribution history)
+    if (models.SupplierReceiptAllocation) {
+      School.hasMany(models.SupplierReceiptAllocation, {
+        foreignKey: "school_id",
+        as: "supplierReceiptAllocations",
+      });
+    }
 
     // (Optional – future ready)
-    // School.hasMany(models.SchoolOrder, {
-    //   foreignKey: "school_id",
-    //   as: "orders",
-    // });
+    // if (models.SchoolOrder) {
+    //   School.hasMany(models.SchoolOrder, {
+    //     foreignKey: "school_id",
+    //     as: "orders",
+    //   });
+    // }
   };
 
   return School;
