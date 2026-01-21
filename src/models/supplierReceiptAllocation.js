@@ -42,6 +42,31 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      // ✅ NEW: pricing fields (optional for specimen, we will store 0)
+      rate: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0,
+      },
+
+      disc_pct: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0,
+      },
+
+      disc_amt: {
+        type: DataTypes.DECIMAL(10, 2),
+        allowNull: true,
+        defaultValue: 0,
+      },
+
+      amount: {
+        type: DataTypes.DECIMAL(12, 2),
+        allowNull: true,
+        defaultValue: 0,
+      },
+
       remarks: {
         type: DataTypes.STRING(255),
         allowNull: true,
@@ -63,13 +88,19 @@ module.exports = (sequelize, DataTypes) => {
         { name: "idx_sra_school_date", fields: ["school_id", "issued_date"] },
         { name: "idx_sra_book", fields: ["book_id"] },
 
-        // ✅ Composite index (short name)
+        // ✅ Composite for validation/summing remaining
         {
           name: "idx_sra_receipt_book_spec",
           fields: ["supplier_receipt_id", "book_id", "is_specimen"],
         },
 
-        // ✅ OPTIONAL: enforce one row per receipt+school+book+specimen (short name)
+        // ✅ Helpful for reports / school-book drilldown
+        {
+          name: "idx_sra_school_book_date",
+          fields: ["school_id", "book_id", "issued_date"],
+        },
+
+        // ✅ OPTIONAL: enforce one row per receipt+school+book+specimen (if you want strict uniqueness)
         // {
         //   name: "uq_sra_receipt_school_book_spec",
         //   unique: true,
@@ -78,6 +109,23 @@ module.exports = (sequelize, DataTypes) => {
       ],
     }
   );
+
+  // ✅ auto-clean pricing for specimen before validate/save (extra safety)
+  SupplierReceiptAllocation.addHook("beforeValidate", (row) => {
+    const isSpec = row.is_specimen === true || row.is_specimen === 1 || row.is_specimen === "1";
+    if (isSpec) {
+      row.rate = 0;
+      row.disc_pct = 0;
+      row.disc_amt = 0;
+      row.amount = 0;
+    } else {
+      // normalize nulls
+      row.rate = row.rate == null ? 0 : row.rate;
+      row.disc_pct = row.disc_pct == null ? 0 : row.disc_pct;
+      row.disc_amt = row.disc_amt == null ? 0 : row.disc_amt;
+      row.amount = row.amount == null ? 0 : row.amount;
+    }
+  });
 
   SupplierReceiptAllocation.associate = (models) => {
     // receipt

@@ -14,7 +14,7 @@ const {
 } = require("../models");
 
 /* ============================================================
- * Helpers (same style as your controller)
+ * Helpers
  * ============================================================ */
 
 const num = (v) => {
@@ -28,8 +28,6 @@ const asBool = (v) => {
   return s === "true" || s === "yes";
 };
 
-const safeText = (v) => String(v ?? "").trim();
-
 function pickAttrs(model, payload) {
   const attrs = model?.rawAttributes || {};
   const out = {};
@@ -41,6 +39,33 @@ function pickAttrs(model, payload) {
 
 function hasCol(model, col) {
   return !!(model?.rawAttributes || {})[col];
+}
+
+/**
+ * Compute allocation amount (paid only)
+ * - specimen => everything 0
+ */
+function computeAllocMoney({ qty, rate, disc_pct, disc_amt, is_specimen }) {
+  const q = Math.max(0, Math.floor(num(qty)));
+  if (asBool(is_specimen)) {
+    return { rate: 0, disc_pct: 0, disc_amt: 0, amount: 0 };
+  }
+
+  const r = Math.max(0, num(rate));
+  const dp = Math.max(0, num(disc_pct));
+  const da = Math.max(0, num(disc_amt));
+
+  const gross = q * r;
+  const pctAmt = (gross * dp) / 100;
+  const totalDisc = Math.min(gross, Math.max(0, pctAmt + da));
+  const amt = Math.max(0, gross - totalDisc);
+
+  return {
+    rate: r,
+    disc_pct: dp,
+    disc_amt: da,
+    amount: amt,
+  };
 }
 
 /* ============================================================
@@ -255,12 +280,16 @@ exports.listByReceipt = async (request, reply) => {
  * POST /api/supplier-receipts/:id/allocations
  * body: {
  *   mode: "APPEND" | "REPLACE",
- *   allocations: [{ school_id, book_id, qty, is_specimen, specimen_reason, remarks, issued_date }]
+ *   allocations: [{
+ *     school_id, book_id, qty, is_specimen,
+ *     specimen_reason, remarks, issued_date,
+ *     rate, disc_pct, disc_amt, amount
+ *   }]
  * }
  *
  * ✅ Requires receipt.status = received
  * ✅ Requires receipt.posted_at (if column exists)
- * ✅ Creates allocations
+ * ✅ Creates allocations (+ pricing fields if DB has columns)
  * ✅ Deducts inventory (FIFO) from receipt batches
  */
 exports.saveForReceipt = async (request, reply) => {
@@ -269,22 +298,47 @@ exports.saveForReceipt = async (request, reply) => {
   const mode = String(body.mode || "APPEND").trim().toUpperCase();
 
   if (!receiptId) return reply.code(400).send({ error: "Invalid receipt id" });
+  if (!["APPEND", "REPLACE"].includes(mode)) return reply.code(400).send({ error: "Invalid mode" });
 
   const incoming = Array.isArray(body.allocations) ? body.allocations : [];
+
+  // sanitize + compute amounts (paid only)
   const clean = incoming
-    .map((a) => ({
-      supplier_receipt_id: receiptId,
-      school_id: num(a.school_id),
-      book_id: num(a.book_id),
-      qty: Math.max(0, Math.floor(num(a.qty))),
-      is_specimen: asBool(a.is_specimen),
-      specimen_reason: a.specimen_reason ? String(a.specimen_reason).trim() : null,
-      remarks: a.remarks ? String(a.remarks).trim() : null,
-      issued_date: a.issued_date ? new Date(a.issued_date) : null,
-    }))
+    .map((a) => {
+      const isSpec = asBool(a.is_specimen);
+      const qty = Math.max(0, Math.floor(num(a.qty)));
+
+      const money = computeAllocMoney({
+        qty,
+        rate: a.rate,
+        disc_pct: a.disc_pct,
+        disc_amt: a.disc_amt,
+        is_specimen: isSpec,
+      });
+
+      return {
+        supplier_receipt_id: receiptId,
+        school_id: num(a.school_id),
+        book_id: num(a.book_id),
+        qty,
+        is_specimen: isSpec,
+        specimen_reason: isSpec ? (a.specimen_reason ? String(a.specimen_reason).trim() : null) : null,
+        remarks: a.remarks ? String(a.remarks).trim() : null,
+        issued_date: a.issued_date ? new Date(a.issued_date) : null,
+
+        // ✅ NEW (only saved if DB/model has columns)
+        rate: money.rate,
+        disc_pct: money.disc_pct,
+        disc_amt: money.disc_amt,
+        amount: money.amount,
+      };
+    })
     .filter((a) => a.school_id && a.book_id && a.qty > 0);
 
   if (!clean.length) return reply.code(400).send({ error: "No allocations provided" });
+
+  // Keep only cols that exist in SupplierReceiptAllocation model
+  const clean2 = clean.map((x) => pickAttrs(SupplierReceiptAllocation, x));
 
   const t = await sequelize.transaction();
   try {
@@ -308,7 +362,7 @@ exports.saveForReceipt = async (request, reply) => {
 
     // validate school ids (optional, but safer)
     if (School) {
-      const schoolIds = [...new Set(clean.map((x) => x.school_id))];
+      const schoolIds = [...new Set(clean2.map((x) => num(x.school_id)).filter(Boolean))];
       const count = await School.count({ where: { id: { [Op.in]: schoolIds } }, transaction: t });
       if (count !== schoolIds.length) {
         await t.rollback();
@@ -317,7 +371,7 @@ exports.saveForReceipt = async (request, reply) => {
     }
 
     // ✅ validate against receipt items received_qty
-    const errMsg = await validateAgainstReceiptItems({ receiptId, newAllocations: clean, mode, t });
+    const errMsg = await validateAgainstReceiptItems({ receiptId, newAllocations: clean2, mode, t });
     if (errMsg) {
       await t.rollback();
       return reply.code(400).send({ error: errMsg });
@@ -346,7 +400,7 @@ exports.saveForReceipt = async (request, reply) => {
 
     // create allocations
     const created = await SupplierReceiptAllocation.bulkCreate(
-      clean.map((x) => ({
+      clean2.map((x) => ({
         ...x,
         issued_date: x.issued_date || receipt.received_date || new Date(),
       })),
