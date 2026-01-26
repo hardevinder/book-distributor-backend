@@ -28,35 +28,61 @@ const PDFDocument = require("pdfkit"); // 🆕 for PDF printing
  *  - page (default 1)
  *  - limit (default 20)
  */
+/**
+ * GET /api/requirements
+ * Supports (all optional):
+ *  - q
+ *  - schoolId / school_id
+ *  - bookId / book_id
+ *  - classId / class_id
+ *  - class_name / className
+ *  - supplierId / supplier_id
+ *  - academic_session
+ *  - status
+ *  - publisherId / publisher_id
+ *  - publisher / publisher_name
+ *  - page, limit
+ */
 exports.getRequirements = async (request, reply) => {
   try {
-    const {
-      q,
-      schoolId,
-      bookId,
-      classId,
-      supplierId,
-      academic_session,
-      status,
-      publisherId,
-      page = 1,
-      limit = 20,
-    } = request.query || {};
+    const query = request.query || {};
+
+    // ---- accept aliases from frontend safely ----
+    const q = query.q;
+
+    const schoolId = query.schoolId ?? query.school_id;
+    const bookId = query.bookId ?? query.book_id;
+    const classId = query.classId ?? query.class_id;
+    const supplierId = query.supplierId ?? query.supplier_id;
+
+    const academic_session = query.academic_session;
+    const status = query.status;
+
+    // publisher aliases
+    const publisherId = query.publisherId ?? query.publisher_id ?? query.book_publisher_id;
+    const publisherName = query.publisher ?? query.publisher_name;
+
+    // class aliases (name)
+    const className = query.class_name ?? query.className;
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
 
     const where = {};
 
     if (schoolId) where.school_id = Number(schoolId);
     if (bookId) where.book_id = Number(bookId);
-    if (classId) where.class_id = Number(classId);
     if (supplierId) where.supplier_id = Number(supplierId);
     if (academic_session) where.academic_session = String(academic_session);
     if (status) where.status = String(status);
 
+    // include graph
     const include = [
       {
         model: School,
         as: "school",
         attributes: ["id", "name"],
+        required: true, // default
       },
       {
         model: Supplier,
@@ -67,12 +93,14 @@ exports.getRequirements = async (request, reply) => {
       {
         model: Book,
         as: "book",
-        attributes: ["id", "title", "publisher_id"],
+        attributes: ["id", "title", "publisher_id", "class_name"],
+        required: true, // default
         include: [
           {
             model: Publisher,
             as: "publisher",
-            attributes: ["id", "name"], // ✅ removed supplier
+            attributes: ["id", "name"],
+            required: false,
           },
         ],
       },
@@ -80,33 +108,68 @@ exports.getRequirements = async (request, reply) => {
         model: Class,
         as: "class",
         attributes: ["id", "class_name", "sort_order"],
+        required: false,
       },
     ];
 
-    // 🔍 text search across school + book title
-    if (q && String(q).trim()) {
-      const search = String(q).trim();
-
-      include[0].where = {
-        ...(include[0].where || {}),
-        name: { [Op.like]: `%${search}%` },
+    // ---- CLASS FILTER (id OR name) ----
+    // If classId provided: filter requirement.class_id
+    if (classId) {
+      where.class_id = Number(classId);
+    } else if (className && String(className).trim()) {
+      // filter by joined Class table (preferred)
+      include[3].where = {
+        ...(include[3].where || {}),
+        class_name: { [Op.like]: `%${String(className).trim()}%` },
       };
-      include[0].required = false;
+      include[3].required = true;
 
-      include[2].where = {
-        ...(include[2].where || {}),
-        title: { [Op.like]: `%${search}%` },
-      };
-      include[2].required = false;
+      // OPTIONAL: if some records rely on book.class_name instead of class relation
+      // keep them too by NOT excluding book.class_name matches
+      // (If you want strict only Class table, remove this OR block)
+      where[Op.or] = [
+        ...(where[Op.or] || []),
+        { "$class.class_name$": { [Op.like]: `%${String(className).trim()}%` } },
+        { "$book.class_name$": { [Op.like]: `%${String(className).trim()}%` } },
+      ];
     }
 
-    // 🔹 Filter by publisher (via Book.publisher_id)
+    // ---- PUBLISHER FILTER (id OR name) ----
     if (publisherId) {
       include[2].where = {
         ...(include[2].where || {}),
         publisher_id: Number(publisherId),
       };
       include[2].required = true;
+    } else if (publisherName && String(publisherName).trim()) {
+      include[2].include[0].where = {
+        ...(include[2].include[0].where || {}),
+        name: { [Op.like]: `%${String(publisherName).trim()}%` },
+      };
+      include[2].include[0].required = true;
+      include[2].required = true;
+    }
+
+    // ---- TEXT SEARCH (q) across school + book title + publisher + supplier ----
+    if (q && String(q).trim()) {
+      const search = String(q).trim();
+
+      // Make includes optional so OR can work (otherwise it becomes AND-like)
+      include[0].required = false;
+      include[2].required = false;
+      include[2].include[0].required = false;
+      include[1].required = false;
+      include[3].required = false;
+
+      // Apply OR on joined columns
+      where[Op.or] = [
+        ...(where[Op.or] || []),
+        { "$school.name$": { [Op.like]: `%${search}%` } },
+        { "$book.title$": { [Op.like]: `%${search}%` } },
+        { "$book->publisher.name$": { [Op.like]: `%${search}%` } },
+        { "$supplier.name$": { [Op.like]: `%${search}%` } },
+        { "$class.class_name$": { [Op.like]: `%${search}%` } },
+      ];
     }
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -120,6 +183,8 @@ exports.getRequirements = async (request, reply) => {
       limit: pageSize,
       offset,
       distinct: true,
+      // this makes "$school.name$" etc work reliably in Sequelize
+      subQuery: false,
     });
 
     return reply.send({
@@ -139,6 +204,7 @@ exports.getRequirements = async (request, reply) => {
     });
   }
 };
+
 
 /**
  * GET /api/requirements/:id

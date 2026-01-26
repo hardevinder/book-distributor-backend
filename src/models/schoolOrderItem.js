@@ -1,4 +1,5 @@
 // src/models/schoolOrderItem.js
+"use strict";
 
 module.exports = (sequelize, DataTypes) => {
   const SchoolOrderItem = sequelize.define(
@@ -26,13 +27,22 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: 0,
       },
 
+      // ✅ Normal received (non-specimen)
       received_qty: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
         defaultValue: 0,
       },
 
-      // ✅ NEW: qty shifted to re-order (do NOT delete history)
+      // ✅ NEW: Specimen received (kept separate from received_qty)
+      specimen_received_qty: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: false,
+        defaultValue: 0,
+        comment: "Specimen qty received (do not mix with received_qty)",
+      },
+
+      // ✅ qty shifted to re-order (do NOT delete history)
       reordered_qty: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
@@ -70,6 +80,14 @@ module.exports = (sequelize, DataTypes) => {
     {
       tableName: "school_order_items",
       timestamps: true,
+      indexes: [
+        // speeds up lookups used in bumpOrderReceivedQty()
+        { fields: ["school_order_id", "book_id"], unique: true },
+
+        // optional but useful for reports
+        { fields: ["school_order_id"] },
+        { fields: ["book_id"] },
+      ],
     }
   );
 

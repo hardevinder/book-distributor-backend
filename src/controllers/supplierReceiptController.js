@@ -995,8 +995,13 @@ exports.create = async (request, reply) => {
   const body = request.body || {};
 
   const supplier_id = num(body.supplier_id);
-  const school_order_id = body.school_order_id ? num(body.school_order_id) : null;
-  const school_id = body.school_id ? num(body.school_id) : null; // ✅ optional for DIRECT purchase
+  // ✅ accept both snake_case + camelCase, and treat 0/"0"/"" as null
+  const soNum = num(body.school_order_id ?? body.schoolOrderId);
+  const school_order_id = soNum > 0 ? soNum : null;
+
+  const schoolNum = num(body.school_id ?? body.schoolId);
+  const school_id = schoolNum > 0 ? schoolNum : null; // ✅ optional for DIRECT purchase
+
 
   const receive_doc_type = normalizeDocType(body.receive_doc_type);
   const doc_no = body.doc_no != null ? String(body.doc_no).trim() : null;
@@ -1295,7 +1300,9 @@ exports.update = async (request, reply) => {
         return reply.code(400).send({ error: "school_order_id can be changed only for DRAFT (not posted) receipt." });
       }
 
-      const nextSo = body.school_order_id ? num(body.school_order_id) : null;
+      const nextSoNum = num(body.school_order_id ?? body.schoolOrderId);
+      const nextSo = nextSoNum > 0 ? nextSoNum : null;
+
 
       if (nextSo) {
         if (SchoolOrder) {
@@ -1317,7 +1324,7 @@ exports.update = async (request, reply) => {
     }
 
     // ✅ Allow school_id update ONLY for DIRECT receipts, DRAFT, not posted
-    if (body.school_id !== undefined && attrs.school_id) {
+    if ((body.school_id !== undefined || body.schoolId !== undefined) && attrs.school_id) {
       if (isPosted || prevStatus !== "draft") {
         await t.rollback();
         return reply.code(400).send({ error: "school_id can be changed only for DRAFT (not posted) receipt." });
@@ -1329,7 +1336,9 @@ exports.update = async (request, reply) => {
         return reply.code(400).send({ error: "school_id cannot be set when school_order_id is present." });
       }
 
-      const nextSchoolId = body.school_id ? num(body.school_id) : null;
+      const nextSchoolIdNum = num(body.school_id ?? body.schoolId);
+      const nextSchoolId = nextSchoolIdNum > 0 ? nextSchoolIdNum : null;
+
       if (nextSchoolId) {
         if (!School) {
           await t.rollback();
