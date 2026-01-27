@@ -224,8 +224,11 @@ exports.listSchoolOrders = async (request, reply) => {
     if (order_source) {
     const src = String(order_source).trim();
     const allowed = ["email", "whatsapp", "phone", "post", "in_person", "other"];
-    if (allowed.includes(src)) where.order_source = src;
+    if (allowed.includes(src)) {
+      where.order_source = src;
+    }
   }
+
 
 
 
@@ -396,8 +399,9 @@ exports.generateOrdersForSession = async (request, reply) => {
             continue;
           }
 
-          const hasReceived = (existing.items || []).some((it) => Number(it.received_qty || 0) > 0);
-          if (hasReceived) {
+         const hasReceived = (existing.items || []).some((it) => Number(it.received_qty || 0) > 0);
+          const hasReordered = (existing.items || []).some((it) => Number(it.reordered_qty || 0) > 0);
+          if (hasReceived || hasReordered) {
             skippedOrders.push({
               order_id: existing.id,
               order_no: existing.order_no,
@@ -405,10 +409,11 @@ exports.generateOrdersForSession = async (request, reply) => {
               supplier_id: existing.supplier_id,
               academic_session: existing.academic_session,
               status: existing.status,
-              reason: "Has received qty; not auto-updating original",
+              reason: "Has received/reordered qty; not auto-updating original",
             });
             continue;
           }
+
 
           const existingItemsByBook = new Map();
           for (const it of existing.items || []) existingItemsByBook.set(Number(it.book_id), it);
@@ -429,11 +434,14 @@ exports.generateOrdersForSession = async (request, reply) => {
 
             let item = existingItemsByBook.get(bookId);
 
-            if (item) {
-              item.total_order_qty = qty;
-              item.received_qty = 0;
-              await item.save({ transaction: t });
-            } else {
+        if (item) {
+            item.total_order_qty = qty;
+            item.received_qty = 0;
+            if ("reordered_qty" in item) item.reordered_qty = 0; // ✅ add
+            await item.save({ transaction: t });
+          }
+
+            else {
               item = await SchoolOrderItem.create(
                 {
                   school_order_id: existing.id,
@@ -565,6 +573,387 @@ exports.generateOrdersForSession = async (request, reply) => {
     });
   }
 };
+/* ============================================
+ * ✅ NEW: POST /api/school-orders/sync-from-requirements
+ * Sync ONE (school + supplier + session) original order
+ * Updates existing if not received; else tells to create reorder
+ * body: { academic_session, school_id, supplier_id }
+ * ============================================ */
+exports.syncOrderFromRequirements = async (request, reply) => {
+  const { academic_session, school_id, supplier_id } = request.body || {};
+
+  const session = String(academic_session || "").trim();
+  const schoolId = Number(school_id || 0);
+  const supplierId = Number(supplier_id || 0);
+
+  // ✅ 1) session + school are always required
+  if (!session || !schoolId) {
+    return reply.code(400).send({
+      error: "ValidationError",
+      message: "academic_session and school_id are required.",
+    });
+  }
+
+  // ✅ 2) if supplier_id missing -> sync ALL suppliers for this school/session
+  if (!supplierId) {
+    const fakeReq = { ...request, body: { academic_session: session, school_id: schoolId } };
+    return exports.syncSchoolSessionFromRequirements(fakeReq, reply);
+  }
+
+  const t = await sequelize.transaction();
+
+  try {
+    // 1) Load confirmed requirements for this (session+school+supplier)
+    const reqWhere = {
+      academic_session: session,
+      school_id: schoolId,
+      status: "confirmed",
+    };
+
+    // If your requirements are supplier-specific, keep it ON (recommended)
+    if ("supplier_id" in SchoolBookRequirement) reqWhere.supplier_id = supplierId;
+
+    const requirements = await SchoolBookRequirement.findAll({
+      where: reqWhere,
+      include: [
+        {
+          model: Book,
+          as: "book",
+          include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+        },
+      ],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (!requirements.length) {
+      await t.rollback();
+      return reply.code(200).send({
+        message: "No confirmed requirements found for this school/supplier/session.",
+        academic_session: session,
+        school_id: schoolId,
+        supplier_id: supplierId,
+        created: false,
+        updated: false,
+        skipped: true,
+        reason: "No requirements",
+      });
+    }
+
+    // 2) Build desired books map: book_id -> total required_copies
+    const bookQtyMap = new Map(); // bookId -> totalQty
+    const reqRowsByBook = new Map(); // bookId -> [reqRows]
+
+    for (const rr of requirements) {
+      const book = rr.book;
+      if (!book?.id) continue;
+
+      const qty = Number(rr.required_copies || 0);
+      if (!qty || qty <= 0) continue;
+
+      const bookId = Number(book.id);
+      bookQtyMap.set(bookId, (Number(bookQtyMap.get(bookId)) || 0) + qty);
+
+      if (!reqRowsByBook.has(bookId)) reqRowsByBook.set(bookId, []);
+      reqRowsByBook.get(bookId).push(rr);
+    }
+
+    if (!bookQtyMap.size) {
+      await t.rollback();
+      return reply.code(200).send({
+        message: "Requirements exist but no positive required_copies found.",
+        academic_session: session,
+        school_id: schoolId,
+        supplier_id: supplierId,
+        created: false,
+        updated: false,
+        skipped: true,
+        reason: "Zero quantities",
+      });
+    }
+
+    const desiredSignature = buildItemsSignatureFromMap(bookQtyMap);
+
+    // 3) Find existing ORIGINAL order (not cancelled) for this tuple
+    const existing = await SchoolOrder.findOne({
+      where: {
+        school_id: schoolId,
+        supplier_id: supplierId,
+        academic_session: session,
+        status: { [Op.ne]: "cancelled" },
+        order_type: "original",
+      },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      order: [["createdAt", "DESC"]],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    // 4) If exists, decide update/skip/block
+    if (existing) {
+      const existingSig = buildItemsSignatureFromOrderItems(existing.items || []);
+
+      if (existingSig === desiredSignature) {
+        await t.rollback();
+        return reply.code(200).send({
+          message: "No changes. Order already matches requirements.",
+          academic_session: session,
+          school_id: schoolId,
+          supplier_id: supplierId,
+          created: false,
+          updated: false,
+          skipped: true,
+          order_id: existing.id,
+          order_no: existing.order_no,
+          reason: "No changes",
+        });
+      }
+
+      const hasReceived = (existing.items || []).some((it) => Number(it.received_qty || 0) > 0);
+      const hasReordered = (existing.items || []).some((it) => Number(it.reordered_qty || 0) > 0);
+
+      // ✅ If movement exists, do NOT edit original
+      if (hasReceived || hasReordered) {
+        await t.rollback();
+        return reply.code(409).send({
+          error: "NotEditable",
+          message:
+            "This original order already has received/reordered movement. Create a re-order/adjustment order instead of editing the original.",
+          academic_session: session,
+          school_id: schoolId,
+          supplier_id: supplierId,
+          order_id: existing.id,
+          order_no: existing.order_no,
+        });
+      }
+
+      // 4a) Update items to match requirements (and rebuild links)
+      const existingItemsByBook = new Map();
+      for (const it of existing.items || []) existingItemsByBook.set(Number(it.book_id), it);
+
+      // Clear links for old items first (we’ll rebuild clean)
+      const oldItemIds = (existing.items || []).map((x) => x.id);
+      if (oldItemIds.length) {
+        await SchoolRequirementOrderLink.destroy({
+          where: { school_order_item_id: oldItemIds },
+          transaction: t,
+        });
+      }
+
+      const linksToCreate = [];
+
+      // Upsert / update required items
+      for (const [bookIdRaw, totalQtyRaw] of bookQtyMap.entries()) {
+        const bookId = Number(bookIdRaw);
+        const qty = Number(totalQtyRaw || 0);
+
+        let item = existingItemsByBook.get(bookId);
+
+        if (item) {
+          item.total_order_qty = qty;
+          item.received_qty = 0;
+          if ("reordered_qty" in item) item.reordered_qty = 0;
+          await item.save({ transaction: t });
+        } else {
+          item = await SchoolOrderItem.create(
+            {
+              school_order_id: existing.id,
+              book_id: bookId,
+              total_order_qty: qty,
+              received_qty: 0,
+              reordered_qty: 0,
+            },
+            { transaction: t }
+          );
+        }
+
+        // Build allocations from req rows (exact per requirement row)
+        const reqRows = reqRowsByBook.get(bookId) || [];
+        for (const rr of reqRows) {
+          const rqQty = Number(rr.required_copies || 0);
+          if (!rqQty || rqQty <= 0) continue;
+
+          linksToCreate.push({
+            requirement_id: rr.id,
+            school_order_item_id: item.id,
+            allocated_qty: rqQty,
+          });
+        }
+      }
+
+      // Remove items no longer in requirements
+      for (const it of existing.items || []) {
+        const bId = Number(it.book_id);
+        if (!bookQtyMap.has(bId)) {
+          await SchoolRequirementOrderLink.destroy({
+            where: { school_order_item_id: it.id },
+            transaction: t,
+          });
+          await it.destroy({ transaction: t });
+        }
+      }
+
+      if (linksToCreate.length) {
+        await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
+      }
+
+      await recomputeOrderStatus(existing, t);
+
+      await t.commit();
+
+      const updated = await SchoolOrder.findOne({
+        where: { id: existing.id },
+        include: [
+          { model: School, as: "school" },
+          { model: Supplier, as: "supplier" },
+          {
+            model: SchoolOrderItem,
+            as: "items",
+            include: [
+              {
+                model: Book,
+                as: "book",
+                include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+              },
+            ],
+          },
+          { model: Transport, as: "transport" },
+          ...(SchoolOrder.associations?.transport2 ? [{ model: Transport, as: "transport2" }] : []),
+        ],
+      });
+
+      const plain = updated.toJSON();
+      plain.items =
+        (plain.items || []).map((it) => {
+          const ordered = Number(it.total_order_qty) || 0;
+          const received = Number(it.received_qty) || 0;
+          const reordered = Number(it.reordered_qty) || 0;
+          const pending = Math.max(ordered - received - reordered, 0);
+          return { ...it, pending_qty: pending };
+        }) || [];
+
+      return reply.code(200).send({
+        message: "Order updated from requirements successfully.",
+        academic_session: session,
+        school_id: schoolId,
+        supplier_id: supplierId,
+        created: false,
+        updated: true,
+        skipped: false,
+        order: plain,
+      });
+    }
+
+    // 5) If no existing order -> create new ORIGINAL order
+    const orderNo = await generateUniqueOrderNo(t);
+
+    const createdOrder = await SchoolOrder.create(
+      {
+        school_id: schoolId,
+        supplier_id: supplierId,
+        order_no: orderNo,
+        academic_session: session,
+        order_date: new Date(),
+        status: "draft",
+        order_type: "original",
+        parent_order_id: null,
+        reorder_seq: null,
+      },
+      { transaction: t }
+    );
+
+    const linksToCreate = [];
+
+    for (const [bookIdRaw, totalQtyRaw] of bookQtyMap.entries()) {
+      const bookId = Number(bookIdRaw);
+      const qty = Number(totalQtyRaw || 0);
+      if (!qty || qty <= 0) continue;
+
+      const item = await SchoolOrderItem.create(
+        {
+          school_order_id: createdOrder.id,
+          book_id: bookId,
+          total_order_qty: qty,
+          received_qty: 0,
+          reordered_qty: 0,
+        },
+        { transaction: t }
+      );
+
+      const reqRows = reqRowsByBook.get(bookId) || [];
+      for (const rr of reqRows) {
+        const rqQty = Number(rr.required_copies || 0);
+        if (!rqQty || rqQty <= 0) continue;
+
+        linksToCreate.push({
+          requirement_id: rr.id,
+          school_order_item_id: item.id,
+          allocated_qty: rqQty,
+        });
+      }
+    }
+
+    if (linksToCreate.length) {
+      await SchoolRequirementOrderLink.bulkCreate(linksToCreate, { transaction: t });
+    }
+
+    await recomputeOrderStatus(createdOrder, t);
+
+    await t.commit();
+
+    const full = await SchoolOrder.findOne({
+      where: { id: createdOrder.id },
+      include: [
+        { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
+        {
+          model: SchoolOrderItem,
+          as: "items",
+          include: [
+            {
+              model: Book,
+              as: "book",
+              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+            },
+          ],
+        },
+        { model: Transport, as: "transport" },
+        ...(SchoolOrder.associations?.transport2 ? [{ model: Transport, as: "transport2" }] : []),
+      ],
+    });
+
+    const plain = full.toJSON();
+    plain.items =
+      (plain.items || []).map((it) => {
+        const ordered = Number(it.total_order_qty) || 0;
+        const received = Number(it.received_qty) || 0;
+        const reordered = Number(it.reordered_qty) || 0;
+        const pending = Math.max(ordered - received - reordered, 0);
+        return { ...it, pending_qty: pending };
+      }) || [];
+
+    return reply.code(201).send({
+      message: "Order created from requirements successfully.",
+      academic_session: session,
+      school_id: schoolId,
+      supplier_id: supplierId,
+      created: true,
+      updated: false,
+      skipped: false,
+      order: plain,
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+    request.log.error({ err }, "Error in syncOrderFromRequirements");
+    return reply.code(500).send({
+      error: "Error",
+      message: err.message || "Failed to sync order from requirements.",
+    });
+  }
+};
+
 
 /* ============================================
  * PATCH /api/school-orders/:orderId/meta
@@ -600,21 +989,28 @@ exports.updateSchoolOrderMeta = async (request, reply) => {
       order.notes = notes === null || notes === "" ? null : String(notes).trim();
     }
 
-    // ✅ notes_2 (note 2)
+    // notes_2
     if (typeof notes_2 !== "undefined") {
-      order.notes_2 = notes_2 === null || notes_2 === "" ? null : String(notes_2).trim();
+      if ("notes_2" in order) {
+        order.notes_2 = notes_2 === null || notes_2 === "" ? null : String(notes_2).trim();
+      }
     }
-    // ✅ remarks (free text)
-      if (typeof remarks !== "undefined") {
+
+    // remarks
+    if (typeof remarks !== "undefined") {
+      if ("remarks" in order) {
         order.remarks = remarks === null || remarks === "" ? null : String(remarks).trim();
       }
+    }
 
-      // ✅ order_source (enum)
-      if (typeof order_source !== "undefined") {
+    // order_source
+    if (typeof order_source !== "undefined") {
+      if ("order_source" in order) {
         const src = String(order_source || "").trim();
         const allowed = ["email", "whatsapp", "phone", "post", "in_person", "other"];
         order.order_source = allowed.includes(src) ? src : "email";
       }
+    }
 
 
     await order.save();
@@ -2930,3 +3326,356 @@ exports.printSupplierOrderIndexPdf = async (request, reply) => {
     });
   }
 };
+
+
+/* ============================================
+ * PATCH /api/school-orders/:orderId/items
+ * ✅ Manual edit: add/update/remove items
+ * ✅ FULL SYNC to SchoolRequirementOrderLink (rebuild allocations)
+ * body: { items: [{ book_id, total_order_qty }] }
+ * ============================================ */
+exports.updateSchoolOrderItems = async (request, reply) => {
+  const { orderId } = request.params;
+  const { items } = request.body || {};
+
+  if (!Array.isArray(items) || !items.length) {
+    return reply.code(400).send({
+      error: "ValidationError",
+      message: "items array is required. Example: { items: [{ book_id, total_order_qty }] }",
+    });
+  }
+
+  const t = await sequelize.transaction();
+
+  try {
+    const order = await SchoolOrder.findOne({
+      where: { id: Number(orderId) },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (!order) {
+      await t.rollback();
+      return reply.code(404).send({ message: "School order not found." });
+    }
+
+    if (order.status === "cancelled") {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "InvalidState",
+        message: "Cancelled order cannot be edited.",
+      });
+    }
+
+    // ✅ If ANY movement exists, block editing original order (force reorder flow)
+    const hasAnyReceived = (order.items || []).some((it) => Number(it.received_qty || 0) > 0);
+    const hasAnyReordered = (order.items || []).some((it) => Number(it.reordered_qty || 0) > 0);
+
+    if ((hasAnyReceived || hasAnyReordered) && order.order_type === "original") {
+      await t.rollback();
+      return reply.code(409).send({
+        error: "NotEditable",
+        message:
+          "This original order already has received/reordered movement. Please create a re-order/adjustment order instead of editing the original.",
+      });
+    }
+
+
+// Normalize input by book_id (last wins)
+// ✅ Accept BOTH: { book_id, total_order_qty } OR { item_id, total_order_qty }
+const inputMap = new Map();
+
+// build quick lookup: item_id -> book_id (from current order items)
+const existingItemById = new Map();
+for (const it of order.items || []) existingItemById.set(Number(it.id), it);
+
+for (const row of items) {
+  let bookId = Number(row?.book_id || 0);
+
+  // fallback: resolve book_id from item_id
+  if (!bookId) {
+    const itemId = Number(row?.item_id || 0);
+    const ex = existingItemById.get(itemId);
+    if (ex) bookId = Number(ex.book_id || 0);
+  }
+
+  if (!bookId) continue;
+
+  let qty = Number(row?.total_order_qty ?? row?.qty ?? 0);
+  if (!Number.isFinite(qty) || qty < 0) qty = 0;
+
+  inputMap.set(bookId, qty);
+}
+
+
+    if (!inputMap.size) {
+      await t.rollback();
+      return reply.code(400).send({ message: "No valid book_id found in items." });
+    }
+
+    // Existing items by book
+    const existingByBook = new Map();
+    for (const it of order.items || []) existingByBook.set(Number(it.book_id), it);
+
+    // --------- Apply upserts + deletions ----------
+    // Track which item IDs need link rebuild
+    const touchedItemIds = new Set();
+    const removedItemIds = [];
+
+    for (const [bookId, desiredQtyRaw] of inputMap.entries()) {
+      const existing = existingByBook.get(bookId);
+
+      if (existing) {
+        const received = Number(existing.received_qty || 0);
+        const reordered = Number(existing.reordered_qty || 0);
+
+        // Minimum qty cannot go below received+reordered
+        const minAllowed = Math.max(received + reordered, 0);
+
+        const desiredQty = Math.max(Number(desiredQtyRaw || 0), 0);
+
+        // If user is trying to remove but received/reordered exist → block
+        if (desiredQty <= 0 && minAllowed > 0) {
+          throw new Error(
+            `Cannot remove Book #${bookId} because received/reordered exists (min allowed qty = ${minAllowed}).`
+          );
+        }
+
+        // Clamp to minAllowed
+        const finalQty = Math.max(desiredQty, minAllowed);
+
+        // If finalQty = 0 → delete item + links
+        if (finalQty === 0) {
+          removedItemIds.push(existing.id);
+          await SchoolRequirementOrderLink.destroy({
+            where: { school_order_item_id: existing.id },
+            transaction: t,
+          });
+          await existing.destroy({ transaction: t });
+        } else {
+          existing.total_order_qty = finalQty;
+          await existing.save({ transaction: t });
+          touchedItemIds.add(existing.id);
+        }
+      } else {
+        // New item: only create if qty > 0
+        const desiredQty = Math.max(Number(desiredQtyRaw || 0), 0);
+        if (desiredQty <= 0) continue;
+
+        const created = await SchoolOrderItem.create(
+          {
+            school_order_id: order.id,
+            book_id: bookId,
+            total_order_qty: desiredQty,
+            received_qty: 0,
+            reordered_qty: 0,
+          },
+          { transaction: t }
+        );
+
+        touchedItemIds.add(created.id);
+      }
+    }
+
+    // --------- Rebuild links for all current items (or at least touched) ----------
+    // For correctness with requirements sync, we rebuild per affected book.
+    // We allocate requirement rows sequentially until order qty is filled (any extra req remains unlinked).
+    // If order qty > sum(req), remaining qty stays unallocated (that’s okay).
+    const freshOrder = await SchoolOrder.findOne({
+      where: { id: order.id },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    const currentItems = freshOrder?.items || [];
+
+    // Load requirements for this order context
+    const reqWhere = {
+      status: "confirmed",
+      school_id: freshOrder.school_id,
+      academic_session: freshOrder.academic_session || null,
+    };
+
+    // If your requirements are supplier-specific, keep this ON (recommended)
+    if ("supplier_id" in SchoolBookRequirement && freshOrder.supplier_id) {
+      reqWhere.supplier_id = freshOrder.supplier_id;
+    }
+
+    const reqRows = await SchoolBookRequirement.findAll({
+      where: reqWhere,
+      attributes: ["id", "book_id", "required_copies"],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    // Group requirements by book_id
+    const reqByBook = new Map();
+    for (const rr of reqRows || []) {
+      const bId = Number(rr.book_id || 0);
+      if (!bId) continue;
+      if (!reqByBook.has(bId)) reqByBook.set(bId, []);
+      reqByBook.get(bId).push(rr);
+    }
+
+    // Rebuild links for each current item
+    for (const it of currentItems) {
+      const itemId = it.id;
+      const bookId = Number(it.book_id);
+      const totalQty = Number(it.total_order_qty || 0);
+
+      // Clear old links
+      await SchoolRequirementOrderLink.destroy({
+        where: { school_order_item_id: itemId },
+        transaction: t,
+      });
+
+      if (totalQty <= 0) continue;
+
+      const list = reqByBook.get(bookId) || [];
+      if (!list.length) continue;
+
+      // Allocate sequentially (cap at totalQty)
+      let remaining = totalQty;
+      const rowsToCreate = [];
+
+      for (const rr of list) {
+        if (remaining <= 0) break;
+        const rq = Number(rr.required_copies || 0);
+        if (rq <= 0) continue;
+
+        const alloc = Math.min(rq, remaining);
+        if (alloc <= 0) continue;
+
+        rowsToCreate.push({
+          requirement_id: rr.id,
+          school_order_item_id: itemId,
+          allocated_qty: alloc,
+        });
+
+        remaining -= alloc;
+      }
+
+      if (rowsToCreate.length) {
+        await SchoolRequirementOrderLink.bulkCreate(rowsToCreate, { transaction: t });
+      }
+    }
+
+    // --------- Status recompute ----------
+    await recomputeOrderStatus(freshOrder, t);
+
+    const updated = await SchoolOrder.findOne({
+      where: { id: order.id },
+      include: [
+        { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
+        {
+          model: SchoolOrderItem,
+          as: "items",
+          include: [
+            {
+              model: Book,
+              as: "book",
+              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+            },
+          ],
+        },
+        { model: Transport, as: "transport" },
+        ...(SchoolOrder.associations?.transport2 ? [{ model: Transport, as: "transport2" }] : []),
+      ],
+      transaction: t,
+    });
+
+    await t.commit();
+
+    const plain = updated.toJSON();
+    plain.items =
+      (plain.items || []).map((it) => {
+        const ordered = Number(it.total_order_qty) || 0;
+        const received = Number(it.received_qty) || 0;
+        const reordered = Number(it.reordered_qty) || 0;
+        const pending = Math.max(ordered - received - reordered, 0);
+        return { ...it, pending_qty: pending };
+      }) || [];
+
+    return reply.code(200).send({
+      message: "Order items updated successfully (items + requirement links synced).",
+      order: plain,
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+    request.log.error({ err }, "Error in updateSchoolOrderItems");
+    return reply.code(500).send({
+      error: "Error",
+      message: err.message || "Failed to update order items.",
+    });
+  }
+};
+exports.syncSchoolSessionFromRequirements = async (req, reply) => {
+  try {
+    const { academic_session, school_id } = req.body || {};
+
+    if (!academic_session || !school_id) {
+      return reply.code(400).send({
+        message: "academic_session and school_id are required.",
+      });
+    }
+
+   const reqRows = await SchoolBookRequirement.findAll({
+  where: { academic_session, school_id, status: "confirmed" },
+  attributes: ["supplier_id"],
+  group: ["supplier_id"],
+  raw: true,
+});
+
+
+    const supplierIds = reqRows
+      .map((r) => Number(r.supplier_id))
+      .filter((x) => Number.isFinite(x) && x > 0);
+
+    if (!supplierIds.length) {
+      return reply.send({
+        message: "No requirements found for this school/session.",
+        suppliers: 0,
+      });
+    }
+
+    const results = [];
+    for (const supplier_id of supplierIds) {
+      // ✅ use your existing single-sync controller by calling it with fake req/reply
+      // (so you don't need syncOneOrderFromRequirements)
+      const fakeReq = { ...req, body: { academic_session, school_id, supplier_id } };
+
+      // capture response from syncOrderFromRequirements
+      let captured = null;
+      const fakeReply = {
+        code: (c) => ({
+          send: (p) => {
+            captured = { statusCode: c, payload: p };
+            return captured;
+          },
+        }),
+        send: (p) => {
+          captured = { statusCode: 200, payload: p };
+          return captured;
+        },
+      };
+
+      await exports.syncOrderFromRequirements(fakeReq, fakeReply);
+      results.push({ supplier_id, ...captured });
+    }
+
+    return reply.send({
+      message: `Synced ${results.length} supplier order(s) from requirements.`,
+      suppliers: results.length,
+      results,
+    });
+  } catch (e) {
+    console.error("syncSchoolSessionFromRequirements error:", e);
+    return reply.code(500).send({ message: "Sync school session failed.", error: e.message });
+  }
+};
+

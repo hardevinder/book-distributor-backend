@@ -1,5 +1,7 @@
 // controllers/schoolBookRequirementController.js
 
+"use strict";
+
 const {
   SchoolBookRequirement,
   School,
@@ -14,20 +16,31 @@ const XLSX = require("xlsx");
 const ExcelJS = require("exceljs");
 const PDFDocument = require("pdfkit"); // 🆕 for PDF printing
 
-/**
- * GET /api/requirements
- * Query params:
- *  - q: text search (school name / book title)
- *  - schoolId
- *  - bookId
- *  - classId
- *  - supplierId
- *  - academic_session
- *  - status (draft / confirmed)
- *  - publisherId (filter by book.publisher_id)
- *  - page (default 1)
- *  - limit (default 20)
- */
+/* ===========================
+ * Small helpers
+ * =========================== */
+
+const toInt = (v) => {
+  if (v === "" || v === null || typeof v === "undefined") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+};
+
+const toStr = (v) => {
+  if (v === "" || v === null || typeof v === "undefined") return null;
+  return String(v);
+};
+
+const truthy = (v) => {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v === 1;
+  if (typeof v === "string") {
+    const s = v.toLowerCase().trim();
+    return ["1", "true", "yes", "y", "locked", "on"].includes(s);
+  }
+  return Boolean(v);
+};
+
 /**
  * GET /api/requirements
  * Supports (all optional):
@@ -59,7 +72,8 @@ exports.getRequirements = async (request, reply) => {
     const status = query.status;
 
     // publisher aliases
-    const publisherId = query.publisherId ?? query.publisher_id ?? query.book_publisher_id;
+    const publisherId =
+      query.publisherId ?? query.publisher_id ?? query.book_publisher_id;
     const publisherName = query.publisher ?? query.publisher_name;
 
     // class aliases (name)
@@ -82,7 +96,7 @@ exports.getRequirements = async (request, reply) => {
         model: School,
         as: "school",
         attributes: ["id", "name"],
-        required: true, // default
+        required: true,
       },
       {
         model: Supplier,
@@ -94,7 +108,7 @@ exports.getRequirements = async (request, reply) => {
         model: Book,
         as: "book",
         attributes: ["id", "title", "publisher_id", "class_name"],
-        required: true, // default
+        required: true,
         include: [
           {
             model: Publisher,
@@ -113,24 +127,23 @@ exports.getRequirements = async (request, reply) => {
     ];
 
     // ---- CLASS FILTER (id OR name) ----
-    // If classId provided: filter requirement.class_id
     if (classId) {
       where.class_id = Number(classId);
     } else if (className && String(className).trim()) {
-      // filter by joined Class table (preferred)
+      const cn = String(className).trim();
+
+      // filter by joined Class table
       include[3].where = {
         ...(include[3].where || {}),
-        class_name: { [Op.like]: `%${String(className).trim()}%` },
+        class_name: { [Op.like]: `%${cn}%` },
       };
       include[3].required = true;
 
-      // OPTIONAL: if some records rely on book.class_name instead of class relation
-      // keep them too by NOT excluding book.class_name matches
-      // (If you want strict only Class table, remove this OR block)
+      // keep compatibility with records relying on book.class_name
       where[Op.or] = [
         ...(where[Op.or] || []),
-        { "$class.class_name$": { [Op.like]: `%${String(className).trim()}%` } },
-        { "$book.class_name$": { [Op.like]: `%${String(className).trim()}%` } },
+        { "$class.class_name$": { [Op.like]: `%${cn}%` } },
+        { "$book.class_name$": { [Op.like]: `%${cn}%` } },
       ];
     }
 
@@ -142,9 +155,10 @@ exports.getRequirements = async (request, reply) => {
       };
       include[2].required = true;
     } else if (publisherName && String(publisherName).trim()) {
+      const pn = String(publisherName).trim();
       include[2].include[0].where = {
         ...(include[2].include[0].where || {}),
-        name: { [Op.like]: `%${String(publisherName).trim()}%` },
+        name: { [Op.like]: `%${pn}%` },
       };
       include[2].include[0].required = true;
       include[2].required = true;
@@ -161,7 +175,6 @@ exports.getRequirements = async (request, reply) => {
       include[1].required = false;
       include[3].required = false;
 
-      // Apply OR on joined columns
       where[Op.or] = [
         ...(where[Op.or] || []),
         { "$school.name$": { [Op.like]: `%${search}%` } },
@@ -183,8 +196,7 @@ exports.getRequirements = async (request, reply) => {
       limit: pageSize,
       offset,
       distinct: true,
-      // this makes "$school.name$" etc work reliably in Sequelize
-      subQuery: false,
+      subQuery: false, // makes "$school.name$" etc work reliably
     });
 
     return reply.send({
@@ -205,7 +217,6 @@ exports.getRequirements = async (request, reply) => {
   }
 };
 
-
 /**
  * GET /api/requirements/:id
  */
@@ -216,7 +227,12 @@ exports.getRequirementById = async (request, reply) => {
     const requirement = await SchoolBookRequirement.findByPk(id, {
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
-        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
+        {
+          model: Supplier,
+          as: "supplier",
+          attributes: ["id", "name"],
+          required: false,
+        },
         {
           model: Book,
           as: "book",
@@ -225,7 +241,7 @@ exports.getRequirementById = async (request, reply) => {
             {
               model: Publisher,
               as: "publisher",
-              attributes: ["id", "name"], // ✅ removed supplier
+              attributes: ["id", "name"],
             },
           ],
         },
@@ -313,7 +329,7 @@ exports.createRequirement = async (request, reply) => {
         academic_session: academic_session || null,
       },
       defaults: {
-        supplier_id: supplier_id || null, // ✅
+        supplier_id: supplier_id || null,
         class_id: classObj ? class_id : null,
         required_copies: numericCopies,
         status: status || "draft",
@@ -324,12 +340,17 @@ exports.createRequirement = async (request, reply) => {
     });
 
     if (!created) {
-      if (typeof supplier_id !== "undefined") record.supplier_id = supplier_id || null;
-      record.class_id = classObj ? class_id : null;
+      if (typeof supplier_id !== "undefined")
+        record.supplier_id = supplier_id || null;
+
+      // ⚠️ If frontend sends class_id but it doesn't exist, we force null to avoid FK garbage
+      if (typeof class_id !== "undefined") record.class_id = classObj ? class_id : null;
+
       record.required_copies = numericCopies;
       if (typeof status !== "undefined") record.status = status || "draft";
       if (typeof remarks !== "undefined") record.remarks = remarks || null;
-      if (typeof is_locked !== "undefined") record.is_locked = Boolean(is_locked);
+      if (typeof is_locked !== "undefined")
+        record.is_locked = Boolean(is_locked);
 
       await record.save({ transaction: t });
     }
@@ -339,7 +360,12 @@ exports.createRequirement = async (request, reply) => {
     const fullRequirement = await SchoolBookRequirement.findByPk(record.id, {
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
-        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
+        {
+          model: Supplier,
+          as: "supplier",
+          attributes: ["id", "name"],
+          required: false,
+        },
         {
           model: Book,
           as: "book",
@@ -396,7 +422,7 @@ exports.updateRequirement = async (request, reply) => {
     } = request.body || {};
 
     if (school_id) {
-      const school = await School.findByPk(school_id);
+      const school = await School.findByPk(school_id, { transaction: t });
       if (!school) {
         await t.rollback();
         return reply.code(400).send({ message: "Invalid school_id." });
@@ -405,7 +431,7 @@ exports.updateRequirement = async (request, reply) => {
     }
 
     if (book_id) {
-      const book = await Book.findByPk(book_id);
+      const book = await Book.findByPk(book_id, { transaction: t });
       if (!book) {
         await t.rollback();
         return reply.code(400).send({ message: "Invalid book_id." });
@@ -415,7 +441,7 @@ exports.updateRequirement = async (request, reply) => {
 
     if (typeof supplier_id !== "undefined") {
       if (supplier_id) {
-        const sup = await Supplier.findByPk(supplier_id);
+        const sup = await Supplier.findByPk(supplier_id, { transaction: t });
         if (!sup) {
           await t.rollback();
           return reply.code(400).send({ message: "Invalid supplier_id." });
@@ -428,7 +454,7 @@ exports.updateRequirement = async (request, reply) => {
 
     if (typeof class_id !== "undefined") {
       if (class_id) {
-        const cls = await Class.findByPk(class_id);
+        const cls = await Class.findByPk(class_id, { transaction: t });
         if (!cls) {
           await t.rollback();
           return reply.code(400).send({ message: "Invalid class_id." });
@@ -439,11 +465,13 @@ exports.updateRequirement = async (request, reply) => {
       }
     }
 
-    if (typeof academic_session !== "undefined")
+    if (typeof academic_session !== "undefined") {
       requirement.academic_session = academic_session || null;
+    }
 
-    if (typeof required_copies !== "undefined")
+    if (typeof required_copies !== "undefined") {
       requirement.required_copies = Number(required_copies) || 0;
+    }
 
     if (typeof status !== "undefined") requirement.status = status;
     if (typeof remarks !== "undefined") requirement.remarks = remarks || null;
@@ -456,7 +484,12 @@ exports.updateRequirement = async (request, reply) => {
     const fullRequirement = await SchoolBookRequirement.findByPk(requirement.id, {
       include: [
         { model: School, as: "school", attributes: ["id", "name"] },
-        { model: Supplier, as: "supplier", attributes: ["id", "name"], required: false },
+        {
+          model: Supplier,
+          as: "supplier",
+          attributes: ["id", "name"],
+          required: false,
+        },
         {
           model: Book,
           as: "book",
@@ -486,7 +519,7 @@ exports.deleteRequirement = async (request, reply) => {
   try {
     const { id } = request.params;
 
-    const requirement = await SchoolBookRequirement.findByPk(id);
+    const requirement = await SchoolBookRequirement.findByPk(id, { transaction: t });
     if (!requirement) {
       await t.rollback();
       return reply.code(404).send({ message: "Requirement not found" });
@@ -542,28 +575,44 @@ exports.importRequirements = async (request, reply) => {
     try {
       const id = row.ID || row.Id || row.id || null;
 
-      const schoolIdRaw = row["School ID"] || row.school_id || row.SchoolId || "";
-      const schoolName = row["School Name"] || row.school || row.SchoolName || "";
+      const schoolIdRaw =
+        row["School ID"] || row.school_id || row.SchoolId || "";
+      const schoolName =
+        row["School Name"] || row.school || row.SchoolName || "";
 
       const bookIdRaw = row["Book ID"] || row.book_id || row.BookId || "";
-      const bookTitle = row["Book Title"] || row.book || row.title || row.BookTitle || "";
+      const bookTitle =
+        row["Book Title"] || row.book || row.title || row.BookTitle || "";
 
-      const supplierName = row["Supplier Name"] || row.supplier || row.supplier_name || ""; // ✅ NEW
+      const supplierName =
+        row["Supplier Name"] ||
+        row.supplier ||
+        row.supplier_name ||
+        "";
 
       const className = row.Class || row["Class Name"] || row.class_name || "";
-      const sessionRaw = row["Session"] || row["Academic Session"] || row.academic_session || "";
-      const copiesRaw = row["Required Copies"] || row.required_copies || row.Copies || "";
+      const sessionRaw =
+        row["Session"] ||
+        row["Academic Session"] ||
+        row.academic_session ||
+        "";
+      const copiesRaw =
+        row["Required Copies"] || row.required_copies || row.Copies || "";
 
       const statusRaw = row.Status || row.status || "";
       const remarks = row.Remarks || row.remarks || "";
-      const isLockedRaw = row["Is Locked"] || row.is_locked || row.IsLocked || false;
+      const isLockedRaw =
+        row["Is Locked"] || row.is_locked || row.IsLocked || false;
 
       // Resolve school
       let school_id = null;
       if (schoolIdRaw) {
         school_id = Number(schoolIdRaw);
       } else if (schoolName) {
-        const school = await School.findOne({ where: { name: schoolName } });
+        const school = await School.findOne({
+          where: { name: String(schoolName).trim() },
+          transaction: t,
+        });
         if (!school) {
           errors.push({ row: rowNumber, error: `School "${schoolName}" not found.` });
           await t.rollback();
@@ -582,7 +631,10 @@ exports.importRequirements = async (request, reply) => {
       if (bookIdRaw) {
         book_id = Number(bookIdRaw);
       } else if (bookTitle) {
-        const book = await Book.findOne({ where: { title: bookTitle } });
+        const book = await Book.findOne({
+          where: { title: String(bookTitle).trim() },
+          transaction: t,
+        });
         if (!book) {
           errors.push({ row: rowNumber, error: `Book "${bookTitle}" not found.` });
           await t.rollback();
@@ -601,6 +653,7 @@ exports.importRequirements = async (request, reply) => {
       if (supplierName && String(supplierName).trim()) {
         const sup = await Supplier.findOne({
           where: { name: String(supplierName).trim() },
+          transaction: t,
         });
         if (!sup) {
           errors.push({ row: rowNumber, error: `Supplier "${supplierName}" not found.` });
@@ -610,10 +663,13 @@ exports.importRequirements = async (request, reply) => {
         supplier_id = sup.id;
       }
 
-      // Resolve class
+      // Resolve class (optional)
       let class_id = null;
-      if (className) {
-        const cls = await Class.findOne({ where: { class_name: className } });
+      if (className && String(className).trim()) {
+        const cls = await Class.findOne({
+          where: { class_name: String(className).trim() },
+          transaction: t,
+        });
         if (!cls) {
           errors.push({ row: rowNumber, error: `Class "${className}" not found.` });
           await t.rollback();
@@ -622,12 +678,13 @@ exports.importRequirements = async (request, reply) => {
         class_id = cls.id;
       }
 
-      const academic_session = sessionRaw || null;
+      const academic_session = sessionRaw ? String(sessionRaw).trim() : null;
 
+      // required_copies
       let required_copies = 0;
       if (copiesRaw === "" || copiesRaw === null || typeof copiesRaw === "undefined") {
         required_copies = 0;
-      } else if (isNaN(Number(copiesRaw))) {
+      } else if (Number.isNaN(Number(copiesRaw))) {
         errors.push({ row: rowNumber, error: "Required Copies must be numeric." });
         await t.rollback();
         continue;
@@ -635,16 +692,14 @@ exports.importRequirements = async (request, reply) => {
         required_copies = Number(copiesRaw);
       }
 
+      // status
       let status = "draft";
       if (statusRaw) {
         const s = String(statusRaw).toLowerCase().trim();
         if (["draft", "confirmed"].includes(s)) status = s;
       }
 
-      const is_locked =
-        typeof isLockedRaw === "string"
-          ? ["1", "true", "yes", "locked"].includes(isLockedRaw.toLowerCase().trim())
-          : Boolean(isLockedRaw);
+      const is_locked = truthy(isLockedRaw);
 
       const payload = {
         school_id,
@@ -654,12 +709,13 @@ exports.importRequirements = async (request, reply) => {
         academic_session,
         required_copies,
         status,
-        remarks: remarks || null,
+        remarks: remarks ? String(remarks) : null,
         is_locked,
       };
 
+      // If ID present -> update that row if exists
       if (id) {
-        const existing = await SchoolBookRequirement.findByPk(id);
+        const existing = await SchoolBookRequirement.findByPk(id, { transaction: t });
         if (existing) {
           await existing.update(payload, { transaction: t });
           updatedCount++;
@@ -668,8 +724,24 @@ exports.importRequirements = async (request, reply) => {
         }
       }
 
-      await SchoolBookRequirement.create(payload, { transaction: t });
-      createdCount++;
+      // Otherwise -> create / upsert by (school_id, book_id, academic_session)
+      const [rec, created] = await SchoolBookRequirement.findOrCreate({
+        where: {
+          school_id,
+          book_id,
+          academic_session: academic_session || null,
+        },
+        defaults: payload,
+        transaction: t,
+      });
+
+      if (!created) {
+        await rec.update(payload, { transaction: t });
+        updatedCount++;
+      } else {
+        createdCount++;
+      }
+
       await t.commit();
     } catch (err) {
       await t.rollback();
@@ -750,7 +822,7 @@ exports.exportRequirements = async (request, reply) => {
       { header: "ID", key: "id", width: 8 },
       { header: "School Name", key: "school_name", width: 35 },
       { header: "Book Title", key: "book_title", width: 40 },
-      { header: "Supplier Name", key: "supplier_name", width: 28 }, // ✅ from requirement
+      { header: "Supplier Name", key: "supplier_name", width: 28 },
       { header: "Publisher Name", key: "publisher_name", width: 30 },
       { header: "Class", key: "class_name", width: 20 },
       { header: "Session", key: "academic_session", width: 15 },
@@ -788,7 +860,10 @@ exports.exportRequirements = async (request, reply) => {
     schools.forEach((s, index) => {
       schoolsSheet.getCell(index + 2, 1).value = s.name;
     });
-    const schoolRange = `Schools!$A$2:$A$${schools.length + 1}`;
+    const schoolRange =
+      schools.length > 0
+        ? `Schools!$A$2:$A$${schools.length + 1}`
+        : `Schools!$A$2:$A$2`;
 
     // ---------- Sheet 3: Suppliers ----------
     const suppliersSheet = workbook.addWorksheet("Suppliers");
@@ -798,7 +873,9 @@ exports.exportRequirements = async (request, reply) => {
       suppliersSheet.getCell(idx + 2, 1).value = s.name;
     });
     const supplierRange =
-      suppliers.length > 0 ? `Suppliers!$A$2:$A$${suppliers.length + 1}` : `Suppliers!$A$2:$A$2`;
+      suppliers.length > 0
+        ? `Suppliers!$A$2:$A$${suppliers.length + 1}`
+        : `Suppliers!$A$2:$A$2`;
 
     // ---------- Sheet 4: Books ----------
     const booksSheet = workbook.addWorksheet("Books");
@@ -813,8 +890,10 @@ exports.exportRequirements = async (request, reply) => {
         b.subject || "",
       ];
     });
-    const bookTitleRange = `Books!$B$2:$B$${books.length + 1}`;
-    const bookLookupRange = `Books!$B$2:$C$${books.length + 1}`; // Title->Publisher
+    const bookTitleRange =
+      books.length > 0 ? `Books!$B$2:$B$${books.length + 1}` : `Books!$B$2:$B$2`;
+    const bookLookupRange =
+      books.length > 0 ? `Books!$B$2:$C$${books.length + 1}` : `Books!$B$2:$C$2`;
 
     // ---------- Sheet 5: Classes ----------
     const classesSheet = workbook.addWorksheet("Classes");
@@ -823,7 +902,10 @@ exports.exportRequirements = async (request, reply) => {
     classes.forEach((c, index) => {
       classesSheet.getCell(index + 2, 1).value = c.class_name;
     });
-    const classRange = `Classes!$A$2:$A$${classes.length + 1}`;
+    const classRange =
+      classes.length > 0
+        ? `Classes!$A$2:$A$${classes.length + 1}`
+        : `Classes!$A$2:$A$2`;
 
     // ---------- Session dropdown ----------
     const baseSessionStart = 2025;
@@ -840,13 +922,25 @@ exports.exportRequirements = async (request, reply) => {
 
     for (let row = 2; row <= maxRows; row++) {
       // School Name → col 2
-      reqSheet.getCell(row, 2).dataValidation = { type: "list", allowBlank: true, formulae: [schoolRange] };
+      reqSheet.getCell(row, 2).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [schoolRange],
+      };
 
       // Book Title → col 3
-      reqSheet.getCell(row, 3).dataValidation = { type: "list", allowBlank: true, formulae: [bookTitleRange] };
+      reqSheet.getCell(row, 3).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [bookTitleRange],
+      };
 
       // Supplier Name → col 4 (manual dropdown)
-      reqSheet.getCell(row, 4).dataValidation = { type: "list", allowBlank: true, formulae: [supplierRange] };
+      reqSheet.getCell(row, 4).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [supplierRange],
+      };
 
       // Publisher Name → col 5 auto from Book Title
       reqSheet.getCell(row, 5).value = {
@@ -854,10 +948,18 @@ exports.exportRequirements = async (request, reply) => {
       };
 
       // Class → col 6
-      reqSheet.getCell(row, 6).dataValidation = { type: "list", allowBlank: true, formulae: [classRange] };
+      reqSheet.getCell(row, 6).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [classRange],
+      };
 
       // Session → col 7
-      reqSheet.getCell(row, 7).dataValidation = { type: "list", allowBlank: true, formulae: [sessionFormula] };
+      reqSheet.getCell(row, 7).dataValidation = {
+        type: "list",
+        allowBlank: true,
+        formulae: [sessionFormula],
+      };
 
       // Required Copies → col 8
       reqSheet.getCell(row, 8).dataValidation = {
@@ -871,8 +973,14 @@ exports.exportRequirements = async (request, reply) => {
     const buffer = await workbook.xlsx.writeBuffer();
 
     reply
-      .header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-      .header("Content-Disposition", 'attachment; filename="school-book-requirements.xlsx"')
+      .header(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      )
+      .header(
+        "Content-Disposition",
+        'attachment; filename="school-book-requirements.xlsx"'
+      )
       .send(Buffer.from(buffer));
   } catch (err) {
     request.log.error({ err }, "Error in exportRequirements");
@@ -929,7 +1037,10 @@ exports.printRequirementsPdf = (request, reply) => {
         if (reply.sent) return;
         reply
           .header("Content-Type", "application/pdf")
-          .header("Content-Disposition", 'attachment; filename="school-book-requirements.pdf"')
+          .header(
+            "Content-Disposition",
+            'attachment; filename="school-book-requirements.pdf"'
+          )
           .send(pdfBuffer);
       });
 
@@ -971,7 +1082,10 @@ exports.printRequirementsPdf = (request, reply) => {
       };
 
       const printClassHeading = (className) => {
-        doc.font("Helvetica-Bold").fontSize(12).text(`Class: ${className || "-"}`, { align: "left" });
+        doc
+          .font("Helvetica-Bold")
+          .fontSize(12)
+          .text(`Class: ${className || "-"}`, { align: "left" });
         doc.moveDown(0.3);
       };
 
@@ -984,15 +1098,12 @@ exports.printRequirementsPdf = (request, reply) => {
 
         if (withClassCol) doc.text("Class", 65, y, { width: 45 });
 
-        // Book title reduced
         doc.text("Book Title", withClassCol ? 115 : 65, y, {
           width: withClassCol ? 200 : 240,
         });
 
-        // Publisher increased (prevents line break)
         doc.text("Publisher", withClassCol ? 325 : 305, y, { width: 170 });
 
-        // Qty shifted right
         doc.text("Qty", 505, y, { width: 50, align: "right" });
 
         doc.moveDown(0.4);
@@ -1065,13 +1176,8 @@ exports.printRequirementsPdf = (request, reply) => {
               const qty = r.required_copies != null ? String(r.required_copies) : "0";
 
               doc.text(String(sr), 40, y, { width: 20 });
-
-              // Book title reduced
               doc.text(bookTitle, 65, y, { width: 240 });
-
-              // Publisher increased
               doc.text(publisherName, 305, y, { width: 170 });
-
               doc.text(qty, 505, y, { width: 50, align: "right" });
 
               doc.moveDown(0.7);
@@ -1100,13 +1206,8 @@ exports.printRequirementsPdf = (request, reply) => {
 
           doc.text(String(sr), 40, y, { width: 20 });
           doc.text(clsName, 65, y, { width: 45 });
-
-          // Book title reduced
           doc.text(bookTitle, 115, y, { width: 200 });
-
-          // Publisher increased
           doc.text(publisherName, 325, y, { width: 170 });
-
           doc.text(qty, 505, y, { width: 50, align: "right" });
 
           doc.moveDown(0.7);
@@ -1126,4 +1227,3 @@ exports.printRequirementsPdf = (request, reply) => {
       }
     });
 };
-

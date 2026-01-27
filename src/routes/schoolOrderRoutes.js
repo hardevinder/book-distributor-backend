@@ -2,7 +2,7 @@
 "use strict";
 
 const schoolOrderController = require("../controllers/schoolOrderController");
-const availabilityController = require("../controllers/availabilityController");
+// const availabilityController = require("../controllers/availabilityController"); // ✅ not needed now
 
 module.exports = async function (fastify, opts) {
   // 🔐 Protect all school-order routes with JWT auth
@@ -19,10 +19,32 @@ module.exports = async function (fastify, opts) {
   fastify.post("/generate", schoolOrderController.generateOrdersForSession);
 
   /**
-   * ✅ School → Class → Book availability
-   * GET /api/school-orders/availability?schoolId=&academic_session=
+   * ✅ Sync ONE (school + supplier + session) original order from requirements
+   * POST /api/school-orders/sync-from-requirements
+   * body: { academic_session, school_id, supplier_id }
    */
-  fastify.get("/availability", availabilityController.schoolAvailability);
+  fastify.post(
+    "/sync-from-requirements",
+    schoolOrderController.syncOrderFromRequirements
+  );
+
+  /**
+   * ✅ Sync ALL suppliers for a school+session from requirements
+   * POST /api/school-orders/sync-school-session
+   * body: { academic_session, school_id }
+   *
+   * NOTE: keep this ABOVE /:orderId routes
+   */
+  fastify.post(
+    "/sync-school-session",
+    schoolOrderController.syncSchoolSessionFromRequirements
+  );
+
+  /**
+   * ✅ School -> Book wise availability (Module-2)
+   * GET /api/school-orders/availability?school_id=&supplier_id=&q=
+   */
+  fastify.get("/availability", schoolOrderController.getSchoolBookAvailability);
 
   /**
    * ✅ Bulk PDF: Print ALL orders in ONE PDF (each order on new page)
@@ -45,20 +67,42 @@ module.exports = async function (fastify, opts) {
 
   // ---------- Email helpers for modal ----------
   // GET /api/school-orders/:orderId/email-preview
-  fastify.get("/:orderId/email-preview", schoolOrderController.getOrderEmailPreview);
+  fastify.get(
+    "/:orderId/email-preview",
+    schoolOrderController.getOrderEmailPreview
+  );
 
   // GET /api/school-orders/:orderId/email-logs?limit=20
   fastify.get("/:orderId/email-logs", schoolOrderController.getOrderEmailLogs);
 
   // POST /api/school-orders/:orderId/send-email
-  fastify.post("/:orderId/send-email", schoolOrderController.sendOrderEmailForOrder);
+  fastify.post(
+    "/:orderId/send-email",
+    schoolOrderController.sendOrderEmailForOrder
+  );
 
   // ---------- Meta / order no ----------
   // PATCH /api/school-orders/:orderId/meta
   fastify.patch("/:orderId/meta", schoolOrderController.updateSchoolOrderMeta);
 
   // PATCH /api/school-orders/:orderId/order-no
-  fastify.patch("/:orderId/order-no", schoolOrderController.updateSchoolOrderNo);
+  fastify.patch(
+    "/:orderId/order-no",
+    schoolOrderController.updateSchoolOrderNo
+  );
+
+  // ======================================================
+  // ✅ EDIT ITEMS (ADD / UPDATE / REMOVE + SYNC LINKS)
+  // ======================================================
+  /**
+   * ✅ Manual Edit Order Items (full sync with SchoolRequirementOrderLink)
+   * PATCH /api/school-orders/:orderId/items
+   * body: { items: [{ book_id, total_order_qty }] }
+   */
+  fastify.patch(
+    "/:orderId/items",
+    schoolOrderController.updateSchoolOrderItems
+  );
 
   // ---------- Receive ----------
   // POST /api/school-orders/:orderId/receive
@@ -74,7 +118,10 @@ module.exports = async function (fastify, opts) {
    * POST /api/school-orders/:orderId/reorder-copy
    * body: { items: [{ item_id, total_order_qty }] }
    */
-  fastify.post("/:orderId/reorder-copy", schoolOrderController.reorderCopyWithEdit);
+  fastify.post(
+    "/:orderId/reorder-copy",
+    schoolOrderController.reorderCopyWithEdit
+  );
 
   // ✅ Alias (frontend calling /reorder)
   // POST /api/school-orders/:orderId/reorder
@@ -82,7 +129,10 @@ module.exports = async function (fastify, opts) {
 
   // ✅ Canonical route (pending-only, shifts reordered_qty)
   // POST /api/school-orders/:orderId/reorder-pending
-  fastify.post("/:orderId/reorder-pending", schoolOrderController.reorderPendingForOrder);
+  fastify.post(
+    "/:orderId/reorder-pending",
+    schoolOrderController.reorderPendingForOrder
+  );
 
   // ======================================================
   // OTHER ACTION ROUTES
