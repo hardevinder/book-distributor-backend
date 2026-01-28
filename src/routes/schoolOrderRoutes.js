@@ -2,7 +2,7 @@
 "use strict";
 
 const schoolOrderController = require("../controllers/schoolOrderController");
-// const availabilityController = require("../controllers/availabilityController"); // ✅ not needed now
+const availabilityController = require("../controllers/availabilityController"); // ✅ ENABLED
 
 module.exports = async function (fastify, opts) {
   // 🔐 Protect all school-order routes with JWT auth
@@ -42,9 +42,12 @@ module.exports = async function (fastify, opts) {
 
   /**
    * ✅ School -> Book wise availability (Module-2)
-   * GET /api/school-orders/availability?school_id=&supplier_id=&q=
+   * ✅ IMPORTANT: route now points to availabilityController.schoolAvailability
+   *
+   * GET /api/school-orders/availability?school_id=2&academic_session=2026-27
+   * (also supports schoolId param)
    */
-  fastify.get("/availability", schoolOrderController.getSchoolBookAvailability);
+  fastify.get("/availability", availabilityController.schoolAvailability);
 
   /**
    * ✅ Bulk PDF: Print ALL orders in ONE PDF (each order on new page)
@@ -131,7 +134,10 @@ module.exports = async function (fastify, opts) {
 
   // ✅ Alias (frontend calling /reorder)
   // POST /api/school-orders/:orderId/reorder
-  fastify.post("/:orderId/reorder", schoolOrderController.reorderPendingForOrder);
+  fastify.post(
+    "/:orderId/reorder",
+    schoolOrderController.reorderPendingForOrder
+  );
 
   // ✅ Canonical route (pending-only, shifts reordered_qty)
   // POST /api/school-orders/:orderId/reorder-pending

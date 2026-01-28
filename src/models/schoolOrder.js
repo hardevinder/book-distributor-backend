@@ -62,7 +62,14 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       status: {
-        type: DataTypes.ENUM("draft", "sent", "partial_received", "completed", "cancelled", "reordered"),
+        type: DataTypes.ENUM(
+          "draft",
+          "sent",
+          "partial_received",
+          "completed",
+          "cancelled",
+          "reordered"
+        ),
         allowNull: false,
         defaultValue: "draft",
       },
@@ -230,6 +237,14 @@ module.exports = (sequelize, DataTypes) => {
         as: "items",
         onDelete: "CASCADE",
         hooks: true,
+      });
+    }
+
+    // ✅ FIX: add reverse association so include from SchoolOrder -> InventoryBatch works
+    if (models.InventoryBatch) {
+      SchoolOrder.hasMany(models.InventoryBatch, {
+        foreignKey: "school_order_id",
+        as: "inventoryBatches",
       });
     }
 

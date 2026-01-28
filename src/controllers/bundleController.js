@@ -1,344 +1,369 @@
 "use strict";
 
 const { Op } = require("sequelize");
-
 const {
   Bundle,
   BundleItem,
+  Product,
   School,
   Book,
-  InventoryBatch,
-  InventoryTxn,
+  Class,
   sequelize,
 } = require("../models");
-
-/* ---------------- Helpers ---------------- */
 
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
 
-async function getAvailableMap(t) {
-  const rows = await InventoryBatch.findAll({
-    attributes: [
-      "book_id",
-      [sequelize.fn("SUM", sequelize.col("available_qty")), "available_qty"],
-    ],
-    group: ["book_id"],
-    raw: true,
-    transaction: t,
-  });
+const bool = (v) => v === true || v === 1 || v === "1" || v === "true";
 
-  const map = new Map();
-  rows.forEach((r) => map.set(Number(r.book_id), num(r.available_qty)));
-  return map;
-}
-
-async function getReservedMapForBundles(t) {
-  // Reserved for bundles = RESERVE - UNRESERVE where ref_type = BUNDLE
-  const rows = await InventoryTxn.findAll({
-    where: { ref_type: "BUNDLE" },
-    attributes: [
-      "book_id",
-      [
-        sequelize.literal(`
-          SUM(CASE WHEN txn_type='RESERVE' THEN qty ELSE 0 END) -
-          SUM(CASE WHEN txn_type='UNRESERVE' THEN qty ELSE 0 END)
-        `),
-        "reserved_qty",
-      ],
-    ],
-    group: ["book_id"],
-    raw: true,
-    transaction: t,
-  });
-
-  const map = new Map();
-  rows.forEach((r) => map.set(Number(r.book_id), Math.max(0, num(r.reserved_qty))));
-  return map;
-}
-
-/* =========================================================
-   POST /api/bundles
-   Create bundle + reserve items (NO stock deduction)
-   Body: { schoolId, academic_session, notes, items:[{book_id, qty}] }
-   ========================================================= */
-exports.createBundle = async (request, reply) => {
-  const body = request.body || {};
-  const schoolId = num(body.schoolId);
-  const academic_session = String(body.academic_session || "").trim();
-  const notes = body.notes ? String(body.notes).trim() : null;
-  const items = Array.isArray(body.items) ? body.items : [];
-
-  if (!schoolId) return reply.code(400).send({ message: "schoolId is required" });
-  if (!academic_session) return reply.code(400).send({ message: "academic_session is required" });
-  if (!items.length) return reply.code(400).send({ message: "items are required" });
-
-  // ✅ sanitize items (aggregate same book_id)
-  const agg = new Map();
-  for (const it of items) {
-    const book_id = num(it.book_id);
-    const qty = Math.max(0, num(it.qty)); // incoming still "qty" from frontend
-    if (!book_id || qty <= 0) continue;
-    agg.set(book_id, (agg.get(book_id) || 0) + qty);
-  }
-
-  const cleanItems = Array.from(agg.entries()).map(([book_id, qty]) => ({
-    book_id,
-    required_qty: qty, // ✅ DB column
-  }));
-
-  if (!cleanItems.length) return reply.code(400).send({ message: "valid items are required" });
-
-  const t = await sequelize.transaction();
-  try {
-    const school = await School.findByPk(schoolId, { transaction: t });
-    if (!school) {
-      await t.rollback();
-      return reply.code(404).send({ message: "School not found" });
-    }
-
-    // validate books exist
-    const bookIds = cleanItems.map((x) => x.book_id);
-    const books = await Book.findAll({
-      where: { id: { [Op.in]: bookIds } },
-      attributes: ["id", "title"],
-      raw: true,
-      transaction: t,
-    });
-
-    const bookSet = new Set(books.map((b) => Number(b.id)));
-    const missing = bookIds.filter((id) => !bookSet.has(Number(id)));
-    if (missing.length) {
-      await t.rollback();
-      return reply.code(400).send({ message: `Invalid book_id(s): ${missing.join(", ")}` });
-    }
-
-    // compute free stock (global available - bundle reserved)
-    const availableMap = await getAvailableMap(t);
-    const reservedMap = await getReservedMapForBundles(t);
-
-    const shortages = [];
-    for (const it of cleanItems) {
-      const avl = availableMap.get(it.book_id) || 0;
-      const res = reservedMap.get(it.book_id) || 0;
-      const free = Math.max(0, avl - res);
-
-      if (free < it.required_qty) {
-        shortages.push({
-          book_id: it.book_id,
-          requested: it.required_qty,
-          free,
-          shortBy: it.required_qty - free,
-        });
-      }
-    }
-
-    if (shortages.length) {
-      await t.rollback();
-      return reply.code(400).send({
-        message: "Insufficient free stock for some books",
-        shortages,
-      });
-    }
-
-    // create bundle
-    const bundle = await Bundle.create(
-      {
-        school_id: schoolId,
-        academic_session,
-        status: "RESERVED",
-        notes,
-      },
-      { transaction: t }
-    );
-
-    // create bundle items ✅ using new columns
-    const bundleItemsPayload = cleanItems.map((it) => ({
-      bundle_id: bundle.id,
-      book_id: it.book_id,
-      required_qty: it.required_qty,
-      reserved_qty: it.required_qty, // ✅ reserve same as required at creation
-      issued_qty: 0,
-    }));
-
-    await BundleItem.bulkCreate(bundleItemsPayload, { transaction: t });
-
-    // create RESERVE txns (reserve required_qty)
-    const txnPayload = cleanItems.map((it) => ({
-      txn_type: "RESERVE",
-      book_id: it.book_id,
-      batch_id: null,
-      qty: it.required_qty,
-      ref_type: "BUNDLE",
-      ref_id: bundle.id,
-      notes: `Reserve for bundle #${bundle.id} (school ${schoolId}, ${academic_session})`,
-    }));
-
-    await InventoryTxn.bulkCreate(txnPayload, { transaction: t });
-
-    await t.commit();
-
-    return reply.send({
-      message: "Bundle created & stock reserved",
-      bundle: {
-        id: bundle.id,
-        school_id: bundle.school_id,
-        academic_session: bundle.academic_session,
-        status: bundle.status,
-        notes: bundle.notes,
-      },
-      items: bundleItemsPayload,
-    });
-  } catch (err) {
-    request.log.error(err);
-    await t.rollback();
-    return reply.code(500).send({ message: "Internal Server Error" });
-  }
+const pick = (obj, keys) => {
+  const out = {};
+  for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
+  return out;
 };
 
-/* =========================================================
-   GET /api/bundles?schoolId=&academic_session=&status=
-   List bundles (with items)
-   ========================================================= */
-exports.listBundles = async (request, reply) => {
-  try {
-    const { schoolId, academic_session, status } = request.query || {};
+async function ensureBundleExists(id) {
+  const bundle = await Bundle.findByPk(id);
+  if (!bundle) {
+    const err = new Error("Bundle not found");
+    err.statusCode = 404;
+    throw err;
+  }
+  return bundle;
+}
+
+module.exports = {
+  // ======================================================
+  // GET /api/bundles
+  // ======================================================
+  async listBundles(req, reply) {
+    const q = req.query || {};
+
     const where = {};
-    if (schoolId) where.school_id = num(schoolId);
-    if (academic_session) where.academic_session = String(academic_session);
-    if (status) where.status = String(status);
-
-    // ✅ Strongest include style: use registered associations (prevents eager loading errors)
-    const include = [];
-
-    // Bundle -> School (belongsTo as: "school")
-    if (Bundle.associations?.school) {
-      include.push({
-        association: Bundle.associations.school,
-        attributes: ["id", "name"],
-      });
-    } else {
-      // Return a clear message instead of Sequelize cryptic error
-      return reply.code(500).send({
-        message:
-          "Bundle -> School association not registered. Ensure models/index.js calls .associate(db) for all models and that Bundle.associate is executed on startup.",
-        bundleAssociations: Object.keys(Bundle.associations || {}),
-      });
-    }
-
-    // Bundle -> Items (hasMany as: "items")
-    if (Bundle.associations?.items) {
-      const itemsInclude = {
-        association: Bundle.associations.items,
-        include: [],
-      };
-
-      // BundleItem -> Book (belongsTo as: "book")
-      if (BundleItem.associations?.book) {
-        itemsInclude.include.push({
-          association: BundleItem.associations.book,
-          attributes: ["id", "title"],
-        });
-      } else {
-        // fallback (still works if association exists but not loaded here)
-        itemsInclude.include.push({
-          model: Book,
-          as: "book",
-          attributes: ["id", "title"],
-        });
-      }
-
-      include.push(itemsInclude);
-    } else {
-      // fallback
-      include.push({
-        model: BundleItem,
-        as: "items",
-        include: [{ model: Book, as: "book", attributes: ["id", "title"] }],
-      });
-    }
+    if (q.school_id) where.school_id = num(q.school_id);
+    if (q.class_id) where.class_id = num(q.class_id);
+    if (q.class_name) where.class_name = String(q.class_name).trim();
+    if (q.academic_session) where.academic_session = String(q.academic_session).trim();
+    if (q.is_active !== undefined) where.is_active = bool(q.is_active);
 
     const rows = await Bundle.findAll({
       where,
-      include,
-      order: [["id", "DESC"]],
+      order: [
+        ["sort_order", "ASC"],
+        ["id", "DESC"],
+      ],
+      include: [
+        { model: School, as: "school", required: false, attributes: ["id", "name"] },
+        Class ? { model: Class, as: "class", required: false, attributes: ["id", "class_name"] } : null,
+      ].filter(Boolean),
     });
 
-    return reply.send({ rows });
-  } catch (err) {
-    request.log.error(err);
-    return reply.code(500).send({ message: "Internal Server Error" });
-  }
-};
+    return reply.send({ success: true, data: rows });
+  },
 
-/* =========================================================
-   POST /api/bundles/:id/cancel
-   Cancel bundle + UNRESERVE txns
-   ========================================================= */
-exports.cancelBundle = async (request, reply) => {
-  const bundleId = num(request.params?.id);
-  if (!bundleId) return reply.code(400).send({ message: "Invalid bundle id" });
+  // ======================================================
+  // GET /api/bundles/:id
+  // ======================================================
+  async getBundleById(req, reply) {
+    const id = num(req.params.id);
 
-  const t = await sequelize.transaction();
-  try {
-    const bundle = await Bundle.findByPk(bundleId, {
-      include: [{ model: BundleItem, as: "items" }],
-      transaction: t,
-      lock: t.LOCK.UPDATE,
+    const bundle = await Bundle.findByPk(id, {
+      include: [
+        { model: School, as: "school", required: false, attributes: ["id", "name"] },
+        Class ? { model: Class, as: "class", required: false, attributes: ["id", "class_name"] } : null,
+        {
+          model: BundleItem,
+          as: "items",
+          required: false,
+          include: [
+            {
+              model: Product,
+              as: "product",
+              required: false,
+              include: [
+                {
+                  model: Book,
+                  as: "book",
+                  required: false,
+                  attributes: ["id", "title", "class_name"],
+                },
+              ],
+            },
+          ],
+          order: [
+            ["sort_order", "ASC"],
+            ["id", "ASC"],
+          ],
+        },
+      ],
     });
 
-    if (!bundle) {
-      await t.rollback();
-      return reply.code(404).send({ message: "Bundle not found" });
+    if (!bundle) return reply.code(404).send({ success: false, message: "Bundle not found" });
+
+    return reply.send({ success: true, data: bundle });
+  },
+
+  // ======================================================
+  // POST /api/bundles
+  // body: { school_id, class_id?, class_name?, academic_session?, name, is_active?, sort_order? }
+  // ======================================================
+  async createBundle(req, reply) {
+    const b = req.body || {};
+
+    const payload = {
+      school_id: num(b.school_id),
+      class_id: b.class_id == null ? null : num(b.class_id),
+      class_name: b.class_name == null ? null : String(b.class_name).trim(),
+      academic_session: b.academic_session == null ? null : String(b.academic_session).trim(),
+      name: String(b.name || "").trim(),
+      is_active: b.is_active === undefined ? true : bool(b.is_active),
+      sort_order: b.sort_order === undefined ? 0 : num(b.sort_order),
+    };
+
+    if (!payload.school_id) {
+      return reply.code(400).send({ success: false, message: "school_id is required" });
+    }
+    if (!payload.name) {
+      return reply.code(400).send({ success: false, message: "name is required" });
     }
 
-    if (bundle.status === "CANCELLED") {
-      await t.rollback();
-      return reply.send({ message: "Already cancelled", bundleId });
+    // optional: ensure school exists
+    const school = await School.findByPk(payload.school_id);
+    if (!school) return reply.code(400).send({ success: false, message: "Invalid school_id" });
+
+    const row = await Bundle.create(payload);
+    return reply.code(201).send({ success: true, data: row });
+  },
+
+  // ======================================================
+  // PUT /api/bundles/:id
+  // ======================================================
+  async updateBundle(req, reply) {
+    const id = num(req.params.id);
+    const b = req.body || {};
+
+    const bundle = await ensureBundleExists(id);
+
+    const changes = pick(b, [
+      "school_id",
+      "class_id",
+      "class_name",
+      "academic_session",
+      "name",
+      "is_active",
+      "sort_order",
+    ]);
+
+    if (changes.school_id !== undefined) changes.school_id = num(changes.school_id);
+    if (changes.class_id !== undefined) changes.class_id = changes.class_id == null ? null : num(changes.class_id);
+    if (changes.class_name !== undefined) changes.class_name = changes.class_name == null ? null : String(changes.class_name).trim();
+    if (changes.academic_session !== undefined) changes.academic_session = changes.academic_session == null ? null : String(changes.academic_session).trim();
+    if (changes.name !== undefined) changes.name = String(changes.name || "").trim();
+    if (changes.is_active !== undefined) changes.is_active = bool(changes.is_active);
+    if (changes.sort_order !== undefined) changes.sort_order = num(changes.sort_order);
+
+    if (changes.school_id) {
+      const school = await School.findByPk(changes.school_id);
+      if (!school) return reply.code(400).send({ success: false, message: "Invalid school_id" });
     }
 
-    // ✅ don’t allow cancel once issued/dispatched/delivered
-    if (["ISSUED", "DISPATCHED", "DELIVERED"].includes(bundle.status)) {
-      await t.rollback();
-      return reply.code(400).send({ message: `Cannot cancel a ${bundle.status} bundle` });
+    if (changes.name !== undefined && !changes.name) {
+      return reply.code(400).send({ success: false, message: "name cannot be empty" });
     }
 
-    const items = (bundle.items || []).map((it) => ({
-      book_id: num(it.book_id),
-      reserved_qty: num(it.reserved_qty), // ✅ new column
+    await bundle.update(changes);
+    return reply.send({ success: true, data: bundle });
+  },
+
+  // ======================================================
+  // DELETE /api/bundles/:id
+  // (will cascade delete BundleItems if your association has onDelete CASCADE)
+  // ======================================================
+  async deleteBundle(req, reply) {
+    const id = num(req.params.id);
+    const bundle = await ensureBundleExists(id);
+
+    await bundle.destroy();
+    return reply.send({ success: true, message: "Bundle deleted" });
+  },
+
+  // ======================================================
+  // POST /api/bundles/:id/items
+  // Upsert items, optionally replace
+  // ======================================================
+  async upsertBundleItems(req, reply) {
+    const bundleId = num(req.params.id);
+    const body = req.body || {};
+    const replace = bool(body.replace);
+    const items = Array.isArray(body.items) ? body.items : [];
+
+    if (!items.length) {
+      return reply.code(400).send({ success: false, message: "items[] is required" });
+    }
+
+    const bundle = await ensureBundleExists(bundleId);
+
+    // Normalize and basic validate
+    const normalized = items.map((it) => ({
+      id: it.id ? num(it.id) : null,
+      product_id: num(it.product_id),
+      qty: it.qty === undefined ? 1 : Math.max(0, num(it.qty)),
+      mrp: it.mrp === undefined ? 0 : num(it.mrp),
+      sale_price: it.sale_price === undefined ? 0 : num(it.sale_price),
+      is_optional: it.is_optional === undefined ? false : bool(it.is_optional),
+      sort_order: it.sort_order === undefined ? 0 : num(it.sort_order),
     }));
 
-    const toUnreserve = items.filter((x) => x.book_id && x.reserved_qty > 0);
-
-    if (toUnreserve.length) {
-      const txnPayload = toUnreserve.map((it) => ({
-        txn_type: "UNRESERVE",
-        book_id: it.book_id,
-        batch_id: null,
-        qty: it.reserved_qty,
-        ref_type: "BUNDLE",
-        ref_id: bundle.id,
-        notes: `Unreserve for cancelled bundle #${bundle.id}`,
-      }));
-      await InventoryTxn.bulkCreate(txnPayload, { transaction: t });
-    }
-
-    // also zero reserved_qty in bundle_items (optional but clean)
-    if (bundle.items?.length) {
-      for (const it of bundle.items) {
-        await it.update({ reserved_qty: 0 }, { transaction: t });
+    for (const it of normalized) {
+      if (!it.product_id) {
+        return reply.code(400).send({ success: false, message: "product_id is required for all items" });
       }
+      // qty=0 allowed? you can decide. I’m allowing but you may restrict to >=1
     }
 
-    await bundle.update({ status: "CANCELLED" }, { transaction: t });
-    await t.commit();
+    // Ensure all products exist
+    const productIds = [...new Set(normalized.map((x) => x.product_id))];
+    const products = await Product.findAll({
+      where: { id: { [Op.in]: productIds } },
+      attributes: ["id", "type", "book_id", "name", "is_active"],
+    });
 
-    return reply.send({ message: "Bundle cancelled & stock unreserved", bundleId });
-  } catch (err) {
-    request.log.error(err);
-    await t.rollback();
-    return reply.code(500).send({ message: "Internal Server Error" });
-  }
+    if (products.length !== productIds.length) {
+      return reply.code(400).send({ success: false, message: "One or more product_id are invalid" });
+    }
+
+    // Transaction: upsert + optional replace delete
+    const result = await sequelize.transaction(async (t) => {
+      const existing = await BundleItem.findAll({
+        where: { bundle_id: bundleId },
+        transaction: t,
+      });
+
+      const existingById = new Map(existing.map((x) => [x.id, x]));
+      const existingByProduct = new Map(existing.map((x) => [x.product_id, x]));
+
+      const keptIds = new Set();
+
+      for (const it of normalized) {
+        // Update by id if provided
+        if (it.id) {
+          const row = existingById.get(it.id);
+          if (!row) {
+            throw Object.assign(new Error(`BundleItem not found: ${it.id}`), { statusCode: 404 });
+          }
+          if (row.bundle_id !== bundleId) {
+            throw Object.assign(new Error("Invalid bundle item"), { statusCode: 400 });
+          }
+
+          await row.update(
+            {
+              product_id: it.product_id,
+              qty: it.qty,
+              mrp: it.mrp,
+              sale_price: it.sale_price,
+              is_optional: it.is_optional,
+              sort_order: it.sort_order,
+            },
+            { transaction: t }
+          );
+          keptIds.add(row.id);
+          continue;
+        }
+
+        // Else upsert by (bundle_id, product_id)
+        const existingRow = existingByProduct.get(it.product_id);
+        if (existingRow) {
+          await existingRow.update(
+            {
+              qty: it.qty,
+              mrp: it.mrp,
+              sale_price: it.sale_price,
+              is_optional: it.is_optional,
+              sort_order: it.sort_order,
+            },
+            { transaction: t }
+          );
+          keptIds.add(existingRow.id);
+        } else {
+          const created = await BundleItem.create(
+            {
+              bundle_id: bundleId,
+              product_id: it.product_id,
+              qty: it.qty,
+              mrp: it.mrp,
+              sale_price: it.sale_price,
+              is_optional: it.is_optional,
+              sort_order: it.sort_order,
+            },
+            { transaction: t }
+          );
+          keptIds.add(created.id);
+        }
+      }
+
+      if (replace) {
+        const toDelete = existing.filter((x) => !keptIds.has(x.id));
+        if (toDelete.length) {
+          await BundleItem.destroy({
+            where: { id: { [Op.in]: toDelete.map((x) => x.id) } },
+            transaction: t,
+          });
+        }
+      }
+
+      // return fresh bundle with items
+      const fresh = await Bundle.findByPk(bundleId, {
+        transaction: t,
+        include: [
+          {
+            model: BundleItem,
+            as: "items",
+            required: false,
+            include: [
+              {
+                model: Product,
+                as: "product",
+                required: false,
+                include: [
+                  {
+                    model: Book,
+                    as: "book",
+                    required: false,
+                    attributes: ["id", "title", "class_name"],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+        order: [
+          [{ model: BundleItem, as: "items" }, "sort_order", "ASC"],
+          [{ model: BundleItem, as: "items" }, "id", "ASC"],
+        ],
+      });
+
+      return fresh;
+    });
+
+    return reply.send({ success: true, data: result, bundle: bundle.id });
+  },
+
+  // ======================================================
+  // DELETE /api/bundles/:id/items/:itemId
+  // ======================================================
+  async deleteBundleItem(req, reply) {
+    const bundleId = num(req.params.id);
+    const itemId = num(req.params.itemId);
+
+    await ensureBundleExists(bundleId);
+
+    const row = await BundleItem.findByPk(itemId);
+    if (!row) return reply.code(404).send({ success: false, message: "Bundle item not found" });
+    if (row.bundle_id !== bundleId) return reply.code(400).send({ success: false, message: "Invalid bundle item" });
+
+    await row.destroy();
+    return reply.send({ success: true, message: "Bundle item deleted" });
+  },
 };

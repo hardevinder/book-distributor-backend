@@ -160,6 +160,9 @@ const buildServer = () => {
     prefix: "/api/requirements",
   });
 
+  // ✅ Products (BOOK + MATERIAL)
+  fastify.register(require("./routes/products"), { prefix: "/api/products" });
+
   /* ---------------- ORDERS ---------------- */
   fastify.register(require("./routes/publisherOrderRoutes"), {
     prefix: "/api/publisher-orders",

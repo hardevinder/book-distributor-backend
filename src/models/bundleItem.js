@@ -1,4 +1,3 @@
-// src/models/bundleItem.js
 "use strict";
 
 module.exports = (sequelize, DataTypes) => {
@@ -16,28 +15,37 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
-      book_id: {
+      product_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
       },
 
-      // ✅ renamed from qty
-      required_qty: {
-        type: DataTypes.INTEGER,
+      qty: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: false,
+        defaultValue: 1,
+      },
+
+      mrp: {
+        type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      // ✅ new
-      reserved_qty: {
-        type: DataTypes.INTEGER,
+      sale_price: {
+        type: DataTypes.DECIMAL(12, 2),
         allowNull: false,
         defaultValue: 0,
       },
 
-      // ✅ new
-      issued_qty: {
-        type: DataTypes.INTEGER,
+      is_optional: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false,
+        defaultValue: false,
+      },
+
+      sort_order: {
+        type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
         defaultValue: 0,
       },
@@ -46,26 +54,29 @@ module.exports = (sequelize, DataTypes) => {
       tableName: "bundle_items",
       timestamps: true,
       indexes: [
-        {
-          unique: true,
-          fields: ["bundle_id", "book_id"],
-          name: "uk_bundle_book",
-        },
+        { fields: ["bundle_id"] },
+        { fields: ["product_id"] },
+
+        // prevent duplicates inside same bundle
+        { unique: true, fields: ["bundle_id", "product_id"] },
       ],
     }
   );
 
   BundleItem.associate = (models) => {
-    BundleItem.belongsTo(models.Bundle, {
-      foreignKey: "bundle_id",
-      as: "bundle",
-      onDelete: "CASCADE",
-    });
+    if (models.Bundle) {
+      BundleItem.belongsTo(models.Bundle, {
+        foreignKey: "bundle_id",
+        as: "bundle",
+      });
+    }
 
-    BundleItem.belongsTo(models.Book, {
-      foreignKey: "book_id",
-      as: "book",
-    });
+    if (models.Product) {
+      BundleItem.belongsTo(models.Product, {
+        foreignKey: "product_id",
+        as: "product",
+      });
+    }
   };
 
   return BundleItem;

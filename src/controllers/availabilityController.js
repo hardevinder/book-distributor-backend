@@ -78,10 +78,11 @@ async function fetchDirectPurchaseBookIds({ sId, academic_session, request }) {
 
 exports.schoolAvailability = async (request, reply) => {
   try {
-    const { schoolId, academic_session } = request.query || {};
-    const sId = Number(schoolId);
+    // ✅ accept both school_id (preferred) and schoolId (legacy)
+    const { school_id, schoolId, academic_session } = request.query || {};
+    const sId = Number(school_id ?? schoolId);
 
-    if (!sId) return reply.code(400).send({ message: "schoolId is required" });
+    if (!sId) return reply.code(400).send({ message: "school_id is required" });
 
     const school = await School.findByPk(sId, { attributes: ["id", "name"] });
     if (!school) return reply.code(404).send({ message: "School not found" });
@@ -94,10 +95,7 @@ exports.schoolAvailability = async (request, reply) => {
 
     const reqAggRows = await SchoolBookRequirement.findAll({
       where: reqWhere,
-      attributes: [
-        "book_id",
-        [sequelize.fn("SUM", sequelize.col("required_copies")), "required_qty"],
-      ],
+      attributes: ["book_id", [sequelize.fn("SUM", sequelize.col("required_copies")), "required_qty"]],
       group: ["book_id"],
       raw: true,
     });
@@ -133,12 +131,16 @@ exports.schoolAvailability = async (request, reply) => {
 
     /* =========================
        2) Inventory available (global)
+       ✅ IMPORTANT: filter to only needed book_ids (fix + faster)
        ========================= */
-    const invRows = await InventoryBatch.findAll({
-      attributes: ["book_id", [sequelize.fn("SUM", sequelize.col("available_qty")), "available_qty"]],
-      group: ["book_id"],
-      raw: true,
-    });
+    const invRows = allBookIds.length
+      ? await InventoryBatch.findAll({
+          attributes: ["book_id", [sequelize.fn("SUM", sequelize.col("available_qty")), "available_qty"]],
+          where: { book_id: { [Op.in]: allBookIds } },
+          group: ["book_id"],
+          raw: true,
+        })
+      : [];
 
     const invMap = new Map((invRows || []).map((r) => [Number(r.book_id), num(r.available_qty)]));
 

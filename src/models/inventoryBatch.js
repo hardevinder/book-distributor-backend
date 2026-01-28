@@ -79,22 +79,35 @@ module.exports = (sequelize, DataTypes) => {
       });
     }
 
-    // Source order reference (optional)
-    InventoryBatch.belongsTo(models.SchoolOrder, {
-      foreignKey: "school_order_id",
-      as: "schoolOrder",
-    });
+    // ✅ Order reference (optional)
+    if (models.SchoolOrder) {
+      InventoryBatch.belongsTo(models.SchoolOrder, {
+        foreignKey: "school_order_id",
+        as: "schoolOrder",
+      });
+
+      // ✅ IMPORTANT: reverse association ALSO HERE (prevents load-order issues)
+      // This makes SchoolOrder -> InventoryBatch include work.
+      models.SchoolOrder.hasMany(models.InventoryBatch, {
+        foreignKey: "school_order_id",
+        as: "inventoryBatches",
+      });
+    }
 
     // Source order item reference (optional)
-    InventoryBatch.belongsTo(models.SchoolOrderItem, {
-      foreignKey: "school_order_item_id",
-      as: "schoolOrderItem",
-    });
+    if (models.SchoolOrderItem) {
+      InventoryBatch.belongsTo(models.SchoolOrderItem, {
+        foreignKey: "school_order_item_id",
+        as: "schoolOrderItem",
+      });
+    }
 
-    InventoryBatch.hasMany(models.InventoryTxn, {
-      foreignKey: "batch_id",
-      as: "txns",
-    });
+    if (models.InventoryTxn) {
+      InventoryBatch.hasMany(models.InventoryTxn, {
+        foreignKey: "batch_id",
+        as: "txns",
+      });
+    }
   };
 
   return InventoryBatch;

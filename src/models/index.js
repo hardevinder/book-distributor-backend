@@ -17,6 +17,9 @@ const School = require("./school")(sequelize, DataTypes);
 const Transport = require("./transport")(sequelize, DataTypes);
 const CompanyProfile = require("./companyProfile")(sequelize, DataTypes);
 
+// ✅ Products (POS / Bundles)
+const Product = require("./product")(sequelize, DataTypes);
+
 /* ======================
    REQUIREMENTS
    ====================== */
@@ -61,12 +64,16 @@ const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
    ====================== */
 const SupplierReceipt = require("./supplierReceipt")(sequelize, DataTypes);
 const SupplierReceiptItem = require("./supplierReceiptItem")(sequelize, DataTypes);
-const SupplierReceiptAllocation = require("./supplierReceiptAllocation")(sequelize, DataTypes); // ✅ FIXED
+const SupplierReceiptAllocation = require("./supplierReceiptAllocation")(sequelize, DataTypes);
 const SupplierPayment = require("./supplierPayment")(sequelize, DataTypes);
 const SupplierLedgerTxn = require("./supplierLedgerTxn")(sequelize, DataTypes);
 
 /* =====================================================
-   ASSOCIATIONS
+   ASSOCIATIONS (manual + safe)
+   NOTE:
+   Do NOT call model.associate(db) here because many models
+   already define associations internally and it causes
+   duplicate alias errors (like "receipts").
    ===================================================== */
 
 /* ---------- Publisher ↔ Books ---------- */
@@ -76,6 +83,10 @@ Book.belongsTo(Publisher, { foreignKey: "publisher_id", as: "publisher" });
 /* ---------- Supplier ↔ Books ---------- */
 Supplier.hasMany(Book, { foreignKey: "supplier_id", as: "books" });
 Book.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
+
+/* ---------- ✅ Product ↔ Book ---------- */
+Book.hasMany(Product, { foreignKey: "book_id", as: "products" });
+Product.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
 /* ---------- School ↔ Book Requirements ---------- */
 School.hasMany(SchoolBookRequirement, { foreignKey: "school_id", as: "requirements" });
@@ -114,14 +125,8 @@ Book.hasMany(SchoolOrderItem, { foreignKey: "book_id", as: "school_order_items" 
 SchoolOrderItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
 /* ---------- School Orders ↔ Email Logs ---------- */
-SchoolOrder.hasMany(SchoolOrderEmailLog, {
-  foreignKey: "school_order_id",
-  as: "emailLogs",
-});
-SchoolOrderEmailLog.belongsTo(SchoolOrder, {
-  foreignKey: "school_order_id",
-  as: "order",
-});
+SchoolOrder.hasMany(SchoolOrderEmailLog, { foreignKey: "school_order_id", as: "emailLogs" });
+SchoolOrderEmailLog.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "order" });
 
 /* ---------- Transport ---------- */
 Transport.hasMany(SchoolOrder, { foreignKey: "transport_id", as: "schoolOrders_transport1" });
@@ -137,6 +142,10 @@ InventoryBatch.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 Supplier.hasMany(InventoryBatch, { foreignKey: "supplier_id", as: "inventory_batches" });
 InventoryBatch.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
+/* ✅ FIX: SchoolOrder ↔ InventoryBatch (this removes your error) */
+SchoolOrder.hasMany(InventoryBatch, { foreignKey: "school_order_id", as: "inventoryBatches" });
+InventoryBatch.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "schoolOrder" });
+
 InventoryBatch.hasMany(InventoryTxn, { foreignKey: "batch_id", as: "txns" });
 InventoryTxn.belongsTo(InventoryBatch, { foreignKey: "batch_id", as: "batch" });
 
@@ -144,11 +153,27 @@ InventoryTxn.belongsTo(InventoryBatch, { foreignKey: "batch_id", as: "batch" });
 Bundle.hasMany(BundleItem, { foreignKey: "bundle_id", as: "items" });
 BundleItem.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 
+/* ✅ BundleItem ↔ Product */
+Product.hasMany(BundleItem, { foreignKey: "product_id", as: "bundle_items" });
+BundleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
+
+/* ✅ Bundle ↔ School / Class */
+School.hasMany(Bundle, { foreignKey: "school_id", as: "bundles" });
+Bundle.belongsTo(School, { foreignKey: "school_id", as: "school" });
+
+Class.hasMany(Bundle, { foreignKey: "class_id", as: "bundles" });
+Bundle.belongsTo(Class, { foreignKey: "class_id", as: "class" });
+
 Bundle.hasMany(BundleIssue, { foreignKey: "bundle_id", as: "issues" });
 BundleIssue.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 
 BundleIssue.hasMany(BundleDispatch, { foreignKey: "bundle_issue_id", as: "dispatches" });
 BundleDispatch.belongsTo(BundleIssue, { foreignKey: "bundle_issue_id", as: "issue" });
+
+if (BundleDispatch.rawAttributes && BundleDispatch.rawAttributes.distributor_id) {
+  Distributor.hasMany(BundleDispatch, { foreignKey: "distributor_id", as: "bundleDispatches" });
+  BundleDispatch.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
+}
 
 /* ---------- Supplier Receipts ---------- */
 Supplier.hasMany(SupplierReceipt, { foreignKey: "supplier_id", as: "receipts" });
@@ -168,7 +193,7 @@ SupplierReceiptItem.belongsTo(SupplierReceipt, { foreignKey: "supplier_receipt_i
 Book.hasMany(SupplierReceiptItem, { foreignKey: "book_id", as: "supplier_receipt_items" });
 SupplierReceiptItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
-/* ---------- ✅ Supplier Receipt Allocations ---------- */
+/* ---------- Supplier Receipt Allocations ---------- */
 SupplierReceipt.hasMany(SupplierReceiptAllocation, {
   foreignKey: "supplier_receipt_id",
   as: "allocations",
@@ -180,23 +205,11 @@ SupplierReceiptAllocation.belongsTo(SupplierReceipt, {
   as: "receipt",
 });
 
-School.hasMany(SupplierReceiptAllocation, {
-  foreignKey: "school_id",
-  as: "supplierReceiptAllocations",
-});
-SupplierReceiptAllocation.belongsTo(School, {
-  foreignKey: "school_id",
-  as: "school",
-});
+School.hasMany(SupplierReceiptAllocation, { foreignKey: "school_id", as: "supplierReceiptAllocations" });
+SupplierReceiptAllocation.belongsTo(School, { foreignKey: "school_id", as: "school" });
 
-Book.hasMany(SupplierReceiptAllocation, {
-  foreignKey: "book_id",
-  as: "supplierReceiptAllocations",
-});
-SupplierReceiptAllocation.belongsTo(Book, {
-  foreignKey: "book_id",
-  as: "book",
-});
+Book.hasMany(SupplierReceiptAllocation, { foreignKey: "book_id", as: "supplierReceiptAllocations" });
+SupplierReceiptAllocation.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
 /* ---------- Supplier Payments ---------- */
 Supplier.hasMany(SupplierPayment, { foreignKey: "supplier_id", as: "payments" });
@@ -225,7 +238,7 @@ SupplierPayment.hasMany(SupplierLedgerTxn, {
 /* =====================================================
    EXPORTS
    ===================================================== */
-module.exports = {
+const db = {
   sequelize,
 
   User,
@@ -236,6 +249,9 @@ module.exports = {
   School,
   Transport,
   CompanyProfile,
+
+  Product,
+
   SchoolBookRequirement,
 
   PublisherOrder,
@@ -263,3 +279,5 @@ module.exports = {
   SupplierPayment,
   SupplierLedgerTxn,
 };
+
+module.exports = db;
