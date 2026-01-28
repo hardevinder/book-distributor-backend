@@ -65,6 +65,12 @@ module.exports = async function (fastify, opts) {
   // ✅ PARAM ROUTES (Grouped)
   // ======================================================
 
+  /**
+   * ✅ DELETE order (Hard delete)
+   * DELETE /api/school-orders/:orderId
+   */
+  fastify.delete("/:orderId", schoolOrderController.deleteSchoolOrder);
+
   // ---------- Email helpers for modal ----------
   // GET /api/school-orders/:orderId/email-preview
   fastify.get(

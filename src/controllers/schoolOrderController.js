@@ -32,6 +32,30 @@ const { sendMail } = require("../config/email");
  * Helpers
  * ============================================ */
 
+async function isOrderLockedForSync(order, t) {
+  if (!order) return false;
+
+  // 1) If order already sent to supplier (treat as locked if you want)
+  const emailSentCount = Number(order.email_sent_count || 0);
+  if (emailSentCount > 0) return true;
+
+  // 2) If any movement in order items
+  const hasReceived = (order.items || []).some((it) => Number(it.received_qty || 0) > 0);
+  const hasReordered = (order.items || []).some((it) => Number(it.reordered_qty || 0) > 0);
+  if (hasReceived || hasReordered) return true;
+
+  // 3) ✅ If inventory batch exists for this order => receipt/stock-in happened => LOCK
+  // (InventoryBatch is already imported in this file)
+  const invCount = await InventoryBatch.count({
+    where: { school_order_id: Number(order.id) },
+    transaction: t,
+  });
+  if (invCount > 0) return true;
+
+  return false;
+}
+
+
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -3679,3 +3703,88 @@ exports.syncSchoolSessionFromRequirements = async (req, reply) => {
   }
 };
 
+/* ============================================
+ * ✅ NEW: DELETE /api/school-orders/:orderId
+ * Hard delete order + items + requirement links
+ * BLOCK if:
+ *  - email_sent_count > 0
+ *  - any received_qty > 0 or reordered_qty > 0
+ *  - any InventoryBatch exists for this order
+ * ============================================ */
+exports.deleteSchoolOrder = async (request, reply) => {
+  const { orderId } = request.params;
+
+  const t = await sequelize.transaction();
+  try {
+    const order = await SchoolOrder.findOne({
+      where: { id: Number(orderId) },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (!order) {
+      await t.rollback();
+      return reply.code(404).send({ message: "School order not found." });
+    }
+
+    // ✅ Lock rules (email sent / received / reordered / inventory in)
+    const locked = await isOrderLockedForSync(order, t);
+    if (locked) {
+      await t.rollback();
+      return reply.code(409).send({
+        error: "OrderLocked",
+        message:
+          "This order cannot be deleted because it is locked (email sent / received or reordered qty / inventory stock-in exists).",
+      });
+    }
+
+    const itemIds = (order.items || []).map((it) => Number(it.id)).filter(Boolean);
+
+    // 1) Remove requirement links
+    if (itemIds.length) {
+      await SchoolRequirementOrderLink.destroy({
+        where: { school_order_item_id: itemIds },
+        transaction: t,
+      });
+    }
+
+    // 2) Remove order items
+    await SchoolOrderItem.destroy({
+      where: { school_order_id: order.id },
+      transaction: t,
+    });
+
+    // 3) Optional: remove email logs if model exists
+    try {
+      const Log = getEmailLogModel();
+      if (Log) {
+        await Log.destroy({
+          where: { school_order_id: order.id },
+          transaction: t,
+        });
+      }
+    } catch {
+      // ignore log cleanup errors
+    }
+
+    // 4) Delete order
+    await order.destroy({ transaction: t });
+
+    await t.commit();
+
+    return reply.code(200).send({
+      message: "Order deleted successfully.",
+      order_id: Number(orderId),
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+    request.log.error({ err }, "Error in deleteSchoolOrder");
+    return reply.code(500).send({
+      error: "Error",
+      message: err.message || "Failed to delete order.",
+    });
+  }
+};
