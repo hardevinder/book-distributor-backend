@@ -326,6 +326,9 @@ async function bumpOrderReceivedQty({ school_order_id, lines, sign, t }) {
   if (!school_order_id) return;
 
   for (const r of lines) {
+    // ✅ NEW: specimen should NOT affect order received qty
+    if (asBool(r.is_specimen)) continue;
+
     const book_id = num(r.book_id);
     const qty = Math.max(0, Math.floor(num(r.qty)));
     if (!book_id || qty <= 0) continue;
@@ -351,6 +354,7 @@ async function bumpOrderReceivedQty({ school_order_id, lines, sign, t }) {
     await row.save({ transaction: t });
   }
 }
+
 
 /* ============================================================
  * Ledger Post (idempotent)
