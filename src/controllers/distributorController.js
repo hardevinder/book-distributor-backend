@@ -1,13 +1,24 @@
-// src/controllers/distributorController.js
 "use strict";
 
 const { Op } = require("sequelize");
-const { Distributor } = require("../models");
+const bcrypt = require("bcryptjs");
+const { Distributor, User, sequelize } = require("../models");
 
 const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
+
+const safeStr = (v) => String(v ?? "").trim();
+
+const randomPassword = (len = 8) => {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+};
+
+/* ---------------- LIST ---------------- */
 
 async function list(request, reply) {
   try {
@@ -35,6 +46,8 @@ async function list(request, reply) {
   }
 }
 
+/* ---------------- CREATE (ONLY DISTRIBUTOR) ---------------- */
+
 async function create(request, reply) {
   try {
     const body = request.body || {};
@@ -56,6 +69,100 @@ async function create(request, reply) {
     return reply.code(500).send({ message: "Internal Server Error" });
   }
 }
+
+/* ---------------- CREATE DISTRIBUTOR + USER (NEW) ----------------
+ * POST /api/distributors/with-user
+ *
+ * body:
+ *  {
+ *    name, mobile, email, address, city, is_active,
+ *    user_email, user_name, user_phone,
+ *    password   (optional, auto-generate if missing)
+ *  }
+ *
+ * Note: user_email is REQUIRED (users.email is unique + required in your model)
+ */
+async function createWithUser(request, reply) {
+  const t = await sequelize.transaction();
+  try {
+    const body = request.body || {};
+
+    // Distributor
+    const name = safeStr(body.name);
+    if (!name) return reply.code(400).send({ message: "name is required" });
+
+    const distPayload = {
+      name,
+      mobile: safeStr(body.mobile) || null,
+      email: safeStr(body.email) || null,
+      address: safeStr(body.address) || null,
+      city: safeStr(body.city) || null,
+      is_active: typeof body.is_active === "boolean" ? body.is_active : true,
+    };
+
+    // User (login)
+    const user_email = safeStr(body.user_email);
+    if (!user_email) {
+      await t.rollback();
+      return reply.code(400).send({ message: "user_email is required (login email)" });
+    }
+
+    // ensure unique email
+    const exists = await User.findOne({ where: { email: user_email }, transaction: t });
+    if (exists) {
+      await t.rollback();
+      return reply.code(409).send({ message: "User with this email already exists" });
+    }
+
+    let password = safeStr(body.password);
+    if (!password) password = randomPassword(8);
+
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const userPayload = {
+      name: safeStr(body.user_name) || `${name} (Distributor)`,
+      email: user_email,
+      phone: safeStr(body.user_phone) || distPayload.mobile || null,
+      password_hash,
+      role: "distributor",
+      is_active: true,
+      // distributor_id will be set after distributor is created
+    };
+
+    // 1) create distributor
+    const dist = await Distributor.create(distPayload, { transaction: t });
+
+    // 2) create linked user
+    const user = await User.create(
+      { ...userPayload, distributor_id: dist.id },
+      { transaction: t }
+    );
+
+    await t.commit();
+
+    // return temp password only at creation time
+    return reply.send({
+      message: "Distributor + User created",
+      distributor: dist,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        distributor_id: user.distributor_id,
+      },
+      temp_password: password,
+    });
+  } catch (err) {
+    request.log.error(err);
+    try {
+      await t.rollback();
+    } catch (_) {}
+    return reply.code(500).send({ message: "Internal Server Error" });
+  }
+}
+
+/* ---------------- UPDATE ---------------- */
 
 async function update(request, reply) {
   try {
@@ -87,6 +194,8 @@ async function update(request, reply) {
   }
 }
 
+/* ---------------- REMOVE (SOFT) ---------------- */
+
 async function remove(request, reply) {
   try {
     const id = num(request.params?.id);
@@ -103,4 +212,4 @@ async function remove(request, reply) {
   }
 }
 
-module.exports = { list, create, update, remove };
+module.exports = { list, create, createWithUser, update, remove };

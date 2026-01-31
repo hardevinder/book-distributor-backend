@@ -1,4 +1,5 @@
-// src/models/user.js
+"use strict";
+
 module.exports = (sequelize, DataTypes) => {
   const User = sequelize.define(
     "User",
@@ -6,43 +7,56 @@ module.exports = (sequelize, DataTypes) => {
       id: {
         type: DataTypes.INTEGER.UNSIGNED,
         autoIncrement: true,
-        primaryKey: true
+        primaryKey: true,
       },
+
       name: {
         type: DataTypes.STRING(100),
-        allowNull: false
+        allowNull: false,
       },
+
       email: {
         type: DataTypes.STRING(150),
         allowNull: false,
-        unique: true
+        unique: true,
       },
+
       phone: {
         type: DataTypes.STRING(30),
-        allowNull: true
+        allowNull: true,
       },
+
       password_hash: {
         type: DataTypes.STRING(255),
-        allowNull: false
+        allowNull: false,
       },
+
       role: {
         type: DataTypes.ENUM("superadmin", "distributor", "school", "staff"),
         allowNull: false,
-        defaultValue: "distributor"
+        defaultValue: "distributor",
       },
+
+      // ✅ LINK TO DISTRIBUTOR (NEW)
+      distributor_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
+
       is_active: {
         type: DataTypes.BOOLEAN,
         allowNull: false,
-        defaultValue: true
+        defaultValue: true,
       },
+
       last_login_at: {
         type: DataTypes.DATE,
-        allowNull: true
-      }
+        allowNull: true,
+      },
     },
     {
       tableName: "users",
-      timestamps: true
+      timestamps: true,
     }
   );
 
