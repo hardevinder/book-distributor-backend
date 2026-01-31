@@ -1227,3 +1227,159 @@ exports.printRequirementsPdf = (request, reply) => {
       }
     });
 };
+
+/**
+ * POST /api/requirements/set-status
+ * Body:
+ *  {
+ *    school_id: number (required),
+ *    status: "draft" | "confirmed" (required),
+ *    academic_session?: string,
+ *    class_id?: number,
+ *    publisher_id?: number,
+ *    include_locked?: boolean,          // default false
+ *    allow_confirmed_to_draft?: boolean // default true (set false if you want to block)
+ *  }
+ */
+exports.setStatusForSchoolFiltered = async (request, reply) => {
+  const t = await sequelize.transaction();
+  try {
+    const body = request.body || {};
+
+    const school_id = toInt(body.school_id ?? body.schoolId);
+    const targetStatus = String(body.status ?? "").trim().toLowerCase();
+    const academic_session = toStr(body.academic_session ?? body.session);
+    const class_id = toInt(body.class_id ?? body.classId);
+    const publisher_id = toInt(body.publisher_id ?? body.publisherId);
+
+    const include_locked = truthy(body.include_locked ?? body.includeLocked ?? false);
+
+    // If you want to block confirmed -> draft in some cases, use this flag
+    const allow_confirmed_to_draft = truthy(
+      typeof body.allow_confirmed_to_draft === "undefined"
+        ? true
+        : body.allow_confirmed_to_draft
+    );
+
+    if (!school_id) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "BadRequest",
+        message: "school_id is required.",
+      });
+    }
+
+    if (!["draft", "confirmed"].includes(targetStatus)) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "BadRequest",
+        message: 'status must be "draft" or "confirmed".',
+      });
+    }
+
+    // Optional safety: validate school exists
+    const school = await School.findByPk(school_id, { transaction: t });
+    if (!school) {
+      await t.rollback();
+      return reply.code(400).send({
+        error: "BadRequest",
+        message: "Invalid school_id.",
+      });
+    }
+
+    // We update only the opposite status (avoid useless updates)
+    const fromStatus = targetStatus === "confirmed" ? "draft" : "confirmed";
+
+    // Build WHERE (SchoolBookRequirement table)
+    const where = {
+      school_id,
+      status: fromStatus,
+    };
+
+    if (academic_session) where.academic_session = academic_session;
+    if (class_id) where.class_id = class_id;
+
+    // Default: skip locked rows (safer)
+    if (!include_locked) where.is_locked = false;
+
+    // If converting confirmed -> draft, you can optionally block it globally
+    if (fromStatus === "confirmed" && targetStatus === "draft" && !allow_confirmed_to_draft) {
+      await t.rollback();
+      return reply.code(403).send({
+        error: "Forbidden",
+        message: "Confirmed → Draft is not allowed.",
+      });
+    }
+
+    // If filtering by publisher_id (on Book), join Book
+    const include = [];
+    if (publisher_id) {
+      include.push({
+        model: Book,
+        as: "book",
+        attributes: ["id", "publisher_id"],
+        required: true,
+        where: { publisher_id },
+      });
+    }
+
+    // Find matching IDs (safe even with JOIN filters)
+    const rows = await SchoolBookRequirement.findAll({
+      attributes: ["id", "is_locked"],
+      where,
+      include,
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    const matched = rows.length;
+    if (!matched) {
+      await t.commit();
+      return reply.send({
+        message: `No rows found to set status to "${targetStatus}".`,
+        school_id,
+        matched: 0,
+        updated: 0,
+        fromStatus,
+        toStatus: targetStatus,
+      });
+    }
+
+    // (Extra safety) If confirmed -> draft and include_locked=true, you may still want to skip locked
+    // If you want locked to NEVER go back to draft, uncomment below:
+    // const ids = rows.filter(r => !r.is_locked).map(r => r.id);
+
+    const ids = rows.map((r) => r.id);
+    const skipped_locked = include_locked ? 0 : rows.filter((r) => r.is_locked).length;
+
+    const [updated] = await SchoolBookRequirement.update(
+      { status: targetStatus },
+      { where: { id: { [Op.in]: ids } }, transaction: t }
+    );
+
+    await t.commit();
+
+    return reply.send({
+      message: `Updated ${updated} requirement(s) to "${targetStatus}".`,
+      school_id,
+      matched,
+      updated,
+      skipped_locked,
+      fromStatus,
+      toStatus: targetStatus,
+      filters: {
+        academic_session: academic_session || null,
+        class_id: class_id || null,
+        publisher_id: publisher_id || null,
+        include_locked,
+      },
+    });
+  } catch (err) {
+    await t.rollback();
+    request.log.error({ err }, "Error in setStatusForSchoolFiltered");
+    return reply.code(500).send({
+      error: "InternalServerError",
+      message: err.message || "Failed to update status",
+    });
+  }
+};

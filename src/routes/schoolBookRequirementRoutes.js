@@ -1,7 +1,13 @@
 // src/routes/schoolBookRequirementRoutes.js
+"use strict";
+
 const requirementController = require("../controllers/schoolBookRequirementController");
 
 module.exports = async function (fastify, opts) {
+  // ======================================================
+  // ✅ STATIC ROUTES FIRST (avoid conflict with /:id)
+  // ======================================================
+
   // IMPORT (Excel)
   fastify.post("/import", requirementController.importRequirements);
 
@@ -10,6 +16,14 @@ module.exports = async function (fastify, opts) {
 
   // PRINT (PDF)
   fastify.get("/print-pdf", requirementController.printRequirementsPdf);
+
+  // ✅ BULK: set status for filtered school (draft <-> confirmed)
+  // POST /api/requirements/set-status
+  fastify.post("/set-status", requirementController.setStatusForSchoolFiltered);
+
+  // ======================================================
+  // CRUD
+  // ======================================================
 
   // CREATE (single / upsert)
   fastify.post("/", requirementController.createRequirement);

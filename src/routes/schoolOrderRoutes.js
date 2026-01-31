@@ -64,6 +64,10 @@ module.exports = async function (fastify, opts) {
     schoolOrderController.printSupplierOrderIndexPdf
   );
 
+  // ✅ Global email logs (for suggestions)
+fastify.get("/email-logs", schoolOrderController.getAllOrderEmailLogs);
+
+
   // ======================================================
   // ✅ PARAM ROUTES (Grouped)
   // ======================================================

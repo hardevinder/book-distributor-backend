@@ -2671,6 +2671,42 @@ exports.getOrderEmailLogs = async (request, reply) => {
 };
 
 /* ============================================
+ * ✅ NEW: GET /api/school-orders/email-logs?limit=100&q=
+ * Global logs across all orders (for suggestion datalist)
+ * ============================================ */
+exports.getAllOrderEmailLogs = async (request, reply) => {
+  const limit = Math.min(Number(request.query?.limit || 100) || 100, 500);
+  const q = String(request.query?.q || "").trim();
+
+  try {
+    const Log = getEmailLogModel();
+    if (!Log) return reply.code(200).send({ data: [] });
+
+    const where = {};
+    if (q) {
+      // Search in to/cc/subject (safe)
+      where[Op.or] = [
+        { to_email: { [Op.like]: `%${q}%` } },
+        { cc_email: { [Op.like]: `%${q}%` } },
+        { subject: { [Op.like]: `%${q}%` } },
+      ];
+    }
+
+    const rows = await Log.findAll({
+      where,
+      order: [["sent_at", "DESC"]],
+      limit,
+    });
+
+    return reply.code(200).send({ data: rows });
+  } catch (err) {
+    request.log.error({ err }, "Error in getAllOrderEmailLogs");
+    return reply.code(500).send({ message: err.message || "Failed to load global email logs." });
+  }
+};
+
+
+/* ============================================
  * POST /api/school-orders/:orderId/send-email
  * ✅ UPDATED: accepts editable to/cc/subject/html from modal
  * body: { to, cc, subject, html }
