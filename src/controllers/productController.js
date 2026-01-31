@@ -111,7 +111,6 @@ async function ensureBookProducts({ onlyActiveBooks = false } = {}) {
   if (!Book || !Product) return { created: 0 };
 
   const whereBook = {};
-  // If your Book table has is_active column you can enable this.
   if (onlyActiveBooks && Book.rawAttributes && Book.rawAttributes.is_active) {
     whereBook.is_active = true;
   }
@@ -148,15 +147,14 @@ async function ensureBookProducts({ onlyActiveBooks = false } = {}) {
 
   if (!toCreate.length) return { created: 0 };
 
-  // bulkCreate with ignoreDuplicates for safety
   await Product.bulkCreate(toCreate, { ignoreDuplicates: true });
 
   return { created: toCreate.length };
 }
 
 /**
- * ✅ Helper: pick correct alias for SupplierReceipt include (depends on your association)
- * We'll try a few common ones to avoid breaking.
+ * ✅ Find distinct book_ids from DIRECT purchases (SupplierReceipt where school_order_id is null/0)
+ * We try common aliases to avoid association mismatch.
  */
 async function findDirectPurchaseBookIds({ onlyReceived = false } = {}) {
   if (!SupplierReceipt || !SupplierReceiptItem) return [];
@@ -190,8 +188,42 @@ async function findDirectPurchaseBookIds({ onlyReceived = false } = {}) {
     }
   }
 
-  // If none of the aliases worked, return empty (safer than crashing)
   return [];
+}
+
+/**
+ * ✅ NEW: ensure Product rows exist for direct-purchased books
+ * (so extras tab works even if Product table doesn't already have BOOK rows)
+ */
+async function ensureProductsForBookIds(bookIds = []) {
+  if (!Product || !Book) return { created: 0 };
+  const ids = Array.from(new Set((bookIds || []).map(num).filter(Boolean)));
+  if (!ids.length) return { created: 0 };
+
+  const existing = await Product.findAll({
+    where: { type: "BOOK", book_id: { [Op.in]: ids } },
+    attributes: ["book_id"],
+    raw: true,
+  });
+
+  const have = new Set(existing.map((r) => num(r.book_id)).filter(Boolean));
+
+  const toCreate = ids
+    .filter((id) => !have.has(id))
+    .map((book_id) => ({
+      type: "BOOK",
+      book_id,
+      name: null,
+      uom: "PCS",
+      is_active: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+  if (!toCreate.length) return { created: 0 };
+
+  await Product.bulkCreate(toCreate, { ignoreDuplicates: true });
+  return { created: toCreate.length };
 }
 
 /* =========================
@@ -202,7 +234,7 @@ module.exports = {
   // ======================================================
   // GET /api/products
   //
-  // ✅ NEW: section support
+  // ✅ section support
   //   - section=books   => BOOK products only from Requirements
   //   - section=extras  => ONLY direct purchases (MATERIAL + direct-purchased BOOKs)
   //
@@ -311,12 +343,17 @@ module.exports = {
     // ======================================================
     // ✅ section=extras => only direct purchases
     // - MATERIAL products always included
-    // - BOOK products included only if purchased directly (optional but useful)
+    // - BOOK products included only if purchased directly
+    // ✅ NEW: auto-create Product rows for those direct books if missing
     // ======================================================
     if (section === "extras") {
       const onlyReceived = bool(q.only_received);
 
+      // ✅ book ids from direct receipts
       const directBookIds = await findDirectPurchaseBookIds({ onlyReceived });
+
+      // ✅ ensure Product rows exist for these book ids (push to products)
+      const ensured = await ensureProductsForBookIds(directBookIds);
 
       const extrasWhere = {
         ...where,
@@ -350,7 +387,7 @@ module.exports = {
       const rows = await Product.findAll({
         where: extrasWhere,
         order: [
-          ["type", "ASC"], // MATERIAL first (optional)
+          ["type", "ASC"],
           ["id", "DESC"],
         ],
         include,
@@ -360,6 +397,7 @@ module.exports = {
         success: true,
         section: "extras",
         ensured_books: ensureBooks ? true : undefined,
+        ensured_direct_books: ensured?.created ? ensured.created : 0, // ✅ helpful debug
         data: rows,
       });
     }
@@ -488,10 +526,8 @@ module.exports = {
     if (changes.uom !== undefined) changes.uom = changes.uom == null ? null : String(changes.uom).trim();
     if (changes.is_active !== undefined) changes.is_active = bool(changes.is_active);
 
-    // Determine effective type (existing or updated)
     const effectiveType = changes.type || row.type;
 
-    // Build a payload to validate *as if final*
     const finalPayload = {
       type: effectiveType,
       book_id: changes.book_id !== undefined ? changes.book_id : row.book_id,
@@ -503,7 +539,6 @@ module.exports = {
     try {
       await validatePayloadForCreateOrUpdate(finalPayload, { isCreate: false });
 
-      // Apply type-based cleanup
       if (effectiveType === "BOOK") {
         changes.type = "BOOK";
         if (changes.book_id === undefined) changes.book_id = finalPayload.book_id;
@@ -567,7 +602,7 @@ module.exports = {
   },
 
   // ======================================================
-  // POST /api/products/ensure-books  (optional helper route)
+  // POST /api/products/ensure-books
   // Creates BOOK products for all books.
   // ======================================================
   async ensureBooks(req, reply) {
