@@ -157,6 +157,10 @@ BundleItem.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 Product.hasMany(BundleItem, { foreignKey: "product_id", as: "bundle_items" });
 BundleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
 
+/* ✅✅ FIX (for your error): BundleItem ↔ Book */
+Book.hasMany(BundleItem, { foreignKey: "book_id", as: "bundleItems" });
+BundleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+
 /* ✅ Bundle ↔ School / Class */
 School.hasMany(Bundle, { foreignKey: "school_id", as: "bundles" });
 Bundle.belongsTo(School, { foreignKey: "school_id", as: "school" });

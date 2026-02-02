@@ -56,10 +56,23 @@ module.exports = (sequelize, DataTypes) => {
       indexes: [
         { fields: ["bundle_id"] },
         { fields: ["product_id"] },
-
-        // prevent duplicates inside same bundle
         { unique: true, fields: ["bundle_id", "product_id"] },
       ],
+      defaultScope: {
+        // ✅ IMPORTANT: explicitly select only real columns
+        attributes: [
+          "id",
+          "bundle_id",
+          "product_id",
+          "qty",
+          "mrp",
+          "sale_price",
+          "is_optional",
+          "sort_order",
+          "createdAt",
+          "updatedAt",
+        ],
+      },
     }
   );
 
@@ -77,6 +90,9 @@ module.exports = (sequelize, DataTypes) => {
         as: "product",
       });
     }
+
+    // ❌ DO NOT add Book relation here
+    // BundleItem does NOT have book_id column.
   };
 
   return BundleItem;
