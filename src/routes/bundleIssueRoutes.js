@@ -1,6 +1,8 @@
 "use strict";
 
 const bundleIssueController = require("../controllers/bundleIssueController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify) {
   /**
@@ -8,78 +10,74 @@ module.exports = async function (fastify) {
    * Static routes BEFORE param routes
    */
 
+  // 🔒 Superadmin-only guard
+  const superadminOnly = {
+    preHandler: [fastify.authenticate, requireRoles(...SUPERADMIN_ONLY)],
+  };
+
   // ======================================================
-  // ✅ Frontend wrapper
+  // Create bundle issue (frontend wrapper)
   // POST /api/bundle-issues
-  // body: { bundle_id, issued_to_type, issued_to_id, qty, notes }
   // ======================================================
   fastify.post(
     "/",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.create
   );
 
   // ======================================================
-  // ✅ Issue bundle directly
+  // Issue bundle directly
   // POST /api/bundle-issues/bundles/:id/issue
   // ======================================================
   fastify.post(
     "/bundles/:id/issue",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.issueBundle
   );
 
   // ======================================================
-  // ✅ List issues for ONE bundle
+  // List issues for ONE bundle
   // GET /api/bundle-issues/bundles/:id/issues
   // ======================================================
   fastify.get(
     "/bundles/:id/issues",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.listIssuesForBundle
   );
 
   // ======================================================
-  // ✅ Invoice PDF for a specific issue
+  // Invoice PDF for a specific issue
   // GET /api/bundle-issues/:id/invoice
-  // (works for SCHOOL + DISTRIBUTOR; RBAC inside controller)
   // ======================================================
   fastify.get(
     "/:id/invoice",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.invoicePdf
   );
 
   // ======================================================
-  // ✅ List recent issues (history page)
-  // GET /api/bundle-issues?academic_session=2026-27&status=ISSUED
-  // RBAC handled inside controller
+  // List recent issues (history page)
+  // GET /api/bundle-issues
   // ======================================================
   fastify.get(
     "/",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.list
   );
 
   // ======================================================
-  // ✅ Cancel issue
+  // Cancel issue
   // POST /api/bundle-issues/:id/cancel
   // ======================================================
   fastify.post(
     "/:id/cancel",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleIssueController.cancel
   );
 
   /**
    * (Optional – future)
    * GET /api/bundle-issues/:id
-   * Issue details API
-   *
-   * fastify.get(
-   *   "/:id",
-   *   { preHandler: [fastify.authenticate] },
-   *   bundleIssueController.getOne
-   * );
    */
+  // fastify.get("/:id", superadminOnly, bundleIssueController.getOne);
 };

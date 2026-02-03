@@ -1,8 +1,17 @@
+// src/routes/supplierReceiptsRoutes.js
 "use strict";
 
 const supplierReceiptController = require("../controllers/supplierReceiptController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function supplierReceiptsRoutes(fastify) {
+  // 🔐 JWT auth for all supplier-receipt routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
+
   /* ===============================
    * CREATE & LIST
    * =============================== */

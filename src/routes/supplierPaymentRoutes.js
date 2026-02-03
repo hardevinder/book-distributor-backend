@@ -1,10 +1,15 @@
 "use strict";
 
 const supplierPaymentController = require("../controllers/supplierPaymentController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function supplierPaymentRoutes(fastify, opts) {
-  // 🔐 Protect all supplier-payment routes
+  // 🔐 JWT auth for all supplier-payment routes
   fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
 
   /**
    * ============================
@@ -33,7 +38,7 @@ module.exports = async function supplierPaymentRoutes(fastify, opts) {
 
   /**
    * GET /api/suppliers/:supplierId/payments/:paymentId
-   * → Get single payment (View modal)
+   * → Get single payment
    */
   fastify.get(
     "/:supplierId/payments/:paymentId",
@@ -42,7 +47,7 @@ module.exports = async function supplierPaymentRoutes(fastify, opts) {
 
   /**
    * DELETE /api/suppliers/:supplierId/payments/:paymentId
-   * → Delete payment (frontend-compatible)
+   * → Delete payment
    */
   fastify.delete(
     "/:supplierId/payments/:paymentId",
@@ -51,7 +56,7 @@ module.exports = async function supplierPaymentRoutes(fastify, opts) {
 
   /**
    * DELETE /api/suppliers/payments/:paymentId
-   * → Backward compatibility (optional)
+   * → Backward compatibility
    */
   fastify.delete(
     "/payments/:paymentId",

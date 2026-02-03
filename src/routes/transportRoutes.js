@@ -1,8 +1,17 @@
 // src/routes/transportRoutes.js
+"use strict";
 
 const transportController = require("../controllers/transportController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify, opts) {
+  // 🔐 JWT auth for all transport routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
+
   // 🔥 BULK IMPORT (Excel Upload)
   fastify.post("/import", transportController.importTransports);
 

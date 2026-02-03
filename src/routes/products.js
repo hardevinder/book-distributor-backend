@@ -1,10 +1,15 @@
 "use strict";
 
 const productController = require("../controllers/productController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify, opts) {
-  // 🔐 protect all product routes
+  // 🔐 JWT auth for all product routes
   fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
 
   // ======================================================
   // PRODUCTS
@@ -15,7 +20,7 @@ module.exports = async function (fastify, opts) {
   // ?type=BOOK|MATERIAL
   // ?include_book=1
   // ?q=search
-  // ?ensure_books=1   <-- ✅ auto-create BOOK products from Books
+  // ?ensure_books=1   <-- auto-create BOOK products from Books
   fastify.get("/", productController.listProducts);
 
   // 🔥 OPTIONAL ADMIN / FIX ROUTE

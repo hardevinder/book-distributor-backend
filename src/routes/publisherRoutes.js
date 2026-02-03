@@ -1,8 +1,17 @@
 // src/routes/publisherRoutes.js
+"use strict";
 
 const publisherController = require("../controllers/publisherController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify, opts) {
+  // 🔐 JWT auth for all publisher routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
+
   // 🔥 BULK IMPORT (Excel Upload)
   fastify.post("/import", publisherController.importPublishers);
 

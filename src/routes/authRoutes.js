@@ -1,13 +1,14 @@
 // src/routes/authRoutes.js
+"use strict";
+
 const bcrypt = require("bcryptjs");
 const { User } = require("../models");
 
 module.exports = async function (fastify, opts) {
-
   // REGISTER (for development)
   fastify.post("/register", async (request, reply) => {
     try {
-      const { name, email, phone, password, role } = request.body || {};
+      const { name, email, phone, password, role, distributor_id } = request.body || {};
 
       if (!name || !email || !password) {
         reply.code(400);
@@ -28,6 +29,8 @@ module.exports = async function (fastify, opts) {
         phone,
         password_hash,
         role: role || "distributor",
+        // ✅ if you pass distributor_id during register (optional)
+        distributor_id: distributor_id || null,
       });
 
       const token = fastify.jwt.sign(
@@ -35,6 +38,8 @@ module.exports = async function (fastify, opts) {
           id: user.id,
           email: user.email,
           role: user.role,
+          // ✅ MUST include for distributor flows
+          distributor_id: user.distributor_id || null,
         },
         {
           expiresIn: process.env.JWT_EXPIRES_IN || "1d",
@@ -49,6 +54,8 @@ module.exports = async function (fastify, opts) {
           name: user.name,
           email: user.email,
           role: user.role,
+          // ✅ return it too
+          distributor_id: user.distributor_id || null,
         },
       };
     } catch (err) {
@@ -68,7 +75,6 @@ module.exports = async function (fastify, opts) {
       }
 
       const user = await User.findOne({ where: { email } });
-
       if (!user) {
         reply.code(401);
         return { error: "Invalid credentials" };
@@ -85,6 +91,8 @@ module.exports = async function (fastify, opts) {
           id: user.id,
           email: user.email,
           role: user.role,
+          // ✅ MUST include for distributor flows
+          distributor_id: user.distributor_id || null,
         },
         {
           expiresIn: process.env.JWT_EXPIRES_IN || "1d",
@@ -101,6 +109,8 @@ module.exports = async function (fastify, opts) {
           name: user.name,
           email: user.email,
           role: user.role,
+          // ✅ return it too
+          distributor_id: user.distributor_id || null,
         },
       };
     } catch (err) {
@@ -112,7 +122,7 @@ module.exports = async function (fastify, opts) {
   // PROTECTED: GET CURRENT USER
   fastify.get("/me", { preHandler: [fastify.authenticate] }, async (request) => {
     const user = await User.findByPk(request.user.id, {
-      attributes: ["id", "name", "email", "role", "createdAt"],
+      attributes: ["id", "name", "email", "role", "distributor_id", "createdAt"],
     });
 
     return user;

@@ -2,8 +2,16 @@
 "use strict";
 
 const requirementController = require("../controllers/schoolBookRequirementController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify, opts) {
+  // 🔐 JWT auth for all requirement routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
+
   // ======================================================
   // ✅ STATIC ROUTES FIRST (avoid conflict with /:id)
   // ======================================================

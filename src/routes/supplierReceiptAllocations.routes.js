@@ -4,14 +4,21 @@
 const supplierReceiptAllocationController = require(
   "../controllers/supplierReceiptAllocationController"
 );
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function supplierReceiptAllocationsRoutes(fastify) {
+  // 🔐 JWT auth for all allocation routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
+
   /* ============================================================
    * SCHOOL-WISE / REPORTING (STATIC FIRST ✅)
    * ============================================================ */
 
-  // 🔹 School-wise / book-wise distribution report
-  // GET /api/supplier-receipt-allocations?school_id=&book_id=&from=&to=&supplier_id=&q=
+  // GET /api/supplier-receipt-allocations
   fastify.get(
     "/supplier-receipt-allocations",
     supplierReceiptAllocationController.listSchoolWise
@@ -21,14 +28,12 @@ module.exports = async function supplierReceiptAllocationsRoutes(fastify) {
    * RECEIPT-WISE ALLOCATIONS
    * ============================================================ */
 
-  // 🔹 Get allocations for a receipt
   // GET /api/supplier-receipts/:id/allocations
   fastify.get(
     "/supplier-receipts/:id/allocations",
     supplierReceiptAllocationController.listByReceipt
   );
 
-  // 🔹 Create / Replace allocations for a receipt
   // POST /api/supplier-receipts/:id/allocations
   // body: { mode: "APPEND"|"REPLACE", allocations: [...] }
   fastify.post(

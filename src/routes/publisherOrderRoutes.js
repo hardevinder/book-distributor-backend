@@ -1,31 +1,28 @@
 // src/routes/publisherOrderRoutes.js
+"use strict";
 
 const publisherOrderController = require("../controllers/publisherOrderController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 async function publisherOrderRoutes(fastify, opts) {
-  // Enable auth if needed:
-  // const auth = fastify.authenticate || ((req, reply, done) => done());
+  // 🔐 Auth for all routes
+  fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
 
   /* ----------------------------------------------------------
    *  GET /api/publisher-orders
-   *  (Used by frontend table + View button)
    * ---------------------------------------------------------- */
-  fastify.get(
-    "/",
-    {
-      // preHandler: auth,
-    },
-    publisherOrderController.listPublisherOrders
-  );
+  fastify.get("/", publisherOrderController.listPublisherOrders);
 
   /* ----------------------------------------------------------
    *  POST /api/publisher-orders/generate
-   *  Generate orders from confirmed school requirements
    * ---------------------------------------------------------- */
   fastify.post(
     "/generate",
     {
-      // preHandler: auth,
       schema: {
         body: {
           type: "object",
@@ -41,12 +38,10 @@ async function publisherOrderRoutes(fastify, opts) {
 
   /* ----------------------------------------------------------
    *  POST /api/publisher-orders/:orderId/receive
-   *  Update received quantities + order status
    * ---------------------------------------------------------- */
   fastify.post(
     "/:orderId/receive",
     {
-      // preHandler: auth,
       schema: {
         params: {
           type: "object",
@@ -83,12 +78,10 @@ async function publisherOrderRoutes(fastify, opts) {
 
   /* ----------------------------------------------------------
    *  POST /api/publisher-orders/:orderId/reorder-pending
-   *  Create a new PO for pending quantity of this order
    * ---------------------------------------------------------- */
   fastify.post(
     "/:orderId/reorder-pending",
     {
-      // preHandler: auth,
       schema: {
         params: {
           type: "object",
@@ -104,12 +97,10 @@ async function publisherOrderRoutes(fastify, opts) {
 
   /* ----------------------------------------------------------
    *  POST /api/publisher-orders/:orderId/send-email
-   *  Send this specific PO email
    * ---------------------------------------------------------- */
   fastify.post(
     "/:orderId/send-email",
     {
-      // preHandler: auth,
       schema: {
         params: {
           type: "object",

@@ -2,51 +2,49 @@
 "use strict";
 
 const bundleController = require("../controllers/bundleController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify, opts) {
-  // 🔐 Protect all bundle routes
+  // 🔐 JWT auth for all bundle routes
   fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔓 READ access
+  const READ = { preHandler: [requireRoles("superadmin", "distributor")] };
+
+  // 🔒 WRITE access
+  const WRITE = { preHandler: [requireRoles(...SUPERADMIN_ONLY)] };
 
   // ======================================================
   // ✅ STATIC ROUTES FIRST (avoid conflict with /:id)
   // ======================================================
 
-  // GET /api/bundles
-  // query: school_id, class_id, class_name, academic_session, is_active
-  fastify.get("/", bundleController.listBundles);
+  // GET /api/bundles  (READ)
+  fastify.get("/", READ, bundleController.listBundles);
 
-  // POST /api/bundles
-  fastify.post("/", bundleController.createBundle);
+  // POST /api/bundles  (WRITE)
+  fastify.post("/", WRITE, bundleController.createBundle);
 
   // ======================================================
-  // ✅ ITEM ROUTES BEFORE /:id (keep order safe)
+  // ✅ ITEM ROUTES BEFORE /:id
   // ======================================================
 
-  /**
-   * POST /api/bundles/:id/items
-   * Body:
-   * {
-   *   replace: false,
-   *   items: [
-   *     { id?, product_id, qty, mrp, sale_price, is_optional, sort_order }
-   *   ]
-   * }
-   */
-  fastify.post("/:id/items", bundleController.upsertBundleItems);
+  // POST /api/bundles/:id/items  (WRITE)
+  fastify.post("/:id/items", WRITE, bundleController.upsertBundleItems);
 
-  // DELETE /api/bundles/:id/items/:itemId
-  fastify.delete("/:id/items/:itemId", bundleController.deleteBundleItem);
+  // DELETE /api/bundles/:id/items/:itemId  (WRITE)
+  fastify.delete("/:id/items/:itemId", WRITE, bundleController.deleteBundleItem);
 
   // ======================================================
   // ✅ PARAM ROUTES LAST
   // ======================================================
 
-  // GET /api/bundles/:id
-  fastify.get("/:id", bundleController.getBundleById);
+  // GET /api/bundles/:id  (READ)
+  fastify.get("/:id", READ, bundleController.getBundleById);
 
-  // PUT /api/bundles/:id
-  fastify.put("/:id", bundleController.updateBundle);
+  // PUT /api/bundles/:id  (WRITE)
+  fastify.put("/:id", WRITE, bundleController.updateBundle);
 
-  // DELETE /api/bundles/:id
-  fastify.delete("/:id", bundleController.deleteBundle);
+  // DELETE /api/bundles/:id  (WRITE)
+  fastify.delete("/:id", WRITE, bundleController.deleteBundle);
 };

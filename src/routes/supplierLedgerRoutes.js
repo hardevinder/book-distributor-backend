@@ -2,10 +2,15 @@
 "use strict";
 
 const supplierLedgerController = require("../controllers/supplierLedgerController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function supplierLedgerRoutes(fastify, opts) {
-  // 🔐 Protect all supplier-ledger routes with JWT (recommended)
+  // 🔐 JWT auth for all supplier-ledger routes
   fastify.addHook("onRequest", fastify.authenticate);
+
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
 
   /**
    * ============================
@@ -24,11 +29,6 @@ module.exports = async function supplierLedgerRoutes(fastify, opts) {
 
   /**
    * GET /api/suppliers/:supplierId/ledger
-   * Query params:
-   *   - from=YYYY-MM-DD
-   *   - to=YYYY-MM-DD
-   *   - limit=number (default 200, max 500)
-   *
    * → Ledger with running balance
    */
   fastify.get(
@@ -40,13 +40,6 @@ module.exports = async function supplierLedgerRoutes(fastify, opts) {
    * ============================
    * (NEXT STEP – NOT YET ADDED)
    * ============================
-   *
-   * POST /api/suppliers/:supplierId/payments
-   * → Creates credit entry (SupplierPayment + Ledger credit)
-   *
-   * GET  /api/suppliers/:supplierId/payments
-   * → List payments
-   *
-   * We will add these after SupplierPayment controller
+   * Payments routes will also inherit SUPERADMIN-only
    */
 };

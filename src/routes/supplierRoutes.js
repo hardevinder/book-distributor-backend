@@ -1,56 +1,35 @@
 // src/routes/supplierRoutes.js
+"use strict";
+
 const supplierController = require("../controllers/supplierController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 async function supplierRoutes(fastify) {
-  const requireRoles = (roles) => async (request, reply) => {
-    await fastify.authenticate(request, reply);
+  // 🔐 JWT auth for all supplier routes
+  fastify.addHook("onRequest", fastify.authenticate);
 
-    const role =
-      request.user?.role ||
-      request.user?.data?.role ||
-      request.user?.user?.role;
+  // 🔒 SUPERADMIN only
+  fastify.addHook("preHandler", requireRoles(...SUPERADMIN_ONLY));
 
-    if (!role || !roles.includes(String(role).toLowerCase())) {
-      return reply.code(403).send({ error: "Forbidden" });
-    }
-  };
+  // LIST
+  fastify.get("/", supplierController.list);
 
-  // ✅ Everyone logged-in can read
-  fastify.get("/", { preHandler: [fastify.authenticate] }, supplierController.list);
+  // invoices
+  fastify.get("/:id/invoices", supplierController.listInvoices);
+  fastify.get("/:id/invoices/:invoiceId", supplierController.getInvoiceDetail);
 
-  // ✅ NEW: invoices
-  fastify.get(
-    "/:id/invoices",
-    { preHandler: [fastify.authenticate] },
-    supplierController.listInvoices
-  );
+  // GET SINGLE
+  fastify.get("/:id", supplierController.getById);
 
-  fastify.get(
-    "/:id/invoices/:invoiceId",
-    { preHandler: [fastify.authenticate] },
-    supplierController.getInvoiceDetail
-  );
+  // CREATE
+  fastify.post("/", supplierController.create);
 
-  fastify.get("/:id", { preHandler: [fastify.authenticate] }, supplierController.getById);
+  // UPDATE
+  fastify.put("/:id", supplierController.update);
 
-  // ✅ Only admin/superadmin can write
-  fastify.post(
-    "/",
-    { preHandler: [requireRoles(["admin", "superadmin"])] },
-    supplierController.create
-  );
-
-  fastify.put(
-    "/:id",
-    { preHandler: [requireRoles(["admin", "superadmin"])] },
-    supplierController.update
-  );
-
-  fastify.delete(
-    "/:id",
-    { preHandler: [requireRoles(["admin", "superadmin"])] },
-    supplierController.remove
-  );
+  // DELETE
+  fastify.delete("/:id", supplierController.remove);
 }
 
 module.exports = supplierRoutes;

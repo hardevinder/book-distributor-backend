@@ -70,17 +70,8 @@ async function create(request, reply) {
   }
 }
 
-/* ---------------- CREATE DISTRIBUTOR + USER (NEW) ----------------
+/* ---------------- CREATE DISTRIBUTOR + USER ----------------
  * POST /api/distributors/with-user
- *
- * body:
- *  {
- *    name, mobile, email, address, city, is_active,
- *    user_email, user_name, user_phone,
- *    password   (optional, auto-generate if missing)
- *  }
- *
- * Note: user_email is REQUIRED (users.email is unique + required in your model)
  */
 async function createWithUser(request, reply) {
   const t = await sequelize.transaction();
@@ -89,7 +80,10 @@ async function createWithUser(request, reply) {
 
     // Distributor
     const name = safeStr(body.name);
-    if (!name) return reply.code(400).send({ message: "name is required" });
+    if (!name) {
+      await t.rollback();
+      return reply.code(400).send({ message: "name is required" });
+    }
 
     const distPayload = {
       name,
@@ -126,17 +120,13 @@ async function createWithUser(request, reply) {
       password_hash,
       role: "distributor",
       is_active: true,
-      // distributor_id will be set after distributor is created
     };
 
     // 1) create distributor
     const dist = await Distributor.create(distPayload, { transaction: t });
 
     // 2) create linked user
-    const user = await User.create(
-      { ...userPayload, distributor_id: dist.id },
-      { transaction: t }
-    );
+    const user = await User.create({ ...userPayload, distributor_id: dist.id }, { transaction: t });
 
     await t.commit();
 
@@ -162,7 +152,119 @@ async function createWithUser(request, reply) {
   }
 }
 
-/* ---------------- UPDATE ---------------- */
+/* ---------------- GET DISTRIBUTOR LOGIN USER ----------------
+ * GET /api/distributors/:id/user
+ */
+async function getUserForDistributor(request, reply) {
+  try {
+    const id = num(request.params?.id);
+    if (!id) return reply.code(400).send({ message: "Invalid distributor id" });
+
+    const user = await User.findOne({
+      where: { distributor_id: id },
+      attributes: ["id", "name", "email", "phone", "role", "is_active", "distributor_id"],
+    });
+
+    return reply.send({ user: user || null });
+  } catch (err) {
+    request.log.error(err);
+    return reply.code(500).send({ message: "Internal Server Error" });
+  }
+}
+
+/* ---------------- UPDATE DISTRIBUTOR LOGIN USER ----------------
+ * PATCH /api/distributors/:id/user
+ *
+ * body: { name?, email?, phone?, password? }
+ * - password: if "" => auto-generate and return temp_password once
+ */
+async function updateUserForDistributor(request, reply) {
+  const t = await sequelize.transaction();
+  try {
+    const id = num(request.params?.id);
+    if (!id) {
+      await t.rollback();
+      return reply.code(400).send({ message: "Invalid distributor id" });
+    }
+
+    const body = request.body || {};
+
+    const user = await User.findOne({ where: { distributor_id: id }, transaction: t });
+    if (!user) {
+      await t.rollback();
+      return reply.code(404).send({ message: "Login user not found for this distributor" });
+    }
+
+    const patch = {};
+    let temp_password = null;
+
+    // name
+    if (typeof body.name !== "undefined") {
+      const name = safeStr(body.name);
+      if (!name) {
+        await t.rollback();
+        return reply.code(400).send({ message: "name cannot be empty" });
+      }
+      patch.name = name;
+    }
+
+    // email
+    if (typeof body.email !== "undefined") {
+      const email = safeStr(body.email);
+      if (!email) {
+        await t.rollback();
+        return reply.code(400).send({ message: "email cannot be empty" });
+      }
+
+      if (email !== user.email) {
+        const exists = await User.findOne({ where: { email }, transaction: t });
+        if (exists) {
+          await t.rollback();
+          return reply.code(409).send({ message: "User with this email already exists" });
+        }
+      }
+
+      patch.email = email;
+    }
+
+    // phone
+    if (typeof body.phone !== "undefined") {
+      patch.phone = safeStr(body.phone) || null;
+    }
+
+    // password (optional)
+    if (typeof body.password !== "undefined") {
+      let password = safeStr(body.password);
+      if (!password) password = randomPassword(8);
+      patch.password_hash = await bcrypt.hash(password, 10);
+      temp_password = password;
+    }
+
+    await user.update(patch, { transaction: t });
+    await t.commit();
+
+    return reply.send({
+      message: "Login updated",
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        distributor_id: user.distributor_id,
+      },
+      temp_password, // only if password changed
+    });
+  } catch (err) {
+    request.log.error(err);
+    try {
+      await t.rollback();
+    } catch (_) {}
+    return reply.code(500).send({ message: "Internal Server Error" });
+  }
+}
+
+/* ---------------- UPDATE DISTRIBUTOR ---------------- */
 
 async function update(request, reply) {
   try {
@@ -212,4 +314,12 @@ async function remove(request, reply) {
   }
 }
 
-module.exports = { list, create, createWithUser, update, remove };
+module.exports = {
+  list,
+  create,
+  createWithUser,
+  getUserForDistributor,
+  updateUserForDistributor,
+  update,
+  remove,
+};

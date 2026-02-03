@@ -1,25 +1,32 @@
 "use strict";
 
 const bundleDispatchController = require("../controllers/bundleDispatchController");
+const requireRoles = require("../middlewares/requireRoles");
+const { SUPERADMIN_ONLY } = require("../constants/roles");
 
 module.exports = async function (fastify) {
+  // 🔒 Superadmin-only guard (auth + role)
+  const superadminOnly = {
+    preHandler: [fastify.authenticate, requireRoles(...SUPERADMIN_ONLY)],
+  };
+
   // ------------------------------------------------------
   // Create dispatch
   // POST /api/bundle-dispatches
   // ------------------------------------------------------
   fastify.post(
     "/",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleDispatchController.createDispatch
   );
 
   // ------------------------------------------------------
-  // List dispatches (filters: bundle_id, status, q, etc.)
+  // List dispatches
   // GET /api/bundle-dispatches
   // ------------------------------------------------------
   fastify.get(
     "/",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleDispatchController.listDispatches
   );
 
@@ -30,7 +37,7 @@ module.exports = async function (fastify) {
   // ------------------------------------------------------
   fastify.get(
     "/:id/challan",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleDispatchController.downloadChallanPdf
   );
 
@@ -40,7 +47,7 @@ module.exports = async function (fastify) {
   // ------------------------------------------------------
   fastify.patch(
     "/:id/status",
-    { preHandler: [fastify.authenticate] },
+    superadminOnly,
     bundleDispatchController.updateStatus
   );
 };

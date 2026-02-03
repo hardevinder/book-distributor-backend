@@ -60,6 +60,12 @@ const BundleIssue = require("./bundleIssue")(sequelize, DataTypes);
 const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
 
 /* ======================
+   ✅ SALES (NEW)
+   ====================== */
+const Sale = require("./sale")(sequelize, DataTypes);
+const SaleItem = require("./saleItem")(sequelize, DataTypes);
+
+/* ======================
    SUPPLIER ACCOUNTING
    ====================== */
 const SupplierReceipt = require("./supplierReceipt")(sequelize, DataTypes);
@@ -142,7 +148,7 @@ InventoryBatch.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 Supplier.hasMany(InventoryBatch, { foreignKey: "supplier_id", as: "inventory_batches" });
 InventoryBatch.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
-/* ✅ FIX: SchoolOrder ↔ InventoryBatch (this removes your error) */
+/* ✅ FIX: SchoolOrder ↔ InventoryBatch */
 SchoolOrder.hasMany(InventoryBatch, { foreignKey: "school_order_id", as: "inventoryBatches" });
 InventoryBatch.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "schoolOrder" });
 
@@ -157,9 +163,11 @@ BundleItem.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 Product.hasMany(BundleItem, { foreignKey: "product_id", as: "bundle_items" });
 BundleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
 
-/* ✅✅ FIX (for your error): BundleItem ↔ Book */
-Book.hasMany(BundleItem, { foreignKey: "book_id", as: "bundleItems" });
-BundleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+/* ✅ BundleItem ↔ Book (ONLY if your bundle_items table has book_id) */
+if (BundleItem?.rawAttributes?.book_id) {
+  Book.hasMany(BundleItem, { foreignKey: "book_id", as: "bundleItems" });
+  BundleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+}
 
 /* ✅ Bundle ↔ School / Class */
 School.hasMany(Bundle, { foreignKey: "school_id", as: "bundles" });
@@ -168,9 +176,15 @@ Bundle.belongsTo(School, { foreignKey: "school_id", as: "school" });
 Class.hasMany(Bundle, { foreignKey: "class_id", as: "bundles" });
 Bundle.belongsTo(Class, { foreignKey: "class_id", as: "class" });
 
+/* Bundle ↔ Issues */
 Bundle.hasMany(BundleIssue, { foreignKey: "bundle_id", as: "issues" });
 BundleIssue.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 
+/* ✅ BundleIssue polymorphic target */
+BundleIssue.belongsTo(School, { foreignKey: "issued_to_id", constraints: false, as: "issuedSchool" });
+BundleIssue.belongsTo(Distributor, { foreignKey: "issued_to_id", constraints: false, as: "issuedDistributor" });
+
+/* Issue ↔ Dispatches */
 BundleIssue.hasMany(BundleDispatch, { foreignKey: "bundle_issue_id", as: "dispatches" });
 BundleDispatch.belongsTo(BundleIssue, { foreignKey: "bundle_issue_id", as: "issue" });
 
@@ -178,6 +192,36 @@ if (BundleDispatch.rawAttributes && BundleDispatch.rawAttributes.distributor_id)
   Distributor.hasMany(BundleDispatch, { foreignKey: "distributor_id", as: "bundleDispatches" });
   BundleDispatch.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
 }
+
+/* ======================
+   ✅ SALES ASSOCIATIONS
+   ====================== */
+
+/* Sale ↔ SaleItem */
+Sale.hasMany(SaleItem, { foreignKey: "sale_id", as: "items", onDelete: "CASCADE", hooks: true });
+SaleItem.belongsTo(Sale, { foreignKey: "sale_id", as: "sale" });
+
+/* SaleItem ↔ Product */
+Product.hasMany(SaleItem, { foreignKey: "product_id", as: "sale_items" });
+SaleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
+
+/* SaleItem ↔ Book (ONLY if sale_items has book_id) */
+if (SaleItem?.rawAttributes?.book_id) {
+  Book.hasMany(SaleItem, { foreignKey: "book_id", as: "sale_items" });
+  SaleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+}
+
+/* Sale ↔ Bundle (optional) */
+Sale.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
+Bundle.hasMany(Sale, { foreignKey: "bundle_id", as: "sales" });
+
+/* Sale sold_to polymorphic */
+Sale.belongsTo(School, { foreignKey: "sold_to_id", constraints: false, as: "soldSchool" });
+Sale.belongsTo(Distributor, { foreignKey: "sold_to_id", constraints: false, as: "soldDistributor" });
+
+/* created_by / cancelled_by (record sold by whom) */
+Sale.belongsTo(User, { foreignKey: "created_by", as: "creator" });
+Sale.belongsTo(User, { foreignKey: "cancelled_by", as: "canceller" });
 
 /* ---------- Supplier Receipts ---------- */
 Supplier.hasMany(SupplierReceipt, { foreignKey: "supplier_id", as: "receipts" });
@@ -276,6 +320,10 @@ const db = {
   Distributor,
   BundleIssue,
   BundleDispatch,
+
+  // ✅ SALES
+  Sale,
+  SaleItem,
 
   SupplierReceipt,
   SupplierReceiptItem,

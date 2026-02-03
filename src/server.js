@@ -194,6 +194,13 @@ const buildServer = () => {
     prefix: "/api/bundle-dispatches",
   });
 
+  /* ======================
+     ✅ SALES (NEW)
+     ====================== */
+  fastify.register(require("./routes/saleRoutes"), {
+    prefix: "/api/sales",
+  });
+
   /* ---------------- STOCK & PROFILE ---------------- */
   fastify.register(require("./routes/stockRoutes"), { prefix: "/api/stock" });
   fastify.register(require("./routes/companyProfileRoutes"), { prefix: "/api" });
