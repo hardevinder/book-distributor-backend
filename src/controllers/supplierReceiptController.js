@@ -1012,7 +1012,7 @@ exports.create = async (request, reply) => {
   const doc_date = body.doc_date ? new Date(body.doc_date) : null;
 
   const invoice_no = body.invoice_no ? String(body.invoice_no).trim() : null;
-  const invoice_date = body.invoice_date ? new Date(body.invoice_date) : null;
+  const invoice_date_input = body.invoice_date ? new Date(body.invoice_date) : null;
 
   const academic_session = body.academic_session ? String(body.academic_session).trim() : null;
   const received_date = body.received_date ? new Date(body.received_date) : now();
@@ -1154,7 +1154,11 @@ const calcLines = items.map((it) => {
     const receipt_no = await makeReceiptNo(t);
 
     const final_doc_no = doc_no || invoice_no || null;
-    const final_doc_date = doc_date || invoice_date || null;
+    const final_doc_date = doc_date || invoice_date_input || null;
+
+    // ✅ DB has NOT NULL invoice_date, so ensure fallback always exists (especially for CHALLAN)
+    const safe_invoice_date = invoice_date_input || final_doc_date || received_date || now();
+
 
     const receiptPayloadBase = {
       supplier_id,
@@ -1169,7 +1173,7 @@ const calcLines = items.map((it) => {
       doc_date: final_doc_date ? new Date(final_doc_date) : null,
 
       invoice_no: invoice_no || (receive_doc_type === "INVOICE" ? final_doc_no : null),
-      invoice_date: invoice_date ? new Date(invoice_date) : null,
+      invoice_date: new Date(safe_invoice_date),
 
       academic_session,
       received_date,
@@ -1405,9 +1409,13 @@ exports.update = async (request, reply) => {
       }
     }
 
-    if (body.invoice_date !== undefined && attrs.invoice_date) {
-      receipt.invoice_date = body.invoice_date ? new Date(body.invoice_date) : receipt.invoice_date;
+   if (body.invoice_date !== undefined && attrs.invoice_date) {
+      const next = body.invoice_date ? new Date(body.invoice_date) : null;
+
+      // ✅ never allow NULL (DB constraint). Fallback to doc_date/received_date/now
+      receipt.invoice_date = next || receipt.doc_date || receipt.received_date || now();
     }
+
 
     const wantsItemsEdit = Array.isArray(body.items);
     const wantsHeaderMoneyEdit =
