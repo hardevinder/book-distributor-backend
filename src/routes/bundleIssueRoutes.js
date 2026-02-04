@@ -10,18 +10,33 @@ module.exports = async function (fastify) {
    * Static routes BEFORE param routes
    */
 
-  // 🔒 Superadmin-only guard
+  // 🔒 Superadmin-only (very limited use)
   const superadminOnly = {
     preHandler: [fastify.authenticate, requireRoles(...SUPERADMIN_ONLY)],
   };
 
+  // 🔓 Admin + Distributor (controller enforces ownership)
+  const adminOrDistributor = {
+    preHandler: [
+      fastify.authenticate,
+      requireRoles(
+        "SUPERADMIN",
+        "ADMIN",
+        "OWNER",
+        "STAFF",
+        "ACCOUNTANT",
+        "DISTRIBUTOR"
+      ),
+    ],
+  };
+
   // ======================================================
-  // Create bundle issue (frontend wrapper)
+  // Create bundle issue (wrapper)
   // POST /api/bundle-issues
   // ======================================================
   fastify.post(
     "/",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.create
   );
 
@@ -31,7 +46,7 @@ module.exports = async function (fastify) {
   // ======================================================
   fastify.post(
     "/bundles/:id/issue",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.issueBundle
   );
 
@@ -41,27 +56,27 @@ module.exports = async function (fastify) {
   // ======================================================
   fastify.get(
     "/bundles/:id/issues",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.listIssuesForBundle
   );
 
   // ======================================================
-  // Invoice PDF for a specific issue
+  // Invoice PDF
   // GET /api/bundle-issues/:id/invoice
   // ======================================================
   fastify.get(
     "/:id/invoice",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.invoicePdf
   );
 
   // ======================================================
-  // List recent issues (history page)
+  // List recent issues
   // GET /api/bundle-issues
   // ======================================================
   fastify.get(
     "/",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.list
   );
 
@@ -71,13 +86,17 @@ module.exports = async function (fastify) {
   // ======================================================
   fastify.post(
     "/:id/cancel",
-    superadminOnly,
+    adminOrDistributor,
     bundleIssueController.cancel
   );
 
-  /**
-   * (Optional – future)
-   * GET /api/bundle-issues/:id
-   */
-  // fastify.get("/:id", superadminOnly, bundleIssueController.getOne);
+  // ======================================================
+  // Return issue (stock return)
+  // POST /api/bundle-issues/:id/return
+  // ======================================================
+  fastify.post(
+    "/:id/return",
+    adminOrDistributor,
+    bundleIssueController.returnIssue
+  );
 };

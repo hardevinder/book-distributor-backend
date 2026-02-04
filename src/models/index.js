@@ -60,6 +60,11 @@ const BundleIssue = require("./bundleIssue")(sequelize, DataTypes);
 const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
 
 /* ======================
+   ✅ DISTRIBUTOR ↔ SCHOOL MAPPING (NEW)
+   ====================== */
+const DistributorSchool = require("./distributorSchool")(sequelize, DataTypes);
+
+/* ======================
    ✅ SALES (NEW)
    ====================== */
 const Sale = require("./sale")(sequelize, DataTypes);
@@ -193,6 +198,33 @@ if (BundleDispatch.rawAttributes && BundleDispatch.rawAttributes.distributor_id)
   BundleDispatch.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
 }
 
+/* =========================================================
+   ✅ Distributor ↔ School Restriction (Mapping)
+   - Dropdown should show only assigned schools for distributor
+   ========================================================= */
+
+/* direct mapping rows */
+Distributor.hasMany(DistributorSchool, { foreignKey: "distributor_id", as: "schoolMappings" });
+DistributorSchool.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
+
+School.hasMany(DistributorSchool, { foreignKey: "school_id", as: "distributorMappings" });
+DistributorSchool.belongsTo(School, { foreignKey: "school_id", as: "school" });
+
+/* many-to-many */
+Distributor.belongsToMany(School, {
+  through: DistributorSchool,
+  foreignKey: "distributor_id",
+  otherKey: "school_id",
+  as: "schools",
+});
+
+School.belongsToMany(Distributor, {
+  through: DistributorSchool,
+  foreignKey: "school_id",
+  otherKey: "distributor_id",
+  as: "distributors",
+});
+
 /* ======================
    ✅ SALES ASSOCIATIONS
    ====================== */
@@ -320,6 +352,9 @@ const db = {
   Distributor,
   BundleIssue,
   BundleDispatch,
+
+  // ✅ Distributor ↔ School mapping
+  DistributorSchool,
 
   // ✅ SALES
   Sale,

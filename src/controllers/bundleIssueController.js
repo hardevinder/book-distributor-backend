@@ -16,12 +16,11 @@ const {
   InventoryTxn,
   School,
   Distributor,
+  DistributorSchool, // ✅ NEW
   Product,
-  Book,
 
-  // optional (if exists in your models index)
+  // optional
   CompanyProfile,
-  Transport,
 
   sequelize,
 } = require("../models");
@@ -33,9 +32,7 @@ const TXN_TYPE = {
   RESERVE: "RESERVE",
   UNRESERVE: "UNRESERVE",
   OUT: "OUT",
-
-  // ✅ NEW: return from distributor/customer back to stock
-  RETURN: "RETURN",
+  RETURN: "RETURN", // ✅ return from distributor back to stock
 };
 
 const ADMINISH_ROLES = ["ADMIN", "SUPERADMIN", "OWNER", "STAFF", "ACCOUNTANT"];
@@ -59,6 +56,7 @@ function formatDateIN(d) {
     return String(d);
   }
 }
+
 
 function safeText(v) {
   return String(v ?? "").trim();
@@ -97,7 +95,33 @@ function isDistributorUser(user) {
 }
 
 function getDistributorIdFromUser(user) {
-  return Number(user?.distributor_id || user?.distributorId || user?.DistributorId || 0) || 0;
+  return (
+    Number(user?.distributor_id || user?.distributorId || user?.DistributorId || 0) ||
+    0
+  );
+}
+
+/**
+ * ✅ When issue to distributor, auto-create/activate mapping:
+ * distributor_schools(distributor_id, school_id)
+ */
+async function ensureDistributorSchoolLink({ distributor_id, school_id, t }) {
+  const did = num(distributor_id);
+  const sid = num(school_id);
+  if (!did || !sid) return;
+
+  if (!DistributorSchool || !DistributorSchool.findOrCreate) return;
+
+  const [row] = await DistributorSchool.findOrCreate({
+    where: { distributor_id: did, school_id: sid },
+    defaults: { distributor_id: did, school_id: sid, is_active: true },
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+
+  if (row && row.is_active === false) {
+    await row.update({ is_active: true }, { transaction: t });
+  }
 }
 
 /**
@@ -119,7 +143,10 @@ function enforceIssuerAuthorization({ user, issued_to_type, issued_to_id }) {
       throw err;
     }
 
-    if (String(issued_to_type).toUpperCase() !== "DISTRIBUTOR" || Number(issued_to_id) !== Number(myDid)) {
+    if (
+      String(issued_to_type).toUpperCase() !== "DISTRIBUTOR" ||
+      Number(issued_to_id) !== Number(myDid)
+    ) {
       const err = new Error("Not allowed: distributor can issue only to own distributor_id");
       err.statusCode = 403;
       throw err;
@@ -135,7 +162,7 @@ function enforceIssuerAuthorization({ user, issued_to_type, issued_to_id }) {
 
 /**
  * ✅ FIFO allocation from available batches
- * returns allocations for as much as possible + remaining (shortage)
+ * returns allocations + remaining (shortage)
  */
 async function allocateFromBatches({ book_id, qtyNeeded, t, lock }) {
   const batches = await InventoryBatch.findAll({
@@ -175,9 +202,6 @@ function resolveBookIdFromProduct(p) {
   return 0;
 }
 
-/**
- * ✅ Normalize product type
- */
 function normalizeProductType(p) {
   return String(p?.type || "BOOK").toUpperCase();
 }
@@ -256,7 +280,6 @@ function formatMetaForHumans(meta) {
     }
   }
 
-  // ✅ NEW: return summary (optional)
   if (Array.isArray(meta.returned_summary) && meta.returned_summary.length) {
     lines.push("");
     lines.push("Returned back:");
@@ -341,9 +364,6 @@ function buildItemRows({ requested_summary = [], issued_summary = [], non_book_i
   return rows;
 }
 
-/**
- * ✅ Compute status from meta
- */
 function computeStatusFromMeta(meta) {
   const s = String(meta?.computed_status || "").toUpperCase();
   if (s) return s;
@@ -497,15 +517,13 @@ function getCompanyLine(company) {
   const phone = safeText(company?.phone || company?.mobile) || "";
   const email = safeText(company?.email) || "";
 
-  const parts = [
+  return [
     name,
     addr ? addr : null,
     gst ? `GSTIN: ${gst}` : null,
     phone ? `Ph: ${phone}` : null,
     email ? `Email: ${email}` : null,
   ].filter(Boolean);
-
-  return parts;
 }
 
 function drawHr(doc, y) {
@@ -515,14 +533,12 @@ function drawHr(doc, y) {
 
 /**
  * Generates invoice PDF buffer for a BundleIssue (school/distributor).
- * ✅ Logo (URL/local/base64) + local fallback assets/logo.png
+ * ✅ Logo (URL/local/base64) + fallback assets/logo.png
  * ✅ Invoice To is ALWAYS the Bundle's School (not the distributor)
- * ✅ Currency format: "Rs. 123.00" (NO ₹ symbol)
- * ✅ Class-wise sections with borders + headings
- * ✅ Table with borders (Item + Qty + Unit Price + Amount)
- *
- * ✅ FIX: If meta.item_rows has 0 price, we fallback to BundleItem.sale_price/mrp/product rates.
- * ✅ FIX: Grand total uses Qty * Unit Price (not just unit prices)
+ * ✅ Currency format: "Rs. 123.00"
+ * ✅ Class-wise sections + table with borders
+ * ✅ Fix: price fallback from BundleItem/product
+ * ✅ Fix: grand total uses Qty * Unit Price
  */
 async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, companyRow }) {
   const doc = new PDFDocument({ size: "A4", margin: 40 });
@@ -553,7 +569,6 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
 
     const s = String(logoRef).trim();
     if (!s) return null;
-
     if (/\.(svg|webp)(\?.*)?$/i.test(s)) return null;
 
     if (s.startsWith("data:image/")) {
@@ -576,9 +591,7 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
 
     try {
       const localPath = path.isAbsolute(s) ? s : path.join(process.cwd(), s);
-      if (fs.existsSync(localPath)) {
-        return fs.readFileSync(localPath);
-      }
+      if (fs.existsSync(localPath)) return fs.readFileSync(localPath);
     } catch {
       return null;
     }
@@ -637,13 +650,11 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   ];
 
   let logoBuf = null;
-
   try {
     logoBuf = await loadLogoBuffer(logoRef);
   } catch {
     logoBuf = null;
   }
-
   if (!logoBuf) {
     for (const pth of FALLBACK_LOGO_PATHS) {
       try {
@@ -687,7 +698,9 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   const bundleId = num(issueRow?.bundle_id || bundleRow?.id || 0) || "-";
   const session = safeText(bundleRow?.academic_session || "");
   const status = safeText(
-    String(issueRow?.status || "").toUpperCase() === "CANCELLED" ? "CANCELLED" : safeText(issueRow?.status || "")
+    String(issueRow?.status || "").toUpperCase() === "CANCELLED"
+      ? "CANCELLED"
+      : safeText(issueRow?.status || "")
   );
 
   const startY = doc.y;
@@ -699,6 +712,7 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   if (session) doc.text(`Session: ${session}`, rightX, doc.y, { align: "left" });
   if (status) doc.text(`Status: ${status}`, rightX, doc.y, { align: "left" });
 
+  // ✅ Invoice To always bundle school
   const schoolRow = bundleRow?.school || billedToRow || null;
 
   const schoolName = safeText(
@@ -724,6 +738,7 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   const normalized = normalizeIssueRow(issueRow);
   const meta = normalized?.meta || null;
 
+  // rows from meta OR fallback from bundle items
   let rows = [];
   if (meta?.item_rows && Array.isArray(meta.item_rows)) {
     rows = meta.item_rows;
@@ -737,20 +752,36 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
       const product_type = normalizeProductType(p);
       const book_id = resolveBookIdFromProduct(p);
       const rate = resolveRateFromItemProduct(bi, p);
-      const title = p?.book?.title || p?.name || p?.title || (product_type === "BOOK" ? "Book" : "Item");
+      const title =
+        p?.book?.title || p?.name || p?.title || (product_type === "BOOK" ? "Book" : "Item");
       const class_name = p?.book?.class_name || p?.class_name || null;
 
       const requested = Math.max(0, num(bi.qty));
       if (product_type === "BOOK") {
-        requested_summary.push({ product_id: num(bi.product_id), book_id: num(book_id), title, class_name, requested, rate });
+        requested_summary.push({
+          product_id: num(bi.product_id),
+          book_id: num(book_id),
+          title,
+          class_name,
+          requested,
+          rate,
+        });
       } else {
-        non_book_items.push({ product_id: num(bi.product_id), title, class_name, requested, type: product_type, rate });
+        non_book_items.push({
+          product_id: num(bi.product_id),
+          title,
+          class_name,
+          requested,
+          type: product_type,
+          rate,
+        });
       }
     }
 
     rows = buildItemRows({ requested_summary, issued_summary, non_book_items });
   }
 
+  // price fallback map from bundle items
   const priceMap = new Map();
   for (const bi of bundleRow?.items || []) {
     const p = bi.product || null;
@@ -795,13 +826,16 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
     return { class_name, title, qty, unit_price, amount };
   });
 
+  // group by class_name
   const groupMap = new Map();
   for (const r of pdfRows) {
     const key = r.class_name || "Unassigned";
     if (!groupMap.has(key)) groupMap.set(key, []);
     groupMap.get(key).push(r);
   }
-  const classKeys = Array.from(groupMap.keys()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const classKeys = Array.from(groupMap.keys()).sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
 
   const tableX = leftX;
   const tableW = contentWidth;
@@ -814,7 +848,9 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   let computedTotal = 0;
 
   for (const className of classKeys) {
-    const items = (groupMap.get(className) || []).slice().sort((a, b) => a.title.localeCompare(b.title));
+    const items = (groupMap.get(className) || [])
+      .slice()
+      .sort((a, b) => a.title.localeCompare(b.title));
 
     ensurePageSpace(90);
 
@@ -907,7 +943,15 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
   drawBox(tableX, totalY, tableW, totalH, { color: "#111", lineWidth: 1 });
 
   drawText("Grand Total", tableX + 10, totalY + 7, colItemW - 20, "left", 10, true);
-  drawText(fmtRs(totalToShow), tableX + colItemW + colQtyW + colUnitW, totalY + 7, colAmtW - 10, "right", 10, true);
+  drawText(
+    fmtRs(totalToShow),
+    tableX + colItemW + colQtyW + colUnitW,
+    totalY + 7,
+    colAmtW - 10,
+    "right",
+    10,
+    true
+  );
 
   doc.y = totalY + totalH + 12;
 
@@ -919,7 +963,9 @@ async function generateIssueInvoicePdf({ issueRow, bundleRow, billedToRow, compa
     doc.y += 40;
   }
 
-  doc.font("Helvetica").fontSize(8).text("This is a computer generated invoice.", 40, 800, { align: "center" });
+  doc.font("Helvetica").fontSize(8).text("This is a computer generated invoice.", 40, 800, {
+    align: "center",
+  });
 
   return collectPdfBuffer(doc);
 }
@@ -948,7 +994,7 @@ exports.create = async (request, reply) => {
    ✅ Deduct inventory ONLY for BOOK items
    ✅ MATERIAL allowed without book_id and skipped
    ✅ Partial issue allowed (computed status in meta)
-   ✅ UI details payload includes meta.item_rows with price info
+   ✅ NEW: if issued_to_type=DISTRIBUTOR => ensure distributor_schools mapping
    ========================================================= */
 exports.issueBundle = async (request, reply) => {
   const bundleId = num(request.params?.id);
@@ -1046,6 +1092,13 @@ exports.issueBundle = async (request, reply) => {
         await t.rollback();
         return reply.code(404).send({ message: "Target distributor not found" });
       }
+
+      // ✅ NEW: mapping distributor -> bundle.school_id
+      await ensureDistributorSchoolLink({
+        distributor_id: issued_to_id,
+        school_id: bundle.school_id,
+        t,
+      });
     }
 
     const rawItems = (bundle.items || []).map((it) => {
@@ -1056,13 +1109,8 @@ exports.issueBundle = async (request, reply) => {
 
       const title =
         p?.book?.title || p?.name || p?.title || (product_type === "BOOK" ? "Book" : "Item");
-
       const class_name =
-        p?.book?.class_name ||
-        p?.class_name ||
-        p?.book?.class ||
-        p?.book?.std ||
-        null;
+        p?.book?.class_name || p?.class_name || p?.book?.class || p?.book?.std || null;
 
       return {
         id: it.id,
@@ -1215,8 +1263,6 @@ exports.issueBundle = async (request, reply) => {
       issued_summary,
       requested_summary,
       non_book_items,
-
-      // ✅ NEW: returns (initial)
       returned_summary: [],
     };
 
@@ -1330,6 +1376,36 @@ exports.issueBundle = async (request, reply) => {
 };
 
 /* =========================================================
+   ✅ GET /api/bundle-issues/:id
+   ========================================================= */
+exports.getOne = async (request, reply) => {
+  const issueId = num(request.params?.id);
+  if (!issueId) return reply.code(400).send({ message: "Invalid issue id" });
+
+  try {
+    const issue = await BundleIssue.findByPk(issueId, { include: issueInclude() });
+    if (!issue) return reply.code(404).send({ message: "Issue not found" });
+
+    if (!isAdminish(request.user) && isDistributorUser(request.user)) {
+      const myDid = getDistributorIdFromUser(request.user);
+      if (!myDid) return reply.code(403).send({ message: "Distributor not linked" });
+
+      if (
+        String(issue.issued_to_type).toUpperCase() !== "DISTRIBUTOR" ||
+        Number(issue.issued_to_id) !== Number(myDid)
+      ) {
+        return reply.code(403).send({ message: "Not allowed to view this issue" });
+      }
+    }
+
+    return reply.send({ row: normalizeIssueRow(issue) });
+  } catch (err) {
+    request.log.error({ err }, "getOne issue failed");
+    return reply.code(500).send({ message: err?.message || "Internal Server Error" });
+  }
+};
+
+/* =========================================================
    ✅ GET /api/bundle-issues/:id/invoice
    ========================================================= */
 exports.invoicePdf = async (request, reply) => {
@@ -1347,7 +1423,10 @@ exports.invoicePdf = async (request, reply) => {
       const myDid = getDistributorIdFromUser(request.user);
       if (!myDid) return reply.code(403).send({ message: "Distributor not linked" });
 
-      if (String(issue.issued_to_type).toUpperCase() !== "DISTRIBUTOR" || Number(issue.issued_to_id) !== Number(myDid)) {
+      if (
+        String(issue.issued_to_type).toUpperCase() !== "DISTRIBUTOR" ||
+        Number(issue.issued_to_id) !== Number(myDid)
+      ) {
         return reply.code(403).send({ message: "Not allowed to view this invoice" });
       }
     }
@@ -1359,7 +1438,8 @@ exports.invoicePdf = async (request, reply) => {
     if (String(issue.issued_to_type).toUpperCase() === "SCHOOL") {
       billedTo = issue.issuedSchool || (await School.findByPk(issue.issued_to_id).catch(() => null));
     } else {
-      billedTo = issue.issuedDistributor || (await Distributor.findByPk(issue.issued_to_id).catch(() => null));
+      billedTo =
+        issue.issuedDistributor || (await Distributor.findByPk(issue.issued_to_id).catch(() => null));
     }
 
     let companyRow = null;
@@ -1376,7 +1456,9 @@ exports.invoicePdf = async (request, reply) => {
 
     const fileName = `invoice_${safeText(issue.issue_no || issue.id)}.pdf`;
 
-    reply.header("Content-Type", "application/pdf").header("Content-Disposition", `inline; filename="${fileName}"`);
+    reply
+      .header("Content-Type", "application/pdf")
+      .header("Content-Disposition", `inline; filename="${fileName}"`);
 
     return reply.send(pdfBuffer);
   } catch (err) {
@@ -1393,14 +1475,22 @@ exports.listIssuesForBundle = async (request, reply) => {
   if (!bundleId) return reply.code(400).send({ message: "Invalid bundle id" });
 
   try {
+    const where = { bundle_id: bundleId };
+
+    if (!isAdminish(request.user) && isDistributorUser(request.user)) {
+      const myDid = getDistributorIdFromUser(request.user);
+      if (!myDid) return reply.code(403).send({ message: "Distributor not linked" });
+      where.issued_to_type = "DISTRIBUTOR";
+      where.issued_to_id = myDid;
+    }
+
     const rows = await BundleIssue.findAll({
-      where: { bundle_id: bundleId },
+      where,
       include: issueInclude(),
       order: [["id", "DESC"]],
     });
 
-    const out = rows.map(normalizeIssueRow);
-    return reply.send({ rows: out });
+    return reply.send({ rows: rows.map(normalizeIssueRow) });
   } catch (err) {
     request.log.error({ err }, "listIssuesForBundle failed");
     return reply.code(500).send({ message: err?.message || "Internal Server Error" });
@@ -1412,9 +1502,13 @@ exports.listIssuesForBundle = async (request, reply) => {
    ========================================================= */
 exports.list = async (request, reply) => {
   try {
-    const academic_session = request.query?.academic_session ? String(request.query.academic_session).trim() : null;
+    const academic_session = request.query?.academic_session
+      ? String(request.query.academic_session).trim()
+      : null;
 
-    const statusWanted = request.query?.status ? String(request.query.status).trim().toUpperCase() : null;
+    const statusWanted = request.query?.status
+      ? String(request.query.status).trim().toUpperCase()
+      : null;
 
     const limit = Math.min(500, Math.max(1, num(request.query?.limit) || 200));
 
@@ -1459,16 +1553,9 @@ exports.list = async (request, reply) => {
 
 /* =========================================================
    ✅ POST /api/bundle-issues/:id/return
-   Body:
-     {
-       "items":[ { "book_id": 12, "qty": 3 }, ... ],
-       "notes": "optional"
-     }
-
-   ✅ Works only for issued_to_type = DISTRIBUTOR
-   ✅ Adds stock back to SAME batches that were deducted (LIFO by OUT txn id)
-   ✅ Creates InventoryTxn RETURN entries (ref_type BUNDLE_ISSUE_RETURN)
-   ✅ Updates issue remarks meta: returned_summary + totals.returned_amount
+   Body: { items:[ { book_id, qty } ], notes }
+   ✅ Only for issued_to_type=DISTRIBUTOR
+   ✅ Adds stock back to SAME batches used in OUT (LIFO)
    ========================================================= */
 exports.returnIssue = async (request, reply) => {
   const issueId = num(request.params?.id);
@@ -1480,7 +1567,6 @@ exports.returnIssue = async (request, reply) => {
   const itemsIn = Array.isArray(body.items) ? body.items : [];
   if (!itemsIn.length) return reply.code(400).send({ message: "items is required (array)" });
 
-  // normalize items
   const want = itemsIn
     .map((x) => ({
       book_id: num(x.book_id || x.bookId),
@@ -1510,13 +1596,11 @@ exports.returnIssue = async (request, reply) => {
       return reply.code(400).send({ message: "Cannot return against a CANCELLED issue" });
     }
 
-    // ✅ only distributor issues can be returned
     if (String(issue.issued_to_type || "").toUpperCase() !== "DISTRIBUTOR") {
       await t.rollback();
       return reply.code(400).send({ message: "Return is allowed only for distributor issues" });
     }
 
-    // ✅ distributor users can return only their own issues
     if (!isAdminish(request.user) && isDistributorUser(request.user)) {
       const myDid = getDistributorIdFromUser(request.user);
       if (!myDid) {
@@ -1529,27 +1613,27 @@ exports.returnIssue = async (request, reply) => {
       }
     }
 
-    // Load bundle (for notes/meta display)
-    const bundle = issue.bundle || (await Bundle.findByPk(issue.bundle_id, { transaction: t }).catch(() => null));
+    const bundle =
+      issue.bundle || (await Bundle.findByPk(issue.bundle_id, { transaction: t }).catch(() => null));
 
-    // OUT txns for this issue (what was actually deducted)
     const outTxns = await InventoryTxn.findAll({
       where: {
         ref_type: "BUNDLE_ISSUE",
         ref_id: issue.id,
         txn_type: TXN_TYPE.OUT,
       },
-      order: [["id", "DESC"]], // LIFO style (easy for return)
+      order: [["id", "DESC"]],
       transaction: t,
       lock: t.LOCK.UPDATE,
     });
 
     if (!outTxns.length) {
       await t.rollback();
-      return reply.code(400).send({ message: "No deducted stock found for this issue (nothing to return)." });
+      return reply
+        .code(400)
+        .send({ message: "No deducted stock found for this issue (nothing to return)." });
     }
 
-    // existing RETURN txns for this issue (already returned earlier)
     const alreadyReturnTxns = await InventoryTxn.findAll({
       where: {
         ref_type: "BUNDLE_ISSUE_RETURN",
@@ -1560,43 +1644,32 @@ exports.returnIssue = async (request, reply) => {
       lock: t.LOCK.UPDATE,
     });
 
-    // build maps:
-    // issuedByBook: book_id => total issued (deducted)
-    // issuedByBatch: batch_id => issued qty
     const issuedByBook = new Map();
-    const issuedByBatch = new Map();
-    const outByBook = new Map(); // book_id => array of {batch_id, qty, outTxnId}
+    const outByBook = new Map(); // book_id => [{batch_id, qty, outTxnId}]
     for (const tx of outTxns) {
       const b = num(tx.book_id);
       const batch = num(tx.batch_id);
       const q = num(tx.qty);
 
       issuedByBook.set(b, (issuedByBook.get(b) || 0) + q);
-      issuedByBatch.set(batch, (issuedByBatch.get(batch) || 0) + q);
 
       if (!outByBook.has(b)) outByBook.set(b, []);
       outByBook.get(b).push({ batch_id: batch, qty: q, outTxnId: num(tx.id) });
     }
 
-    // returnedByBook & returnedByBatch
     const returnedByBook = new Map();
-    const returnedByBatch = new Map();
     for (const tx of alreadyReturnTxns) {
       const b = num(tx.book_id);
-      const batch = num(tx.batch_id);
       const q = num(tx.qty);
       returnedByBook.set(b, (returnedByBook.get(b) || 0) + q);
-      returnedByBatch.set(batch, (returnedByBatch.get(batch) || 0) + q);
     }
 
-    // parse meta from issue remarks
     const { note, meta: oldMeta } = extractMetaFromRemarks(issue.remarks);
     const meta = oldMeta && typeof oldMeta === "object" ? oldMeta : {};
     if (!Array.isArray(meta.returned_summary)) meta.returned_summary = [];
     if (!meta.totals) meta.totals = {};
     meta.totals.returned_amount = num(meta.totals.returned_amount);
 
-    // build quick title/rate map from meta rows if possible
     const titleRateMap = new Map(); // book_id => {title, rate, class_name}
     const rs = Array.isArray(meta.requested_summary) ? meta.requested_summary : [];
     for (const r of rs) {
@@ -1635,7 +1708,6 @@ exports.returnIssue = async (request, reply) => {
         continue;
       }
 
-      // allocate return qty across batches used in OUT (LIFO)
       let remaining = reqQty;
       const outList = outByBook.get(bookId) || [];
 
@@ -1645,10 +1717,6 @@ exports.returnIssue = async (request, reply) => {
         const batchId = num(o.batch_id);
         const outQtyForBatch = num(o.qty);
 
-        const alreadyReturnedForBatch = num(returnedByBatch.get(batchId) || 0);
-
-        // but returnedByBatch includes other books too, so we need per (book,batch) correctness:
-        // We'll compute per (book,batch) on the fly:
         const returnedThisBookThisBatch = alreadyReturnTxns
           .filter((x) => num(x.book_id) === bookId && num(x.batch_id) === batchId)
           .reduce((s, x) => s + num(x.qty), 0);
@@ -1664,7 +1732,6 @@ exports.returnIssue = async (request, reply) => {
       }
 
       if (remaining > 0) {
-        // shouldn't happen if issued/returned math is consistent, but safety
         errors.push({
           book_id: bookId,
           message: `Unable to allocate full return qty from batches. Remaining=${remaining}`,
@@ -1682,7 +1749,6 @@ exports.returnIssue = async (request, reply) => {
       return reply.code(400).send({ message: "Nothing to return after validation." });
     }
 
-    // apply batch increments + create RETURN txns
     const returnTxns = [];
     const returnedSummaryDelta = new Map(); // book_id => qty
 
@@ -1709,7 +1775,6 @@ exports.returnIssue = async (request, reply) => {
 
     await InventoryTxn.bulkCreate(returnTxns, { transaction: t });
 
-    // update meta: returned_summary + totals.returned_amount
     for (const [bookId, qtyReturnedNow] of returnedSummaryDelta.entries()) {
       const info = titleRateMap.get(bookId) || { title: `Book #${bookId}`, rate: 0, class_name: null };
       meta.returned_summary.push({
@@ -1726,7 +1791,6 @@ exports.returnIssue = async (request, reply) => {
       meta.totals.returned_amount = round2(num(meta.totals.returned_amount) + num(info.rate) * qtyReturnedNow);
     }
 
-    // write back remarks (keep note + updated meta)
     const mergedRemarks = (() => {
       const base = note ? String(note) : "";
       const json = JSON.stringify(meta);
@@ -1883,7 +1947,9 @@ exports.cancel = async (request, reply) => {
     const normalized = normalizeIssueRow(issue);
 
     return reply.send({
-      message: outTxns.length ? "Issue cancelled successfully (stock reverted)" : "Issue cancelled successfully (no stock was deducted)",
+      message: outTxns.length
+        ? "Issue cancelled successfully (stock reverted)"
+        : "Issue cancelled successfully (no stock was deducted)",
       issue: {
         id: issue.id,
         issue_no: issue.issue_no,

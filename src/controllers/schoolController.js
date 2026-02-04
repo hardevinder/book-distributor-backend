@@ -1,18 +1,131 @@
 // controllers/schoolController.js
+"use strict";
 
-const { School, sequelize } = require("../models");
 const { Op } = require("sequelize");
 const XLSX = require("xlsx"); // ⭐ for Excel import
 const ExcelJS = require("exceljs"); // ⭐ for Excel export
 
+const {
+  School,
+  sequelize,
+
+  // ✅ Mapping model (your Option A)
+  DistributorSchool,
+} = require("../models");
+
+/* ================= Helpers (RBAC + Distributor School Filter) ================= */
+
+const ADMINISH_ROLES = ["ADMIN", "SUPERADMIN", "OWNER", "STAFF", "ACCOUNTANT"];
+
+const num = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+function getUserRoles(user) {
+  const r = user?.roles ?? user?.role ?? [];
+  if (Array.isArray(r)) return r.map((x) => String(x).toUpperCase());
+  return [String(r).toUpperCase()];
+}
+
+function isAdminish(user) {
+  const roles = getUserRoles(user);
+  return ADMINISH_ROLES.some((r) => roles.includes(r));
+}
+
+function isDistributorUser(user) {
+  const roles = getUserRoles(user);
+  return roles.includes("DISTRIBUTOR");
+}
+
+function getDistributorIdFromUser(user) {
+  // Prefer explicit distributor_id fields; otherwise fallback to user.id (common setup)
+  const explicit =
+    Number(
+      user?.distributor_id ||
+        user?.distributorId ||
+        user?.DistributorId ||
+        user?.distributor?.id ||
+        0
+    ) || 0;
+
+  return explicit || (Number(user?.id) || 0);
+}
+
 /**
- * GET /api/schools
+ * ✅ Returns:
+ * - null  => no restriction (admin-ish)
+ * - []    => restricted but none
+ * - [ids] => allowed school ids
+ */
+async function getAllowedSchoolIdsForUser(request, t) {
+  const user = request.user;
+
+  if (isAdminish(user)) return null;
+
+  if (!isDistributorUser(user)) {
+    const err = new Error("Not allowed to list schools");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const distributorId = getDistributorIdFromUser(user);
+  if (!distributorId) {
+    const err = new Error("Distributor user not linked (missing distributor_id)");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  // ✅ Option A: DistributorSchool mapping table
+  if (!DistributorSchool || !DistributorSchool.findAll) {
+    const err = new Error(
+      "School restriction not configured. Missing DistributorSchool model."
+    );
+    err.statusCode = 500;
+    throw err;
+  }
+
+  // Filter only active mapping if column exists
+  const dsCols = DistributorSchool.rawAttributes || {};
+  const dsWhere = { distributor_id: distributorId };
+  if (dsCols.is_active) dsWhere.is_active = true;
+
+  const rows = await DistributorSchool.findAll({
+    where: dsWhere,
+    attributes: ["school_id"],
+    transaction: t || undefined,
+  });
+
+  const ids = rows
+    .map((r) => {
+      const o = r?.toJSON ? r.toJSON() : r;
+      return num(o.school_id);
+    })
+    .filter((x) => x > 0);
+
+  return Array.from(new Set(ids));
+}
+
+/**
+ * ✅ Apply restriction to a query
+ */
+async function buildRestrictedWhere(request, baseWhere = {}, t) {
+  const allowedIds = await getAllowedSchoolIdsForUser(request, t);
+  if (allowedIds === null) return baseWhere; // admin => all
+  return {
+    ...baseWhere,
+    id: { [Op.in]: allowedIds.length ? allowedIds : [-1] },
+  };
+}
+
+/* =========================
+ * GET /api/schools (restricted for distributor users)
  * Query params:
  *  - q: search text (name, contact_person, city)
  *  - is_active (true/false)
  *  - page (default 1)
  *  - limit (default 50)
- */
+ * ========================= */
 exports.getSchools = async (request, reply) => {
   try {
     const { q, is_active, page = 1, limit = 50 } = request.query || {};
@@ -35,12 +148,15 @@ exports.getSchools = async (request, reply) => {
       if (is_active === "false" || is_active === "0") where.is_active = false;
     }
 
+    // ✅ Restrict for distributor user
+    const restrictedWhere = await buildRestrictedWhere(request, where);
+
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
     const pageSize = Math.max(parseInt(limit, 10) || 50, 1);
     const offset = (pageNum - 1) * pageSize;
 
     const { rows, count } = await School.findAndCountAll({
-      where,
+      where: restrictedWhere,
       order: [
         ["sort_order", "ASC"],
         ["name", "ASC"],
@@ -59,22 +175,53 @@ exports.getSchools = async (request, reply) => {
       },
     });
   } catch (err) {
+    const code = err.statusCode || 500;
     request.log.error({ err }, "Error in getSchools");
-    return reply.code(500).send({
-      error: "InternalServerError",
+    return reply.code(code).send({
+      error: code === 403 ? "Forbidden" : "InternalServerError",
       message: err.message || "Failed to fetch schools",
     });
   }
 };
 
 /**
- * GET /api/schools/:id
+ * ✅ NEW: GET /api/schools/my/schools
+ * Returns only allowed schools for current user
+ */
+exports.getMySchools = async (request, reply) => {
+  try {
+    const restrictedWhere = await buildRestrictedWhere(request, {});
+    const rows = await School.findAll({
+      where: restrictedWhere,
+      order: [
+        ["sort_order", "ASC"],
+        ["name", "ASC"],
+      ],
+      limit: 2000,
+    });
+
+    return reply.send({ data: rows });
+  } catch (err) {
+    const code = err.statusCode || 500;
+    request.log.error({ err }, "Error in getMySchools");
+    return reply.code(code).send({
+      error: code === 403 ? "Forbidden" : "InternalServerError",
+      message: err.message || "Failed to fetch schools",
+    });
+  }
+};
+
+/**
+ * GET /api/schools/:id  (restricted for distributor users)
  */
 exports.getSchoolById = async (request, reply) => {
   try {
     const { id } = request.params;
 
-    const school = await School.findByPk(id);
+    // ✅ Restrict access
+    const restrictedWhere = await buildRestrictedWhere(request, { id: num(id) });
+
+    const school = await School.findOne({ where: restrictedWhere });
 
     if (!school) {
       return reply.code(404).send({ message: "School not found" });
@@ -82,9 +229,10 @@ exports.getSchoolById = async (request, reply) => {
 
     return reply.send(school);
   } catch (err) {
+    const code = err.statusCode || 500;
     request.log.error({ err }, "Error in getSchoolById");
-    return reply.code(500).send({
-      error: "InternalServerError",
+    return reply.code(code).send({
+      error: code === 403 ? "Forbidden" : "InternalServerError",
       message: err.message || "Failed to fetch school",
     });
   }
@@ -92,17 +240,6 @@ exports.getSchoolById = async (request, reply) => {
 
 /**
  * POST /api/schools
- * Body:
- *  - name*            (string)
- *  - contact_person   (string, optional)
- *  - phone            (string, optional)
- *  - email            (string, optional)
- *  - address          (string, optional)
- *  - city             (string, optional)
- *  - state            (string, optional)
- *  - pincode          (string, optional)
- *  - sort_order       (number, optional)
- *  - is_active        (boolean, default true)
  */
 exports.createSchool = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -122,9 +259,7 @@ exports.createSchool = async (request, reply) => {
 
     if (!name || !String(name).trim()) {
       await t.rollback();
-      return reply.code(400).send({
-        message: "name is required.",
-      });
+      return reply.code(400).send({ message: "name is required." });
     }
 
     const trimmedName = String(name).trim();
@@ -175,17 +310,6 @@ exports.createSchool = async (request, reply) => {
 
 /**
  * PUT /api/schools/:id
- * Body:
- *  - name             (string, optional)
- *  - contact_person   (string, optional)
- *  - phone            (string, optional)
- *  - email            (string, optional)
- *  - address          (string, optional)
- *  - city             (string, optional)
- *  - state            (string, optional)
- *  - pincode          (string, optional)
- *  - sort_order       (number, optional)
- *  - is_active        (boolean, optional)
  */
 exports.updateSchool = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -260,8 +384,7 @@ exports.updateSchool = async (request, reply) => {
     }
 
     if (typeof city !== "undefined") {
-      school.city =
-        city === null || city === "" ? null : String(city).trim();
+      school.city = city === null || city === "" ? null : String(city).trim();
     }
 
     if (typeof state !== "undefined") {
@@ -301,7 +424,6 @@ exports.updateSchool = async (request, reply) => {
 
 /**
  * DELETE /api/schools/:id
- * (Hard delete. If you want soft delete, change to is_active = false instead.)
  */
 exports.deleteSchool = async (request, reply) => {
   const t = await sequelize.transaction();
@@ -329,20 +451,6 @@ exports.deleteSchool = async (request, reply) => {
 };
 
 /* ------------ BULK IMPORT: POST /api/schools/import ------------ */
-/**
- * Expected columns (case-insensitive):
- *  - ID
- *  - School Name / Name
- *  - Contact Person
- *  - Phone
- *  - Email
- *  - Address
- *  - City
- *  - State
- *  - Pincode
- *  - Sort Order
- *  - Is Active
- */
 exports.importSchools = async (request, reply) => {
   const file = await request.file();
 
@@ -422,7 +530,6 @@ exports.importSchools = async (request, reply) => {
         row["Is Active"] || row.is_active || row.IsActive || true;
 
       const name = String(nameRaw || "").trim();
-
       if (!name) {
         await t.rollback();
         continue; // skip empty row
@@ -466,7 +573,6 @@ exports.importSchools = async (request, reply) => {
       if (id) {
         const existing = await School.findByPk(id, { transaction: t });
         if (existing) {
-          // Optional: avoid name clash with other records
           const nameConflict = await School.findOne({
             where: {
               name,
@@ -474,6 +580,7 @@ exports.importSchools = async (request, reply) => {
             },
             transaction: t,
           });
+
           if (nameConflict) {
             errors.push({
               row: rowNumber,
@@ -523,13 +630,13 @@ exports.importSchools = async (request, reply) => {
 };
 
 /* ------------ BULK EXPORT: GET /api/schools/export ------------ */
-/**
- * Export with:
- *  - Sheet "Schools": data rows
- */
 exports.exportSchools = async (request, reply) => {
   try {
+    // ✅ Restrict export for distributor user as well
+    const restrictedWhere = await buildRestrictedWhere(request, {});
+
     const schools = await School.findAll({
+      where: restrictedWhere,
       order: [
         ["sort_order", "ASC"],
         ["name", "ASC"],
@@ -537,8 +644,6 @@ exports.exportSchools = async (request, reply) => {
     });
 
     const workbook = new ExcelJS.Workbook();
-
-    // Sheet 1: Schools
     const sheet = workbook.addWorksheet("Schools");
 
     sheet.columns = [
@@ -590,9 +695,10 @@ exports.exportSchools = async (request, reply) => {
       .header("Content-Disposition", 'attachment; filename="schools.xlsx"')
       .send(Buffer.from(buffer));
   } catch (err) {
+    const code = err.statusCode || 500;
     request.log.error({ err }, "Error in exportSchools");
-    return reply.code(500).send({
-      error: "InternalServerError",
+    return reply.code(code).send({
+      error: code === 403 ? "Forbidden" : "InternalServerError",
       message: err.message || "Failed to export schools",
     });
   }
