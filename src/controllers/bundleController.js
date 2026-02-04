@@ -8,6 +8,7 @@ const {
   School,
   Book,
   Class,
+  SchoolBookRequirement, // ✅ ADDED (for default qty)
   sequelize,
 } = require("../models");
 
@@ -87,7 +88,7 @@ module.exports = {
                   model: Book,
                   as: "book",
                   required: false,
-                  attributes: ["id", "title", "class_name"],
+                  attributes: ["id", "title", "class_name", "rate", "mrp"],
                 },
               ],
             },
@@ -158,8 +159,11 @@ module.exports = {
 
     if (changes.school_id !== undefined) changes.school_id = num(changes.school_id);
     if (changes.class_id !== undefined) changes.class_id = changes.class_id == null ? null : num(changes.class_id);
-    if (changes.class_name !== undefined) changes.class_name = changes.class_name == null ? null : String(changes.class_name).trim();
-    if (changes.academic_session !== undefined) changes.academic_session = changes.academic_session == null ? null : String(changes.academic_session).trim();
+    if (changes.class_name !== undefined)
+      changes.class_name = changes.class_name == null ? null : String(changes.class_name).trim();
+    if (changes.academic_session !== undefined)
+      changes.academic_session =
+        changes.academic_session == null ? null : String(changes.academic_session).trim();
     if (changes.name !== undefined) changes.name = String(changes.name || "").trim();
     if (changes.is_active !== undefined) changes.is_active = bool(changes.is_active);
     if (changes.sort_order !== undefined) changes.sort_order = num(changes.sort_order);
@@ -179,7 +183,6 @@ module.exports = {
 
   // ======================================================
   // DELETE /api/bundles/:id
-  // (will cascade delete BundleItems if your association has onDelete CASCADE)
   // ======================================================
   async deleteBundle(req, reply) {
     const id = num(req.params.id);
@@ -192,6 +195,13 @@ module.exports = {
   // ======================================================
   // POST /api/bundles/:id/items
   // Upsert items, optionally replace
+  //
+  // ✅ NEW OPTIONAL FLAGS:
+  //   use_defaults: true
+  //   overwrite_qty: true|false (default false)
+  //   overwrite_price: true|false (default false)
+  //   bundle_type: "SCHOOL_BULK" | "STUDENT" (default "SCHOOL_BULK")
+  //   academic_session: "2025-26" (optional; else uses bundle.academic_session)
   // ======================================================
   async upsertBundleItems(req, reply) {
     const bundleId = num(req.params.id);
@@ -199,19 +209,34 @@ module.exports = {
     const replace = bool(body.replace);
     const items = Array.isArray(body.items) ? body.items : [];
 
+    const useDefaults = bool(body.use_defaults);
+    const overwriteQty = bool(body.overwrite_qty);
+    const overwritePrice = bool(body.overwrite_price);
+    const bundleType = String(body.bundle_type || "SCHOOL_BULK").trim().toUpperCase(); // SCHOOL_BULK | STUDENT
+
     if (!items.length) {
       return reply.code(400).send({ success: false, message: "items[] is required" });
     }
 
-    const bundle = await ensureBundleExists(bundleId);
+    // Need full bundle (school_id/class_id/session) for requirements
+    const bundle = await Bundle.findByPk(bundleId);
+    if (!bundle) return reply.code(404).send({ success: false, message: "Bundle not found" });
+
+    const academicSession =
+      body.academic_session != null && String(body.academic_session).trim()
+        ? String(body.academic_session).trim()
+        : (bundle.academic_session ? String(bundle.academic_session).trim() : null);
 
     // Normalize and basic validate
-    const normalized = items.map((it) => ({
+    let normalized = items.map((it) => ({
       id: it.id ? num(it.id) : null,
       product_id: num(it.product_id),
+
+      // these may be overwritten by defaults
       qty: it.qty === undefined ? 1 : Math.max(0, num(it.qty)),
       mrp: it.mrp === undefined ? 0 : num(it.mrp),
       sale_price: it.sale_price === undefined ? 0 : num(it.sale_price),
+
       is_optional: it.is_optional === undefined ? false : bool(it.is_optional),
       sort_order: it.sort_order === undefined ? 0 : num(it.sort_order),
     }));
@@ -220,7 +245,6 @@ module.exports = {
       if (!it.product_id) {
         return reply.code(400).send({ success: false, message: "product_id is required for all items" });
       }
-      // qty=0 allowed? you can decide. I’m allowing but you may restrict to >=1
     }
 
     // Ensure all products exist
@@ -232,6 +256,86 @@ module.exports = {
 
     if (products.length !== productIds.length) {
       return reply.code(400).send({ success: false, message: "One or more product_id are invalid" });
+    }
+
+    const productById = new Map(products.map((p) => [p.id, p]));
+
+    /* ======================================================
+       ✅ Defaults: qty from requirements, price from Book
+       ====================================================== */
+    if (useDefaults) {
+      // only BOOK products can map to requirements + book pricing
+      const bookProducts = products.filter(
+        (p) => String(p.type || "").toUpperCase() === "BOOK" && p.book_id
+      );
+      const bookIds = [...new Set(bookProducts.map((p) => num(p.book_id)))];
+
+      // Books for price defaults
+      const books = bookIds.length
+        ? await Book.findAll({
+            where: { id: { [Op.in]: bookIds } },
+            attributes: ["id", "mrp", "rate", "selling_price"],
+          })
+        : [];
+      const bookById = new Map(books.map((b) => [b.id, b]));
+
+      // Requirements for qty defaults
+      let reqByBookId = new Map(); // book_id -> required_copies
+      if (bundle.school_id && academicSession) {
+        const reqWhere = {
+          school_id: num(bundle.school_id),
+          academic_session: academicSession,
+        };
+
+        // Match class_id when present (recommended)
+        if (bundle.class_id) reqWhere.class_id = num(bundle.class_id);
+
+        const reqRows = await SchoolBookRequirement.findAll({
+          where: reqWhere,
+          attributes: ["book_id", "required_copies"],
+        });
+
+        reqByBookId = new Map(reqRows.map((r) => [num(r.book_id), num(r.required_copies)]));
+      }
+
+      const pickSalePrice = (bookRow) => {
+        if (!bookRow) return 0;
+        const r = num(bookRow.rate);
+        if (r > 0) return r;
+        const sp = num(bookRow.selling_price);
+        if (sp > 0) return sp;
+        const mrp = num(bookRow.mrp);
+        return mrp > 0 ? mrp : 0;
+      };
+
+      normalized = normalized.map((it) => {
+        const p = productById.get(it.product_id);
+        if (!p || String(p.type || "").toUpperCase() !== "BOOK" || !p.book_id) return it;
+
+        const bookId = num(p.book_id);
+        const bookRow = bookById.get(bookId);
+
+        // qty default:
+        // STUDENT -> 1
+        // SCHOOL_BULK -> requirement required_copies (if found)
+        let defaultQty = it.qty;
+        if (bundleType === "STUDENT") {
+          defaultQty = 1;
+        } else {
+          const reqQty = reqByBookId.get(bookId);
+          if (Number.isFinite(reqQty) && reqQty >= 0) defaultQty = reqQty;
+        }
+
+        const defaultPrice = pickSalePrice(bookRow);
+        const defaultMrp = bookRow ? num(bookRow.mrp) : it.mrp;
+
+        return {
+          ...it,
+          qty: overwriteQty ? defaultQty : it.qty,
+          sale_price: overwritePrice ? defaultPrice : it.sale_price,
+          mrp: overwritePrice ? defaultMrp : it.mrp, // optional sync
+        };
+      });
     }
 
     // Transaction: upsert + optional replace delete
@@ -331,7 +435,7 @@ module.exports = {
                     model: Book,
                     as: "book",
                     required: false,
-                    attributes: ["id", "title", "class_name"],
+                    attributes: ["id", "title", "class_name", "rate", "mrp"],
                   },
                 ],
               },

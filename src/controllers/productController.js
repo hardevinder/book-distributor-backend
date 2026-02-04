@@ -35,6 +35,8 @@ const normalizeType = (v) => {
   return t === "BOOK" || t === "MATERIAL" ? t : null;
 };
 
+const BOOK_ATTRS = ["id", "title", "subject", "code", "class_name", "rate", "selling_price", "mrp"];
+
 async function ensureProductExists(id) {
   const row = await Product.findByPk(id);
   if (!row) {
@@ -278,7 +280,7 @@ module.exports = {
         model: Book,
         as: "book",
         required: false,
-        attributes: ["id", "title", "subject", "code", "class_name"],
+        attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
       });
     }
 
@@ -450,7 +452,7 @@ module.exports = {
               model: Book,
               as: "book",
               required: false,
-              attributes: ["id", "title", "subject", "code", "class_name"],
+              attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
             },
           ]
         : [],
@@ -486,7 +488,7 @@ module.exports = {
                 model: Book,
                 as: "book",
                 required: false,
-                attributes: ["id", "title", "subject", "code", "class_name"],
+                attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
               },
             ]
           : [],
@@ -558,7 +560,7 @@ module.exports = {
                 model: Book,
                 as: "book",
                 required: false,
-                attributes: ["id", "title", "subject", "code", "class_name"],
+                attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
               },
             ]
           : [],
