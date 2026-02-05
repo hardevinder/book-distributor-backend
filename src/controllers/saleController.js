@@ -18,33 +18,40 @@ const {
   School,
   Distributor,
   Bundle,
-  BundleIssue, // ✅ NEW (for distributor ownership check)
+  BundleIssue, // ✅ distributor ownership check
 
   InventoryBatch,
   InventoryTxn,
 
   CompanyProfile,
-  User, // ✅ NEW (for "sold by whom")
+  User, // ✅ sold-by
 } = require("../models");
 
 /* =========================
    Helpers
    ========================= */
 
-const TXN_TYPE = {
-  IN: "IN",
-  OUT: "OUT",
-};
+const TXN_TYPE = { IN: "IN", OUT: "OUT" };
 
 const ADMINISH_ROLES = ["ADMIN", "SUPERADMIN", "OWNER", "STAFF", "ACCOUNTANT"];
 const SELLER_ROLES = ["DISTRIBUTOR", ...ADMINISH_ROLES];
 
+/**
+ * ✅ Robust number parser
+ * Handles DECIMAL strings, commas, currency symbols.
+ */
 const num = (v) => {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === "string") {
+    const cleaned = v.replace(/[^\d.-]/g, "");
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : 0;
+  }
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
-const round2 = (n) => Math.round(num(n) * 100) / 100;
 
+const round2 = (n) => Math.round(num(n) * 100) / 100;
 const safeText = (v) => String(v ?? "").trim();
 
 function formatDateIN(d) {
@@ -90,10 +97,12 @@ function isAdminish(user) {
   const mine = getUserRoles(user);
   return ADMINISH_ROLES.some((r) => mine.includes(r));
 }
+
 function isDistributorUser(user) {
   const mine = getUserRoles(user);
   return mine.includes("DISTRIBUTOR");
 }
+
 function getDistributorIdFromUser(user) {
   return Number(user?.distributor_id || user?.distributorId || user?.DistributorId || 0) || 0;
 }
@@ -214,12 +223,21 @@ function hr(doc) {
   doc.moveTo(doc.page.margins.left, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).stroke();
 }
 
+/**
+ * ✅ UPDATED:
+ * - Customer line shows Student (bill_to_name) if present
+ * - If sold_to_type=SCHOOL and bill_to_name exists, show School on next line
+ * - If payment_mode=CREDIT show Parent/Phone/Ref fields
+ * - Item Qty printed from requested_qty, Amount from amount or computed
+ */
 async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow, size, soldByUser }) {
   const money = (v) => round2(num(v)).toFixed(2);
   const fmtRs = (v) => `Rs. ${money(v)}`;
   const is3in = String(size || "").toLowerCase() === "3in";
 
-  const doc = is3in ? new PDFDocument({ size: [216, 1000], margin: 12 }) : new PDFDocument({ size: "A5", margin: 24 });
+  const doc = is3in
+    ? new PDFDocument({ size: [216, 1000], margin: 12 })
+    : new PDFDocument({ size: "A5", margin: 24 });
 
   const companyLines = getCompanyLine(companyRow);
 
@@ -238,16 +256,34 @@ async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow,
   doc.text(`Bill No: ${saleNo}`);
   doc.text(`Date: ${saleDate}`);
 
-  const custName =
+  const soldType = String(saleRow.sold_to_type || "").toUpperCase();
+  const baseCustomer =
     safeText(customerRow?.name) ||
     safeText(customerRow?.school_name) ||
     safeText(customerRow?.title) ||
-    (String(saleRow.sold_to_type).toUpperCase() === "WALKIN" ? "Walk-in" : `Customer #${saleRow.sold_to_id || "-"}`);
+    (soldType === "WALKIN" ? "Walk-in" : `Customer #${saleRow.sold_to_id || "-"}`);
 
-  doc.text(`Customer: ${custName}`);
+  const billToName = safeText(saleRow.bill_to_name) || "";
+  doc.text(`Customer: ${billToName || baseCustomer}`);
+
+  if (billToName && soldType === "SCHOOL" && safeText(baseCustomer)) {
+    doc.text(`School: ${baseCustomer}`);
+  }
+
   if (safeText(saleRow.class_name)) doc.text(`Class: ${safeText(saleRow.class_name)}`);
 
-  // ✅ Sold By
+  // Credit-only details
+  const mode = safeText(saleRow.payment_mode).toUpperCase();
+  if (mode === "CREDIT") {
+    if (safeText(saleRow.parent_name)) doc.text(`Parent: ${safeText(saleRow.parent_name)}`);
+    if (safeText(saleRow.phone)) doc.text(`Phone: ${safeText(saleRow.phone)}`);
+
+    if (safeText(saleRow.reference_by)) {
+      const rp = safeText(saleRow.reference_phone);
+      doc.text(`Ref: ${safeText(saleRow.reference_by)}${rp ? ` • ${rp}` : ""}`);
+    }
+  }
+
   const soldBy =
     safeText(soldByUser?.name) ||
     safeText(soldByUser?.full_name) ||
@@ -260,10 +296,8 @@ async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow,
   hr(doc);
   doc.moveDown(0.4);
 
-  // ======= FIXED COLUMNS (no continued) =======
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
-  const tableW = right - left;
 
   const qtyW = is3in ? 26 : 40;
   const amtW = is3in ? 70 : 90;
@@ -272,9 +306,8 @@ async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow,
   const xQty = right - amtW - qtyW;
   const xAmt = right - amtW;
 
-  // Header
   doc.font("Helvetica-Bold").fontSize(is3in ? 8.5 : 9);
-  let y = doc.y;
+  const y = doc.y;
   doc.text("Item", xItem, y, { width: xQty - xItem - 4 });
   doc.text("Qty", xQty, y, { width: qtyW, align: "right" });
   doc.text("Amt", xAmt, y, { width: amtW, align: "right" });
@@ -282,21 +315,49 @@ async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow,
   doc.moveDown(0.35);
   doc.font("Helvetica").fontSize(is3in ? 8.5 : 9);
 
-  // Rows
-  for (const it of items) {
-    const title = safeText(it.title_snapshot || "Item");
-    const qty = num(it.issued_qty || it.qty || 0);
-    const amt = num(it.amount || 0);
+  const safeItems = Array.isArray(items)
+    ? items.map((it) => (it && typeof it.toJSON === "function" ? it.toJSON() : (it?.dataValues ?? it)))
+    : [];
 
-    y = doc.y;
+  for (const it of safeItems) {
+    const title = safeText(it.title_snapshot || it.name_snapshot || it.title || it.name || "Item");
 
-    // Item may wrap; keep columns aligned by writing qty/amt at same y
-    doc.text(title, xItem, y, { width: xQty - xItem - 4 });
-    doc.text(String(qty), xQty, y, { width: qtyW, align: "right" });
-    doc.text(fmtRs(amt), xAmt, y, { width: amtW, align: "right" });
+    // ✅ PRINT requested qty (billing)
+    const qty = num(it.requested_qty ?? it.requestedQty ?? it.qty ?? it.quantity ?? 0);
 
-    // If item wrapped into multiple lines, jump to the max y (pdfkit already advanced y via first text)
-    doc.moveDown(0.15);
+    // ✅ billing price
+    const unit = num(
+      it.requested_unit_price ??
+        it.requestedUnitPrice ??
+        it.unit_price ??
+        it.unitPrice ??
+        it.price ??
+        it.selling_price ??
+        it.sellingPrice ??
+        it.sale_price ??
+        it.salePrice ??
+        it.rate ??
+        it.mrp ??
+        0
+    );
+
+    // ✅ prefer stored amount; else compute from requested
+    let amt = num(it.amount ?? it.line_amount ?? it.lineAmount ?? it.line_total ?? it.lineTotal ?? it.total ?? 0);
+    if (amt <= 0 && qty > 0 && unit > 0) amt = round2(qty * unit);
+
+    const rowY = doc.y;
+    const rowH = is3in ? 11 : 12;
+
+    doc.text(title, xItem, rowY, {
+      width: xQty - xItem - 4,
+      ellipsis: true,
+      lineBreak: false,
+    });
+
+    doc.text(String(qty), xQty, rowY, { width: qtyW, align: "right" });
+    doc.text(fmtRs(amt > 0 ? amt : 0), xAmt, rowY, { width: amtW, align: "right" });
+
+    doc.y = rowY + rowH;
   }
 
   doc.moveDown(0.3);
@@ -330,8 +391,10 @@ async function generateSaleReceiptPdf({ saleRow, items, customerRow, companyRow,
 
 /**
  * POST /api/sales
- * ✅ Distributor can sell ONLY bundles issued to him (if bundle_id provided)
- * ✅ Record seller: created_by (already) + return seller info
+ * ✅ Added:
+ * - bill_to_name always required
+ * - parent_name/phone required only when payment_mode=CREDIT (udhaaar)
+ * - reference_by/reference_phone optional only for credit
  */
 exports.create = async (request, reply) => {
   try {
@@ -350,14 +413,37 @@ exports.create = async (request, reply) => {
 
   const payment_mode = safeText(body.payment_mode || "CASH").toUpperCase();
   const paid_amount_in = round2(num(body.paid_amount));
-
   const notes = body.notes != null ? String(body.notes).trim() : null;
+
+  // ✅ NEW: bill-to / credit-only details
+  const bill_to_name = body.bill_to_name != null ? safeText(body.bill_to_name) : "";
+  const parent_name = body.parent_name != null ? safeText(body.parent_name) : "";
+  const phone = body.phone != null ? safeText(body.phone) : "";
+  const reference_by = body.reference_by != null ? safeText(body.reference_by) : "";
+  const reference_phone = body.reference_phone != null ? safeText(body.reference_phone) : "";
+
+  const isCredit = payment_mode === "CREDIT";
 
   if (!["SCHOOL", "WALKIN", "DISTRIBUTOR"].includes(sold_to_type)) {
     return reply.code(400).send({ message: "sold_to_type must be SCHOOL, WALKIN, or DISTRIBUTOR" });
   }
   if (sold_to_type !== "WALKIN" && !sold_to_id) {
     return reply.code(400).send({ message: "sold_to_id is required for SCHOOL/DISTRIBUTOR" });
+  }
+
+  if (!["CASH", "UPI", "CARD", "CREDIT", "MIXED"].includes(payment_mode)) {
+    return reply.code(400).send({ message: "payment_mode must be CASH, UPI, CARD, CREDIT, MIXED" });
+  }
+
+  // ✅ Student name always required
+  if (!bill_to_name) {
+    return reply.code(400).send({ message: "Student name is required (bill_to_name)" });
+  }
+
+  // ✅ Credit (udhaaar) requires extra details
+  if (isCredit) {
+    if (!parent_name) return reply.code(400).send({ message: "Parent name is required for CREDIT sale" });
+    if (!phone) return reply.code(400).send({ message: "Phone is required for CREDIT sale" });
   }
 
   const itemsIn = Array.isArray(body.items) ? body.items : [];
@@ -466,13 +552,25 @@ exports.create = async (request, reply) => {
 
       const class_name_snapshot = safeText(p?.book?.class_name) || safeText(p?.class_name) || null;
 
-      const qty = round2(line.qty);
-      const unit_price = round2(line.unit_price);
+      // ✅ requested from frontend
+      const requested_qty = round2(line.qty);
+      const requested_unit_price = round2(line.unit_price);
 
-      let issued_qty = qty;
+      // default: issued == requested
+      let issued_qty = requested_qty;
       let short_qty = 0;
 
       if (kind === "BOOK") {
+        // ✅ books must be whole numbers (optional but recommended)
+        if (requested_qty % 1 !== 0) {
+          await t.rollback();
+          return reply.code(400).send({
+            message: "Book quantity must be whole number",
+            product_id: line.product_id,
+            qty: requested_qty,
+          });
+        }
+
         if (!book_id) {
           await t.rollback();
           return reply.code(400).send({
@@ -482,11 +580,11 @@ exports.create = async (request, reply) => {
           });
         }
 
-        const { allocations } = await allocateFromBatches({ book_id, qtyNeeded: qty, t, lock: true });
+        const { allocations } = await allocateFromBatches({ book_id, qtyNeeded: requested_qty, t, lock: true });
 
         const issuedNow = round2(allocations.reduce((s, a) => s + num(a.qty), 0));
         issued_qty = issuedNow;
-        short_qty = round2(Math.max(0, qty - issuedNow));
+        short_qty = round2(Math.max(0, requested_qty - issuedNow));
 
         for (const a of allocations) {
           outTxns.push({
@@ -501,8 +599,9 @@ exports.create = async (request, reply) => {
         }
 
         for (const a of allocations) {
+          const q = Number(num(a.qty));
           await InventoryBatch.update(
-            { available_qty: sequelize.literal(`available_qty - ${num(a.qty)}`) },
+            { available_qty: sequelize.literal(`available_qty - ${q}`) },
             { where: { id: num(a.batch_id) }, transaction: t }
           );
         }
@@ -512,15 +611,16 @@ exports.create = async (request, reply) => {
             product_id: line.product_id,
             book_id: num(book_id),
             title: title_snapshot,
-            requested: qty,
+            requested: requested_qty,
             issued: issued_qty,
             short: short_qty,
           });
         }
       }
 
-      const amount = round2(num(issued_qty) * num(unit_price));
-      subtotal = round2(subtotal + amount);
+      // ✅ billed on requested, not issued
+      const billed_amount = round2(num(requested_qty) * num(requested_unit_price));
+      subtotal = round2(subtotal + billed_amount);
 
       saleItemsToCreate.push({
         sale_id: 0,
@@ -529,9 +629,15 @@ exports.create = async (request, reply) => {
         kind,
         title_snapshot,
         class_name_snapshot,
-        qty,
-        unit_price,
-        amount,
+
+        requested_qty,
+        requested_unit_price,
+
+        qty: requested_qty,
+        unit_price: requested_unit_price,
+
+        amount: billed_amount,
+
         issued_qty,
         short_qty,
       });
@@ -541,6 +647,9 @@ exports.create = async (request, reply) => {
     const tax = round2(num(body.tax));
 
     const total_amount = round2(Math.max(0, subtotal - discount + tax));
+
+    // ✅ If CREDIT, paid can be less than total (balance will be >0)
+    // For CASH/UPI/CARD, we still clamp paid to total
     const paid_amount = round2(Math.min(total_amount, Math.max(0, paid_amount_in)));
     const balance_amount = round2(Math.max(0, total_amount - paid_amount));
 
@@ -561,6 +670,14 @@ exports.create = async (request, reply) => {
         paid_amount,
         balance_amount,
         notes,
+
+        // ✅ NEW fields
+        bill_to_name,
+        parent_name: isCredit ? parent_name : null,
+        phone: isCredit ? phone : null,
+        reference_by: isCredit ? reference_by : null,
+        reference_phone: isCredit ? reference_phone : null,
+
         created_by: request.user?.id || null,
       },
       { transaction: t }
@@ -601,23 +718,13 @@ exports.create = async (request, reply) => {
 
 /**
  * GET /api/sales/:id
- * ✅ Distributor can view only own sale
- * ✅ returns sold_by user
  */
 exports.getOne = async (request, reply) => {
   const id = num(request.params?.id);
   if (!id) return reply.code(400).send({ message: "Invalid id" });
 
   try {
-    const row = await Sale.findByPk(id, {
-      include: [
-        { model: SaleItem, as: "items", required: false },
-        Bundle ? { model: Bundle, as: "bundle", required: false } : null,
-        User ? { model: User, as: "creator", required: false } : null,
-      ].filter(Boolean),
-      order: [[{ model: SaleItem, as: "items" }, "id", "ASC"]],
-    });
-
+    const row = await Sale.findByPk(id);
     if (!row) return reply.code(404).send({ message: "Sale not found" });
 
     try {
@@ -625,6 +732,8 @@ exports.getOne = async (request, reply) => {
     } catch (e) {
       return reply.code(e.statusCode || 403).send({ message: e.message });
     }
+
+    const items = await SaleItem.findAll({ where: { sale_id: id }, order: [["id", "ASC"]] });
 
     let customer = null;
     if (String(row.sold_to_type).toUpperCase() === "SCHOOL" && row.sold_to_id) {
@@ -636,7 +745,7 @@ exports.getOne = async (request, reply) => {
     const soldByUser = User && row.created_by ? await User.findByPk(row.created_by).catch(() => null) : null;
 
     return reply.send({
-      sale: row,
+      sale: { ...row.toJSON(), items },
       customer,
       sold_by: soldByUser
         ? {
@@ -656,18 +765,18 @@ exports.getOne = async (request, reply) => {
 
 /**
  * GET /api/sales
- * ✅ Distributor sees only own sales
  */
 exports.list = async (request, reply) => {
   try {
     const q = request.query || {};
     const limit = Math.min(500, Math.max(1, num(q.limit) || 200));
-
     const where = {};
 
     if (q.status) where.status = safeText(q.status).toUpperCase();
     if (q.sold_to_type) where.sold_to_type = safeText(q.sold_to_type).toUpperCase();
     if (q.sold_to_id) where.sold_to_id = num(q.sold_to_id);
+
+    if (q.payment_mode) where.payment_mode = safeText(q.payment_mode).toUpperCase(); // ✅ NEW filter
 
     if (q.date_from || q.date_to) {
       where.sale_date = {};
@@ -679,12 +788,7 @@ exports.list = async (request, reply) => {
       where.created_by = num(request.user?.id);
     }
 
-    const rows = await Sale.findAll({
-      where,
-      order: [["id", "DESC"]],
-      limit,
-    });
-
+    const rows = await Sale.findAll({ where, order: [["id", "DESC"]], limit });
     return reply.send({ rows });
   } catch (err) {
     request.log.error({ err }, "sale list failed");
@@ -694,19 +798,13 @@ exports.list = async (request, reply) => {
 
 /**
  * GET /api/sales/:id/receipt?size=a5|3in
- * ✅ Distributor can print only own sale
- * ✅ prints Sold By
  */
 exports.receiptPdf = async (request, reply) => {
   const id = num(request.params?.id);
   if (!id) return reply.code(400).send({ message: "Invalid id" });
 
   try {
-    const sale = await Sale.findByPk(id, {
-      include: [{ model: SaleItem, as: "items", required: false }],
-      order: [[{ model: SaleItem, as: "items" }, "id", "ASC"]],
-    });
-
+    const sale = await Sale.findByPk(id);
     if (!sale) return reply.code(404).send({ message: "Sale not found" });
 
     try {
@@ -714,6 +812,8 @@ exports.receiptPdf = async (request, reply) => {
     } catch (e) {
       return reply.code(e.statusCode || 403).send({ message: e.message });
     }
+
+    const items = await SaleItem.findAll({ where: { sale_id: id }, order: [["id", "ASC"]] });
 
     let companyRow = null;
     if (CompanyProfile && CompanyProfile.findOne) {
@@ -733,7 +833,7 @@ exports.receiptPdf = async (request, reply) => {
 
     const pdfBuffer = await generateSaleReceiptPdf({
       saleRow: sale,
-      items: sale.items || [],
+      items,
       customerRow,
       companyRow,
       size,
@@ -751,7 +851,6 @@ exports.receiptPdf = async (request, reply) => {
 
 /**
  * POST /api/sales/:id/cancel
- * ✅ Distributor can cancel only own sale
  */
 exports.cancel = async (request, reply) => {
   try {
@@ -840,6 +939,98 @@ exports.cancel = async (request, reply) => {
   } catch (err) {
     request.log.error({ err }, "sale cancel failed");
     await t.rollback();
+    return reply.code(500).send({ message: err?.message || "Internal Server Error" });
+  }
+};
+/**
+ * GET /api/sales/my/summary?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+ * ✅ Distributor: only his own (created_by=user.id)
+ * ✅ Admin: can see overall; optional filters: created_by, sold_to_type, sold_to_id
+ *
+ * Returns:
+ * - totals by payment_mode (CASH/UPI/CARD/CREDIT/MIXED)
+ * - total_sales_amount, total_paid, total_balance
+ * - count of bills
+ */
+exports.mySummary = async (request, reply) => {
+  try {
+    enforceSalesAuthorization(request.user);
+  } catch (e) {
+    return reply.code(e.statusCode || 403).send({ message: e.message });
+  }
+
+  const q = request.query || {};
+
+  const date_from = q.date_from ? safeText(q.date_from) : null;
+  const date_to = q.date_to ? safeText(q.date_to) : null;
+
+  // Default: today (if no dates supplied)
+  const df = date_from || nowISODate();
+  const dt = date_to || nowISODate();
+
+  const where = {
+    status: "COMPLETED",
+    sale_date: { [Op.gte]: df, [Op.lte]: dt },
+  };
+
+  // ✅ Distributor restriction (only own)
+  if (!isAdminish(request.user) && isDistributorUser(request.user)) {
+    where.created_by = num(request.user?.id);
+  } else {
+    // ✅ Admin optional filters
+    if (q.created_by) where.created_by = num(q.created_by);
+    if (q.sold_to_type) where.sold_to_type = safeText(q.sold_to_type).toUpperCase();
+    if (q.sold_to_id) where.sold_to_id = num(q.sold_to_id);
+  }
+
+  try {
+    // We can aggregate using Sequelize.fn
+    const rows = await Sale.findAll({
+      where,
+      attributes: [
+        "payment_mode",
+        [sequelize.fn("COUNT", sequelize.col("id")), "bills"],
+        [sequelize.fn("SUM", sequelize.col("total_amount")), "total_sales_amount"],
+        [sequelize.fn("SUM", sequelize.col("paid_amount")), "total_paid_amount"],
+        [sequelize.fn("SUM", sequelize.col("balance_amount")), "total_balance_amount"],
+      ],
+      group: ["payment_mode"],
+      raw: true,
+    });
+
+    const base = {
+      date_from: df,
+      date_to: dt,
+      totals: {
+        CASH: { bills: 0, sale: 0, paid: 0, balance: 0 },
+        UPI: { bills: 0, sale: 0, paid: 0, balance: 0 },
+        CARD: { bills: 0, sale: 0, paid: 0, balance: 0 },
+        CREDIT: { bills: 0, sale: 0, paid: 0, balance: 0 },
+        MIXED: { bills: 0, sale: 0, paid: 0, balance: 0 },
+      },
+      grand: { bills: 0, sale: 0, paid: 0, balance: 0 },
+    };
+
+    for (const r of rows) {
+      const mode = safeText(r.payment_mode).toUpperCase();
+      if (!base.totals[mode]) base.totals[mode] = { bills: 0, sale: 0, paid: 0, balance: 0 };
+
+      const bills = num(r.bills);
+      const sale = round2(num(r.total_sales_amount));
+      const paid = round2(num(r.total_paid_amount));
+      const balance = round2(num(r.total_balance_amount));
+
+      base.totals[mode] = { bills, sale, paid, balance };
+
+      base.grand.bills += bills;
+      base.grand.sale = round2(base.grand.sale + sale);
+      base.grand.paid = round2(base.grand.paid + paid);
+      base.grand.balance = round2(base.grand.balance + balance);
+    }
+
+    return reply.send(base);
+  } catch (err) {
+    request.log.error({ err }, "sale mySummary failed");
     return reply.code(500).send({ message: err?.message || "Internal Server Error" });
   }
 };

@@ -45,6 +45,18 @@ module.exports = (sequelize, DataTypes) => {
 
       notes: { type: DataTypes.TEXT, allowNull: true },
 
+      /* =====================================================
+         ✅ NEW: "TO BILL" / STUDENT DETAILS
+         - Always store bill_to_name
+         - Credit-only details will be filled when payment_mode=CREDIT
+         ===================================================== */
+
+      bill_to_name: { type: DataTypes.STRING(255), allowNull: true }, // Student Name (always)
+      parent_name: { type: DataTypes.STRING(255), allowNull: true },  // Credit only
+      phone: { type: DataTypes.STRING(30), allowNull: true },         // Credit only
+      reference_by: { type: DataTypes.STRING(255), allowNull: true }, // Credit only (optional)
+      reference_phone: { type: DataTypes.STRING(30), allowNull: true }, // Credit only (optional)
+
       // ✅ Sold-by record (seller)
       created_by: { type: DataTypes.BIGINT.UNSIGNED, allowNull: true },
 
@@ -72,6 +84,10 @@ module.exports = (sequelize, DataTypes) => {
 
         // ✅ common report query: per seller per day
         { fields: ["sale_date", "created_by"], name: "idx_sales_date_created_by" },
+
+        // ✅ optional: credit follow-up queries
+        { fields: ["payment_mode"], name: "idx_sales_payment_mode" },
+        { fields: ["phone"], name: "idx_sales_phone" },
       ],
     }
   );

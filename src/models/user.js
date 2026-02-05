@@ -37,7 +37,7 @@ module.exports = (sequelize, DataTypes) => {
         defaultValue: "distributor",
       },
 
-      // ✅ LINK TO DISTRIBUTOR (NEW)
+      // ✅ LINK TO DISTRIBUTOR
       distributor_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
@@ -59,6 +59,14 @@ module.exports = (sequelize, DataTypes) => {
       timestamps: true,
     }
   );
+
+  // ✅ THIS WAS MISSING (CRITICAL)
+  User.associate = (models) => {
+    User.belongsTo(models.Distributor, {
+      foreignKey: "distributor_id",
+      as: "distributor",
+    });
+  };
 
   return User;
 };

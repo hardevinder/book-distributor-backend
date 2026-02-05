@@ -60,6 +60,12 @@ const BundleIssue = require("./bundleIssue")(sequelize, DataTypes);
 const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
 
 /* ======================
+   ✅ User ↔ Distributor (LOGIN / ANALYTICS)  ✅ NEW
+   ====================== */
+Distributor.hasMany(User, { foreignKey: "distributor_id", as: "users" });
+User.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
+
+/* ======================
    ✅ DISTRIBUTOR ↔ SCHOOL MAPPING (NEW)
    ====================== */
 const DistributorSchool = require("./distributorSchool")(sequelize, DataTypes);

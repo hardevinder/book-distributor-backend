@@ -112,7 +112,9 @@ const buildServer = () => {
   /* ---------------- AUTH & MASTERS ---------------- */
   fastify.register(require("./routes/authRoutes"), { prefix: "/api/auth" });
   fastify.register(require("./routes/bookRoutes"), { prefix: "/api/books" });
-  fastify.register(require("./routes/publisherRoutes"), { prefix: "/api/publishers" });
+  fastify.register(require("./routes/publisherRoutes"), {
+    prefix: "/api/publishers",
+  });
 
   /* =========================================================
      SUPPLIER (IMPORTANT ORDER)
@@ -199,6 +201,14 @@ const buildServer = () => {
      ====================== */
   fastify.register(require("./routes/saleRoutes"), {
     prefix: "/api/sales",
+  });
+
+  /* ======================
+     ✅ SALES ANALYTICS (NEW)
+     ====================== */
+  // ✅ Admin-only routes: distributor->school summary, item totals, sales drilldown, credit outstanding
+  fastify.register(require("./routes/salesAnalyticsRoutes"), {
+    prefix: "/api/sales-analytics",
   });
 
   /* ---------------- STOCK & PROFILE ---------------- */
