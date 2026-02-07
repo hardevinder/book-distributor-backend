@@ -6,13 +6,7 @@ let transporter;
 function getTransporter() {
   if (transporter) return transporter;
 
-  const {
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_PASS,
-    SMTP_SECURE,
-  } = process.env;
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
 
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
     throw new Error(
@@ -21,7 +15,15 @@ function getTransporter() {
   }
 
   const port = Number(SMTP_PORT) || 587;
-  const secure = SMTP_SECURE === "true"; // true for 465, false for 587 (usually)
+
+  // ✅ Safe default:
+  // - 465 => secure true
+  // - 587 => secure false (STARTTLS)
+  // If SMTP_SECURE is explicitly set, honor it.
+  const secure =
+    process.env.SMTP_SECURE != null
+      ? process.env.SMTP_SECURE === "true"
+      : port === 465;
 
   console.log("[MAIL] Creating transporter:", {
     host: SMTP_HOST,
@@ -38,9 +40,20 @@ function getTransporter() {
       user: SMTP_USER,
       pass: SMTP_PASS,
     },
-    // If your provider has a proper certificate, you don't need this.
-    // Only uncomment if you're getting CERT related errors.
-    // tls: { rejectUnauthorized: false },
+
+    // ✅ Prevent “hang / timeout” on server
+    connectionTimeout: 20_000, // connect timeout
+    greetingTimeout: 20_000, // server greeting timeout
+    socketTimeout: 30_000, // idle socket timeout
+
+    // ✅ Helpful for strict STARTTLS servers (587)
+    requireTLS: !secure,
+    tls: {
+      servername: SMTP_HOST,
+      // If your provider has a proper certificate, you don't need this.
+      // Only uncomment if you're getting CERT related errors.
+      // rejectUnauthorized: false,
+    },
   });
 
   return transporter;
@@ -66,8 +79,11 @@ async function sendMail({ to, subject, html, text, cc, bcc, attachments }) {
   try {
     console.log("[MAIL] Sending email:", {
       to,
+      cc,
+      bcc,
       subject,
       from: mailOptions.from,
+      attachments: Array.isArray(attachments) ? attachments.length : 0,
     });
 
     const info = await t.sendMail(mailOptions);
@@ -75,6 +91,8 @@ async function sendMail({ to, subject, html, text, cc, bcc, attachments }) {
     console.log("[MAIL] SMTP accepted email:", {
       messageId: info.messageId,
       response: info.response,
+      accepted: info.accepted,
+      rejected: info.rejected,
     });
 
     return info;
