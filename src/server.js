@@ -112,101 +112,55 @@ const buildServer = () => {
   /* ---------------- AUTH & MASTERS ---------------- */
   fastify.register(require("./routes/authRoutes"), { prefix: "/api/auth" });
   fastify.register(require("./routes/bookRoutes"), { prefix: "/api/books" });
-  fastify.register(require("./routes/publisherRoutes"), {
-    prefix: "/api/publishers",
-  });
+  fastify.register(require("./routes/publisherRoutes"), { prefix: "/api/publishers" });
 
   /* =========================================================
      SUPPLIER (IMPORTANT ORDER)
      ========================================================= */
 
-  // ✅ Supplier ledger
-  fastify.register(require("./routes/supplierLedgerRoutes"), {
-    prefix: "/api/suppliers",
-  });
-
-  // ✅ Supplier payments
-  fastify.register(require("./routes/supplierPaymentRoutes"), {
-    prefix: "/api/suppliers",
-  });
-
-  // ✅ Supplier receipts
-  fastify.register(require("./routes/supplierReceiptsRoutes"), {
-    prefix: "/api/supplier-receipts",
-  });
-
-  // ✅ Supplier receipt allocations (NEW)
-  fastify.register(require("./routes/supplierReceiptAllocations.routes"), {
-    prefix: "/api",
-  });
-
-  // ✅ Supplier CRUD (keep AFTER above)
-  fastify.register(require("./routes/supplierRoutes"), {
-    prefix: "/api/suppliers",
-  });
+  fastify.register(require("./routes/supplierLedgerRoutes"), { prefix: "/api/suppliers" });
+  fastify.register(require("./routes/supplierPaymentRoutes"), { prefix: "/api/suppliers" });
+  fastify.register(require("./routes/supplierReceiptsRoutes"), { prefix: "/api/supplier-receipts" });
+  fastify.register(require("./routes/supplierReceiptAllocations.routes"), { prefix: "/api" });
+  fastify.register(require("./routes/supplierRoutes"), { prefix: "/api/suppliers" });
 
   /* ---------------- OTHER MASTERS ---------------- */
-  fastify.register(require("./routes/transportRoutes"), {
-    prefix: "/api/transports",
+  fastify.register(require("./routes/transportRoutes"), { prefix: "/api/transports" });
+  fastify.register(require("./routes/classRoutes"), { prefix: "/api/classes" });
+  fastify.register(require("./routes/schoolRoutes"), { prefix: "/api/schools" });
+  fastify.register(require("./routes/schoolBookRequirementRoutes"), { prefix: "/api/requirements" });
+
+  /* =========================================================
+     ✅ PRODUCT CATEGORIES (NEW – MUST COME BEFORE PRODUCTS)
+     ========================================================= */
+  fastify.register(require("./routes/productCategory.routes"), {
+    prefix: "/api/product-categories",
   });
 
-  fastify.register(require("./routes/classRoutes"), {
-    prefix: "/api/classes",
-  });
-
-  fastify.register(require("./routes/schoolRoutes"), {
-    prefix: "/api/schools",
-  });
-
-  fastify.register(require("./routes/schoolBookRequirementRoutes"), {
-    prefix: "/api/requirements",
-  });
-
-  // ✅ Products (BOOK + MATERIAL)
+  /* ---------------- PRODUCTS ---------------- */
   fastify.register(require("./routes/products"), { prefix: "/api/products" });
 
   /* ---------------- ORDERS ---------------- */
-  fastify.register(require("./routes/publisherOrderRoutes"), {
-    prefix: "/api/publisher-orders",
-  });
-
-  fastify.register(require("./routes/schoolOrderRoutes"), {
-    prefix: "/api/school-orders",
-  });
+  fastify.register(require("./routes/publisherOrderRoutes"), { prefix: "/api/publisher-orders" });
+  fastify.register(require("./routes/schoolOrderRoutes"), { prefix: "/api/school-orders" });
 
   /* ---------------- REPORTS ---------------- */
-  fastify.register(require("./routes/reportRoutes"), {
-    prefix: "/api/reports",
-  });
+  fastify.register(require("./routes/reportRoutes"), { prefix: "/api/reports" });
 
   /* ---------------- MODULE-2 ---------------- */
-  fastify.register(require("./routes/bundleRoutes"), {
-    prefix: "/api/bundles",
-  });
-
-  fastify.register(require("./routes/distributorRoutes"), {
-    prefix: "/api/distributors",
-  });
-
-  fastify.register(require("./routes/bundleIssueRoutes"), {
-    prefix: "/api/bundle-issues",
-  });
-
-  fastify.register(require("./routes/bundleDispatchRoutes"), {
-    prefix: "/api/bundle-dispatches",
-  });
+  fastify.register(require("./routes/bundleRoutes"), { prefix: "/api/bundles" });
+  fastify.register(require("./routes/distributorRoutes"), { prefix: "/api/distributors" });
+  fastify.register(require("./routes/bundleIssueRoutes"), { prefix: "/api/bundle-issues" });
+  fastify.register(require("./routes/bundleDispatchRoutes"), { prefix: "/api/bundle-dispatches" });
 
   /* ======================
-     ✅ SALES (NEW)
+     ✅ SALES
      ====================== */
-  fastify.register(require("./routes/saleRoutes"), {
-    prefix: "/api/sales",
-  });
+  fastify.register(require("./routes/saleRoutes"), { prefix: "/api/sales" });
 
   /* ======================
-     ✅ SALES ANALYTICS (NEW)
+     ✅ SALES ANALYTICS
      ====================== */
-  // ✅ Admin-only routes: distributor->school summary, item totals, sales drilldown, credit outstanding
   fastify.register(require("./routes/salesAnalyticsRoutes"), {
     prefix: "/api/sales-analytics",
   });

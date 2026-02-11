@@ -11,14 +11,12 @@ module.exports = (sequelize, DataTypes) => {
       },
 
       /**
-       * BOOK  -> auto-created from books (Option A)
+       * BOOK  -> auto-created from books
        * MATERIAL -> stationery / other items
        */
       type: {
         type: DataTypes.ENUM("BOOK", "MATERIAL"),
         allowNull: false,
-        // ✅ Better default: most products you create manually are MATERIAL,
-        // but if your system auto-creates BOOK products, it's fine either way.
         defaultValue: "MATERIAL",
       },
 
@@ -39,6 +37,16 @@ module.exports = (sequelize, DataTypes) => {
        */
       name: {
         type: DataTypes.STRING(255),
+        allowNull: true,
+      },
+
+      /**
+       * Category (mostly for MATERIAL)
+       * - recommended/required when type = MATERIAL
+       * - optional for BOOK (you can still categorize books if you want)
+       */
+      category_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
         allowNull: true,
       },
 
@@ -67,12 +75,12 @@ module.exports = (sequelize, DataTypes) => {
 
       /**
        * Indexes
-       * - unique(type, book_id) ensures:
-       *   👉 one BOOK product per book
+       * - unique(type, book_id) ensures one BOOK product per book
        */
       indexes: [
         { fields: ["type"] },
         { fields: ["book_id"] },
+        { fields: ["category_id"] },
         { fields: ["is_active"] },
         {
           unique: true,
@@ -83,7 +91,7 @@ module.exports = (sequelize, DataTypes) => {
 
       /**
        * Extra safety at model level
-       * ✅ FIX: robust trimming + allow book_id=0 check + allow empty string name check
+       * ✅ Updated: adds category rules for MATERIAL
        */
       validate: {
         productTypeRules() {
@@ -96,9 +104,11 @@ module.exports = (sequelize, DataTypes) => {
               throw new Error("BOOK product must have valid book_id");
             }
 
-            // For BOOK, name should ideally be null/empty (optional)
-            // We won't enforce, but if you want strict:
-            // if (this.name) throw new Error("BOOK product should not have name");
+            // Optional strict rules for BOOK (keep relaxed)
+            // const nm = String(this.name || "").trim();
+            // if (nm) throw new Error("BOOK product should not have name");
+
+            // category_id is optional for BOOK
           }
 
           if (t === "MATERIAL") {
@@ -106,8 +116,19 @@ module.exports = (sequelize, DataTypes) => {
             if (!nm) {
               throw new Error("MATERIAL product must have name");
             }
-            // For MATERIAL, book_id should be null (optional strict enforcement)
-            // if (this.book_id) throw new Error("MATERIAL product must not have book_id");
+
+            // ✅ Recommended: MATERIAL must have category_id
+            const cid = Number(this.category_id);
+            if (!Number.isFinite(cid) || cid <= 0) {
+              throw new Error("MATERIAL product must have valid category_id");
+            }
+
+            // Optional strict enforcement:
+            // book_id should be null for MATERIAL
+            // const bid = Number(this.book_id);
+            // if (Number.isFinite(bid) && bid > 0) {
+            //   throw new Error("MATERIAL product must not have book_id");
+            // }
           }
         },
       },
@@ -125,8 +146,15 @@ module.exports = (sequelize, DataTypes) => {
       });
     }
 
+    // ✅ NEW: Category link
+    if (models.ProductCategory) {
+      Product.belongsTo(models.ProductCategory, {
+        foreignKey: "category_id",
+        as: "category",
+      });
+    }
+
     // ✅ OPTIONAL (recommended): if you store product_id in bundle_items
-    // This won't break anything if BundleItem model exists.
     if (models.BundleItem) {
       Product.hasMany(models.BundleItem, {
         foreignKey: "product_id",

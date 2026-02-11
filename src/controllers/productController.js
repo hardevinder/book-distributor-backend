@@ -11,6 +11,9 @@ const {
   SchoolBookRequirement,
   SupplierReceipt,
   SupplierReceiptItem,
+
+  // ✅ NEW: category model (if present)
+  ProductCategory,
 } = require("../models");
 
 /* =========================
@@ -35,7 +38,10 @@ const normalizeType = (v) => {
   return t === "BOOK" || t === "MATERIAL" ? t : null;
 };
 
+const safeStr = (v) => String(v ?? "").trim();
+
 const BOOK_ATTRS = ["id", "title", "subject", "code", "class_name", "rate", "selling_price", "mrp"];
+const CAT_ATTRS = ["id", "name"];
 
 async function ensureProductExists(id) {
   const row = await Product.findByPk(id);
@@ -71,7 +77,9 @@ async function validatePayloadForCreateOrUpdate(payload, { isCreate }) {
   if (payload.book_id !== undefined) payload.book_id = payload.book_id == null ? null : num(payload.book_id);
   if (payload.name !== undefined) payload.name = payload.name == null ? null : String(payload.name).trim();
 
-  // Validate by type (if type known for this request)
+  // ✅ category_id normalize
+  if (payload.category_id !== undefined) payload.category_id = payload.category_id == null ? null : num(payload.category_id);
+
   const t = payload.type; // may be undefined on update
 
   if (t === "BOOK") {
@@ -80,8 +88,12 @@ async function validatePayloadForCreateOrUpdate(payload, { isCreate }) {
       err.statusCode = 400;
       throw err;
     }
+
     // For BOOK: force name null
     payload.name = null;
+
+    // For BOOK: category optional (allow null)
+    // payload.category_id is allowed or null
 
     if (Book) {
       const b = await Book.findByPk(payload.book_id, { attributes: ["id"] });
@@ -99,15 +111,32 @@ async function validatePayloadForCreateOrUpdate(payload, { isCreate }) {
       err.statusCode = 400;
       throw err;
     }
+
     // For MATERIAL: force book_id null
     payload.book_id = null;
+
+    // ✅ MATERIAL: category required (as per your model validate)
+    if (!payload.category_id) {
+      const err = new Error("category_id is required when type=MATERIAL");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // ✅ validate category exists (if model exists)
+    if (ProductCategory) {
+      const cat = await ProductCategory.findByPk(payload.category_id, { attributes: ["id"] });
+      if (!cat) {
+        const err = new Error("Invalid category_id");
+        err.statusCode = 400;
+        throw err;
+      }
+    }
   }
 }
 
 /**
  * Option-A helper:
  * ensure every Book has a corresponding Product row of type=BOOK.
- * This makes kit builder show books automatically without manual product entry.
  */
 async function ensureBookProducts({ onlyActiveBooks = false } = {}) {
   if (!Book || !Product) return { created: 0 };
@@ -141,6 +170,7 @@ async function ensureBookProducts({ onlyActiveBooks = false } = {}) {
       type: "BOOK",
       book_id,
       name: null,
+      category_id: 1, // ✅ keep null by default
       uom: "PCS",
       is_active: true,
       createdAt: new Date(),
@@ -150,13 +180,11 @@ async function ensureBookProducts({ onlyActiveBooks = false } = {}) {
   if (!toCreate.length) return { created: 0 };
 
   await Product.bulkCreate(toCreate, { ignoreDuplicates: true });
-
   return { created: toCreate.length };
 }
 
 /**
- * ✅ Find distinct book_ids from DIRECT purchases (SupplierReceipt where school_order_id is null/0)
- * We try common aliases to avoid association mismatch.
+ * ✅ Find distinct book_ids from DIRECT purchases
  */
 async function findDirectPurchaseBookIds({ onlyReceived = false } = {}) {
   if (!SupplierReceipt || !SupplierReceiptItem) return [];
@@ -194,8 +222,7 @@ async function findDirectPurchaseBookIds({ onlyReceived = false } = {}) {
 }
 
 /**
- * ✅ NEW: ensure Product rows exist for direct-purchased books
- * (so extras tab works even if Product table doesn't already have BOOK rows)
+ * ✅ ensure Product rows exist for direct-purchased books
  */
 async function ensureProductsForBookIds(bookIds = []) {
   if (!Product || !Book) return { created: 0 };
@@ -216,6 +243,7 @@ async function ensureProductsForBookIds(bookIds = []) {
       type: "BOOK",
       book_id,
       name: null,
+      category_id: null, // ✅ keep null
       uom: "PCS",
       is_active: true,
       createdAt: new Date(),
@@ -239,6 +267,11 @@ module.exports = {
   // ✅ section support
   //   - section=books   => BOOK products only from Requirements
   //   - section=extras  => ONLY direct purchases (MATERIAL + direct-purchased BOOKs)
+  //
+  // ✅ category support
+  //   - category_id=5
+  //   - category_ids=1,2,3
+  //   - include_category=1
   //
   // existing query:
   // type?, book_id?, is_active?, q?, include_book?, ensure_books?
@@ -271,16 +304,42 @@ module.exports = {
     if (q.book_id) where.book_id = num(q.book_id);
     if (q.is_active !== undefined) where.is_active = bool(q.is_active);
 
+    // ✅ category filters (works for MATERIAL mainly, but also allow for BOOK if you set it)
+    const category_id = num(q.category_id);
+    const category_ids = safeStr(q.category_ids);
+    const catIdsArr = category_ids
+      ? category_ids
+          .split(",")
+          .map((x) => num(x))
+          .filter(Boolean)
+      : [];
+
+    if (category_id) where.category_id = category_id;
+    if (catIdsArr.length) where.category_id = { [Op.in]: catIdsArr };
+
     const search = String(q.q || "").trim();
     const includeBook = bool(q.include_book);
 
+    // ✅ include category?
+    const includeCategory = bool(q.include_category);
+
     const include = [];
+
     if (includeBook && Book) {
       include.push({
         model: Book,
         as: "book",
         required: false,
-        attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
+        attributes: BOOK_ATTRS,
+      });
+    }
+
+    if (includeCategory && ProductCategory) {
+      include.push({
+        model: ProductCategory,
+        as: "category",
+        required: false,
+        attributes: CAT_ATTRS,
       });
     }
 
@@ -313,19 +372,26 @@ module.exports = {
       where.type = "BOOK";
       where.book_id = { [Op.in]: reqBookIds.length ? reqBookIds : [-1] };
 
-      if (search && includeBook && Book) {
+      if (search) {
         const like = `%${search}%`;
-        where[Op.and] = [
-          ...(where[Op.and] || []),
-          {
-            [Op.or]: [
-              { "$book.title$": { [Op.like]: like } },
-              { "$book.code$": { [Op.like]: like } },
-              { "$book.subject$": { [Op.like]: like } },
-              { "$book.class_name$": { [Op.like]: like } },
-            ],
-          },
-        ];
+
+        // Search across book fields (and optionally category name if included)
+        const ors = [];
+        if (includeBook && Book) {
+          ors.push(
+            { "$book.title$": { [Op.like]: like } },
+            { "$book.code$": { [Op.like]: like } },
+            { "$book.subject$": { [Op.like]: like } },
+            { "$book.class_name$": { [Op.like]: like } }
+          );
+        }
+        if (includeCategory && ProductCategory) {
+          ors.push({ "$category.name$": { [Op.like]: like } });
+        }
+
+        if (ors.length) {
+          where[Op.and] = [...(where[Op.and] || []), { [Op.or]: ors }];
+        }
       }
 
       const rows = await Product.findAll({
@@ -346,15 +412,12 @@ module.exports = {
     // ✅ section=extras => only direct purchases
     // - MATERIAL products always included
     // - BOOK products included only if purchased directly
-    // ✅ NEW: auto-create Product rows for those direct books if missing
     // ======================================================
     if (section === "extras") {
       const onlyReceived = bool(q.only_received);
 
-      // ✅ book ids from direct receipts
       const directBookIds = await findDirectPurchaseBookIds({ onlyReceived });
 
-      // ✅ ensure Product rows exist for these book ids (push to products)
       const ensured = await ensureProductsForBookIds(directBookIds);
 
       const extrasWhere = {
@@ -367,23 +430,25 @@ module.exports = {
 
       if (search) {
         const like = `%${search}%`;
+
+        const ors = [
+          { name: { [Op.like]: like } }, // MATERIAL name
+        ];
+
         if (includeBook && Book) {
-          extrasWhere[Op.and] = [
-            ...(extrasWhere[Op.and] || []),
-            {
-              [Op.or]: [
-                { name: { [Op.like]: like } }, // MATERIAL
-                { "$book.title$": { [Op.like]: like } }, // BOOK (direct)
-                { "$book.code$": { [Op.like]: like } },
-                { "$book.subject$": { [Op.like]: like } },
-                { "$book.class_name$": { [Op.like]: like } },
-              ],
-            },
-          ];
-        } else {
-          // without book join, search only MATERIAL by name
-          extrasWhere.name = { [Op.like]: like };
+          ors.push(
+            { "$book.title$": { [Op.like]: like } },
+            { "$book.code$": { [Op.like]: like } },
+            { "$book.subject$": { [Op.like]: like } },
+            { "$book.class_name$": { [Op.like]: like } }
+          );
         }
+
+        if (includeCategory && ProductCategory) {
+          ors.push({ "$category.name$": { [Op.like]: like } });
+        }
+
+        extrasWhere[Op.and] = [...(extrasWhere[Op.and] || []), { [Op.or]: ors }];
       }
 
       const rows = await Product.findAll({
@@ -399,7 +464,7 @@ module.exports = {
         success: true,
         section: "extras",
         ensured_books: ensureBooks ? true : undefined,
-        ensured_direct_books: ensured?.created ? ensured.created : 0, // ✅ helpful debug
+        ensured_direct_books: ensured?.created ? ensured.created : 0,
         data: rows,
       });
     }
@@ -410,17 +475,22 @@ module.exports = {
     if (search) {
       const like = `%${search}%`;
 
+      const ors = [{ name: { [Op.like]: like } }];
+
       if (includeBook && Book) {
-        where[Op.or] = [
-          { name: { [Op.like]: like } },
+        ors.push(
           { "$book.title$": { [Op.like]: like } },
           { "$book.code$": { [Op.like]: like } },
           { "$book.subject$": { [Op.like]: like } },
-          { "$book.class_name$": { [Op.like]: like } },
-        ];
-      } else {
-        where.name = { [Op.like]: like };
+          { "$book.class_name$": { [Op.like]: like } }
+        );
       }
+
+      if (includeCategory && ProductCategory) {
+        ors.push({ "$category.name$": { [Op.like]: like } });
+      }
+
+      where[Op.or] = ors;
     }
 
     const rows = await Product.findAll({
@@ -445,18 +515,27 @@ module.exports = {
   async getProductById(req, reply) {
     const id = num(req.params.id);
 
-    const row = await Product.findByPk(id, {
-      include: Book
-        ? [
-            {
-              model: Book,
-              as: "book",
-              required: false,
-              attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
-            },
-          ]
-        : [],
-    });
+    const include = [];
+
+    if (Book) {
+      include.push({
+        model: Book,
+        as: "book",
+        required: false,
+        attributes: BOOK_ATTRS,
+      });
+    }
+
+    if (ProductCategory) {
+      include.push({
+        model: ProductCategory,
+        as: "category",
+        required: false,
+        attributes: CAT_ATTRS,
+      });
+    }
+
+    const row = await Product.findByPk(id, { include });
 
     if (!row) return reply.code(404).send({ success: false, message: "Product not found" });
     return reply.send({ success: true, data: row });
@@ -464,7 +543,7 @@ module.exports = {
 
   // ======================================================
   // POST /api/products
-  // body: { type, book_id?, name?, uom?, is_active? }
+  // body: { type, book_id?, name?, uom?, is_active?, category_id? }
   // ======================================================
   async createProduct(req, reply) {
     const b = req.body || {};
@@ -473,26 +552,21 @@ module.exports = {
       type: normalizeType(b.type),
       book_id: b.book_id == null ? null : num(b.book_id),
       name: b.name == null ? null : String(b.name).trim(),
+      category_id: b.category_id == null ? null : num(b.category_id), // ✅ NEW
       uom: b.uom == null ? "PCS" : String(b.uom).trim(),
       is_active: b.is_active === undefined ? true : bool(b.is_active),
     };
 
     try {
       await validatePayloadForCreateOrUpdate(payload, { isCreate: true });
+
       const row = await Product.create(payload);
 
-      const fresh = await Product.findByPk(row.id, {
-        include: Book
-          ? [
-              {
-                model: Book,
-                as: "book",
-                required: false,
-                attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
-              },
-            ]
-          : [],
-      });
+      const include = [];
+      if (Book) include.push({ model: Book, as: "book", required: false, attributes: BOOK_ATTRS });
+      if (ProductCategory) include.push({ model: ProductCategory, as: "category", required: false, attributes: CAT_ATTRS });
+
+      const fresh = await Product.findByPk(row.id, { include });
 
       return reply.code(201).send({ success: true, data: fresh });
     } catch (err) {
@@ -511,7 +585,7 @@ module.exports = {
 
   // ======================================================
   // PUT /api/products/:id
-  // body: { type?, book_id?, name?, uom?, is_active? }
+  // body: { type?, book_id?, name?, uom?, is_active?, category_id? }
   // ======================================================
   async updateProduct(req, reply) {
     const id = num(req.params.id);
@@ -519,14 +593,15 @@ module.exports = {
 
     const row = await ensureProductExists(id);
 
-    const changes = pick(b, ["type", "book_id", "name", "uom", "is_active"]);
+    const changes = pick(b, ["type", "book_id", "name", "uom", "is_active", "category_id"]); // ✅ NEW
 
-    // Normalize fields (without enforcing type rules yet)
+    // Normalize fields
     if (changes.type !== undefined) changes.type = normalizeType(changes.type);
     if (changes.book_id !== undefined) changes.book_id = changes.book_id == null ? null : num(changes.book_id);
     if (changes.name !== undefined) changes.name = changes.name == null ? null : String(changes.name).trim();
     if (changes.uom !== undefined) changes.uom = changes.uom == null ? null : String(changes.uom).trim();
     if (changes.is_active !== undefined) changes.is_active = bool(changes.is_active);
+    if (changes.category_id !== undefined) changes.category_id = changes.category_id == null ? null : num(changes.category_id);
 
     const effectiveType = changes.type || row.type;
 
@@ -534,6 +609,7 @@ module.exports = {
       type: effectiveType,
       book_id: changes.book_id !== undefined ? changes.book_id : row.book_id,
       name: changes.name !== undefined ? changes.name : row.name,
+      category_id: changes.category_id !== undefined ? changes.category_id : row.category_id,
       uom: changes.uom !== undefined ? changes.uom : row.uom,
       is_active: changes.is_active !== undefined ? changes.is_active : row.is_active,
     };
@@ -541,30 +617,26 @@ module.exports = {
     try {
       await validatePayloadForCreateOrUpdate(finalPayload, { isCreate: false });
 
+      // enforce by type
       if (effectiveType === "BOOK") {
         changes.type = "BOOK";
         if (changes.book_id === undefined) changes.book_id = finalPayload.book_id;
         changes.name = null;
+        // category optional; keep as given
       } else if (effectiveType === "MATERIAL") {
         changes.type = "MATERIAL";
         changes.book_id = null;
         if (changes.name === undefined) changes.name = finalPayload.name;
+        // category required; validated above
       }
 
       await row.update(changes);
 
-      const fresh = await Product.findByPk(row.id, {
-        include: Book
-          ? [
-              {
-                model: Book,
-                as: "book",
-                required: false,
-                attributes: BOOK_ATTRS, // ✅ rate / selling_price / mrp added
-              },
-            ]
-          : [],
-      });
+      const include = [];
+      if (Book) include.push({ model: Book, as: "book", required: false, attributes: BOOK_ATTRS });
+      if (ProductCategory) include.push({ model: ProductCategory, as: "category", required: false, attributes: CAT_ATTRS });
+
+      const fresh = await Product.findByPk(row.id, { include });
 
       return reply.send({ success: true, data: fresh });
     } catch (err) {

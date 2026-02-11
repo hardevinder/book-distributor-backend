@@ -20,6 +20,9 @@ const CompanyProfile = require("./companyProfile")(sequelize, DataTypes);
 // ✅ Products (POS / Bundles)
 const Product = require("./product")(sequelize, DataTypes);
 
+// ✅ NEW: Product Categories (POS / Masters)
+const ProductCategory = require("./ProductCategory")(sequelize, DataTypes);
+
 /* ======================
    REQUIREMENTS
    ====================== */
@@ -87,10 +90,6 @@ const SupplierLedgerTxn = require("./supplierLedgerTxn")(sequelize, DataTypes);
 
 /* =====================================================
    ASSOCIATIONS (manual + safe)
-   NOTE:
-   Do NOT call model.associate(db) here because many models
-   already define associations internally and it causes
-   duplicate alias errors (like "receipts").
    ===================================================== */
 
 /* ---------- Publisher ↔ Books ---------- */
@@ -104,6 +103,10 @@ Book.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 /* ---------- ✅ Product ↔ Book ---------- */
 Book.hasMany(Product, { foreignKey: "book_id", as: "products" });
 Product.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+
+/* ---------- ✅ NEW: ProductCategory ↔ Product ---------- */
+ProductCategory.hasMany(Product, { foreignKey: "category_id", as: "products" });
+Product.belongsTo(ProductCategory, { foreignKey: "category_id", as: "category" });
 
 /* ---------- School ↔ Book Requirements ---------- */
 School.hasMany(SchoolBookRequirement, { foreignKey: "school_id", as: "requirements" });
@@ -206,7 +209,6 @@ if (BundleDispatch.rawAttributes && BundleDispatch.rawAttributes.distributor_id)
 
 /* =========================================================
    ✅ Distributor ↔ School Restriction (Mapping)
-   - Dropdown should show only assigned schools for distributor
    ========================================================= */
 
 /* direct mapping rows */
@@ -337,6 +339,7 @@ const db = {
   CompanyProfile,
 
   Product,
+  ProductCategory, // ✅ NEW EXPORT
 
   SchoolBookRequirement,
 
