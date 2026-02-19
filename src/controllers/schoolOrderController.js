@@ -35,17 +35,16 @@ const { sendMail } = require("../config/email");
 async function isOrderLockedForSync(order, t) {
   if (!order) return false;
 
-  // 1) If order already sent to supplier (treat as locked if you want)
-  const emailSentCount = Number(order.email_sent_count || 0);
-  if (emailSentCount > 0) return true;
+  // ✅ DO NOT lock just because email sent
+  // const emailSentCount = Number(order.email_sent_count || 0);
+  // if (emailSentCount > 0) return true;
 
-  // 2) If any movement in order items
+  // ✅ Lock only if any movement in order items
   const hasReceived = (order.items || []).some((it) => Number(it.received_qty || 0) > 0);
   const hasReordered = (order.items || []).some((it) => Number(it.reordered_qty || 0) > 0);
   if (hasReceived || hasReordered) return true;
 
-  // 3) ✅ If inventory batch exists for this order => receipt/stock-in happened => LOCK
-  // (InventoryBatch is already imported in this file)
+  // ✅ Lock if inventory batch exists (stock-in done)
   const invCount = await InventoryBatch.count({
     where: { school_order_id: Number(order.id) },
     transaction: t,
@@ -54,6 +53,7 @@ async function isOrderLockedForSync(order, t) {
 
   return false;
 }
+
 
 
 const num = (v) => {
@@ -635,7 +635,10 @@ exports.syncOrderFromRequirements = async (request, reply) => {
     };
 
     // If your requirements are supplier-specific, keep it ON (recommended)
-    if ("supplier_id" in SchoolBookRequirement) reqWhere.supplier_id = supplierId;
+    if (SchoolBookRequirement.rawAttributes?.supplier_id) {
+      reqWhere.supplier_id = supplierId;
+    }
+
 
     const requirements = await SchoolBookRequirement.findAll({
       where: reqWhere,
