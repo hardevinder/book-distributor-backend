@@ -3827,3 +3827,236 @@ exports.deleteSchoolOrder = async (request, reply) => {
     });
   }
 };
+
+
+/* ============================================
+ * ✅ NEW: POST /api/school-orders/adjust-from-requirements
+ * Delta-based adjustment:
+ * - Looks at confirmed requirements (desired)
+ * - Looks at total already-ordered qty (original + reorders, not cancelled)
+ * - If desired > alreadyOrdered => creates NEW reorder with only delta
+ * - If desired == alreadyOrdered => no new order
+ * - If desired < alreadyOrdered => no auto-reduce (manual decision)
+ *
+ * body: { academic_session, school_id, supplier_id }
+ * ============================================ */
+exports.adjustOrderFromRequirements = async (request, reply) => {
+  const { academic_session, school_id, supplier_id } = request.body || {};
+
+  const session = String(academic_session || "").trim();
+  const schoolId = Number(school_id || 0);
+  const supplierId = Number(supplier_id || 0);
+
+  if (!session || !schoolId || !supplierId) {
+    return reply.code(400).send({
+      error: "ValidationError",
+      message: "academic_session, school_id, supplier_id are required.",
+    });
+  }
+
+  const t = await sequelize.transaction();
+  try {
+    // 1) Desired qty from confirmed requirements
+    const reqWhere = {
+      academic_session: session,
+      school_id: schoolId,
+      status: "confirmed",
+    };
+
+    // Requirements supplier-specific (recommended)
+    if (SchoolBookRequirement.rawAttributes?.supplier_id) {
+      reqWhere.supplier_id = supplierId;
+    }
+
+    const reqRows = await SchoolBookRequirement.findAll({
+      where: reqWhere,
+      attributes: ["id", "book_id", "required_copies"],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    if (!reqRows.length) {
+      await t.rollback();
+      return reply.code(200).send({
+        message: "No confirmed requirements found for this school/supplier/session.",
+        created: false,
+        reason: "No requirements",
+      });
+    }
+
+    const desiredByBook = new Map(); // book_id -> desiredQty
+    for (const rr of reqRows) {
+      const bId = Number(rr.book_id || 0);
+      const q = Number(rr.required_copies || 0);
+      if (!bId || q <= 0) continue;
+      desiredByBook.set(bId, (Number(desiredByBook.get(bId)) || 0) + q);
+    }
+
+    if (!desiredByBook.size) {
+      await t.rollback();
+      return reply.code(200).send({
+        message: "Requirements exist but all required_copies are zero.",
+        created: false,
+        reason: "Zero quantities",
+      });
+    }
+
+    // 2) Load all orders (original + reorder) for this tuple (not cancelled)
+    const allOrders = await SchoolOrder.findAll({
+      where: {
+        academic_session: session,
+        school_id: schoolId,
+        supplier_id: supplierId,
+        status: { [Op.ne]: "cancelled" },
+      },
+      include: [{ model: SchoolOrderItem, as: "items" }],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+      order: [["createdAt", "ASC"]],
+    });
+
+    // Need original order to link parent_order_id
+    const original = allOrders.find((o) => String(o.order_type) === "original") || null;
+    if (!original) {
+      await t.rollback();
+      return reply.code(409).send({
+        error: "NoOriginalOrder",
+        message:
+          "No original order exists for this school/supplier/session. First create original using sync-from-requirements / generate.",
+      });
+    }
+
+    // 3) Sum already-ordered qty across ALL orders
+    const orderedByBook = new Map(); // book_id -> alreadyOrderedQty
+    for (const o of allOrders) {
+      for (const it of o.items || []) {
+        const bId = Number(it.book_id || 0);
+        const q = Number(it.total_order_qty || 0);
+        if (!bId || q <= 0) continue;
+        orderedByBook.set(bId, (Number(orderedByBook.get(bId)) || 0) + q);
+      }
+    }
+
+    // 4) Compute delta
+    const deltaByBook = new Map(); // book_id -> extraQtyNeeded
+    let hasDecrease = false;
+
+    for (const [bId, desiredQty] of desiredByBook.entries()) {
+      const already = Number(orderedByBook.get(bId)) || 0;
+      const delta = Number(desiredQty) - already;
+
+      if (delta > 0) deltaByBook.set(bId, delta);
+      if (delta < 0) hasDecrease = true;
+    }
+
+    if (!deltaByBook.size) {
+      await t.rollback();
+      return reply.code(200).send({
+        message: hasDecrease
+          ? "Requirements reduced vs already ordered. No auto-reduction done (manual decision needed)."
+          : "No extra qty needed. Orders already match requirements.",
+        created: false,
+        decreased: hasDecrease,
+      });
+    }
+
+    // 5) Next reorder_seq for this parent
+    const last = await SchoolOrder.findOne({
+      where: {
+        parent_order_id: original.id,
+        order_type: "reorder",
+        status: { [Op.ne]: "cancelled" },
+      },
+      order: [["reorder_seq", "DESC"], ["createdAt", "DESC"]],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+
+    const nextSeq = (Number(last?.reorder_seq) || 0) + 1;
+    const newOrderNo = await generateUniqueOrderNo(t);
+
+    // 6) Create NEW reorder order with ONLY delta items
+    const newOrder = await SchoolOrder.create(
+      {
+        school_id: schoolId,
+        supplier_id: supplierId,
+        order_no: newOrderNo,
+        academic_session: session,
+        order_date: new Date(),
+        status: "draft",
+        order_type: "reorder",
+        parent_order_id: original.id,
+        reorder_seq: nextSeq,
+        remarks: `Adjustment order (delta) based on updated requirements. Parent: ${
+          original.order_no || original.id
+        }`,
+      },
+      { transaction: t }
+    );
+
+    for (const [bookId, qty] of deltaByBook.entries()) {
+      const q = Number(qty || 0);
+      if (q <= 0) continue;
+
+      await SchoolOrderItem.create(
+        {
+          school_order_id: newOrder.id,
+          book_id: Number(bookId),
+          total_order_qty: q,
+          received_qty: 0,
+          reordered_qty: 0,
+        },
+        { transaction: t }
+      );
+    }
+
+    await recomputeOrderStatus(newOrder, t);
+    await t.commit();
+
+    // 7) Return full order
+    const full = await SchoolOrder.findOne({
+      where: { id: newOrder.id },
+      include: [
+        { model: School, as: "school" },
+        { model: Supplier, as: "supplier" },
+        {
+          model: SchoolOrderItem,
+          as: "items",
+          include: [
+            {
+              model: Book,
+              as: "book",
+              include: [{ model: Publisher, as: "publisher", attributes: ["id", "name"] }],
+            },
+          ],
+        },
+      ],
+    });
+
+    const plain = full.toJSON();
+    plain.items =
+      (plain.items || []).map((it) => {
+        const ordered = Number(it.total_order_qty) || 0;
+        const received = Number(it.received_qty) || 0;
+        const reordered = Number(it.reordered_qty) || 0;
+        const pending = Math.max(ordered - received - reordered, 0);
+        return { ...it, pending_qty: pending };
+      }) || [];
+
+    return reply.code(201).send({
+      message: "Adjustment reorder created successfully (delta only).",
+      created: true,
+      order: plain,
+      delta_items_count: deltaByBook.size,
+    });
+  } catch (err) {
+    try {
+      if (!t.finished) await t.rollback();
+    } catch {}
+    request.log.error({ err }, "Error in adjustOrderFromRequirements");
+    return reply.code(500).send({
+      error: "Error",
+      message: err.message || "Failed to adjust order from requirements.",
+    });
+  }
+};

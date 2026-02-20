@@ -24,20 +24,22 @@ module.exports = async function (fastify, opts) {
   fastify.get("/", READ, schoolOrderController.listSchoolOrders);
   fastify.get("/availability", READ, availabilityController.schoolAvailability);
   fastify.get("/pdf/all", READ, schoolOrderController.printAllOrdersPdf);
-  fastify.get(
-    "/pdf/supplier-order-index",
-    READ,
-    schoolOrderController.printSupplierOrderIndexPdf
-  );
+  fastify.get("/pdf/supplier-order-index", READ, schoolOrderController.printSupplierOrderIndexPdf);
   fastify.get("/email-logs", READ, schoolOrderController.getAllOrderEmailLogs);
 
   // WRITE
   fastify.post("/generate", WRITE, schoolOrderController.generateOrdersForSession);
+
+  // ✅ NEW: delta-based adjustment (creates reorder only for INCREASED requirements)
+  // MUST stay in STATIC section (before "/:orderId")
   fastify.post(
-    "/sync-from-requirements",
+    "/adjust-from-requirements",
     WRITE,
-    schoolOrderController.syncOrderFromRequirements
+    schoolOrderController.adjustOrderFromRequirements
   );
+
+  fastify.post("/sync-from-requirements", WRITE, schoolOrderController.syncOrderFromRequirements);
+
   fastify.post(
     "/sync-school-session",
     WRITE,
@@ -49,58 +51,26 @@ module.exports = async function (fastify, opts) {
   // ======================================================
 
   // READ
-  fastify.get(
-    "/:orderId/email-preview",
-    READ,
-    schoolOrderController.getOrderEmailPreview
-  );
-  fastify.get(
-    "/:orderId/email-logs",
-    READ,
-    schoolOrderController.getOrderEmailLogs
-  );
+  fastify.get("/:orderId/email-preview", READ, schoolOrderController.getOrderEmailPreview);
+  fastify.get("/:orderId/email-logs", READ, schoolOrderController.getOrderEmailLogs);
   fastify.get("/:orderId/pdf", READ, schoolOrderController.printOrderPdf);
 
   // WRITE
   fastify.delete("/:orderId", WRITE, schoolOrderController.deleteSchoolOrder);
-  fastify.post(
-    "/:orderId/send-email",
-    WRITE,
-    schoolOrderController.sendOrderEmailForOrder
-  );
-  fastify.patch(
-    "/:orderId/meta",
-    WRITE,
-    schoolOrderController.updateSchoolOrderMeta
-  );
-  fastify.patch(
-    "/:orderId/order-no",
-    WRITE,
-    schoolOrderController.updateSchoolOrderNo
-  );
-  fastify.patch(
-    "/:orderId/items",
-    WRITE,
-    schoolOrderController.updateSchoolOrderItems
-  );
-  fastify.post(
-    "/:orderId/receive",
-    WRITE,
-    schoolOrderController.receiveOrderItems
-  );
-  fastify.post(
-    "/:orderId/reorder-copy",
-    WRITE,
-    schoolOrderController.reorderCopyWithEdit
-  );
-  fastify.post(
-    "/:orderId/reorder",
-    WRITE,
-    schoolOrderController.reorderPendingForOrder
-  );
-  fastify.post(
-    "/:orderId/reorder-pending",
-    WRITE,
-    schoolOrderController.reorderPendingForOrder
-  );
+
+  fastify.post("/:orderId/send-email", WRITE, schoolOrderController.sendOrderEmailForOrder);
+
+  fastify.patch("/:orderId/meta", WRITE, schoolOrderController.updateSchoolOrderMeta);
+
+  fastify.patch("/:orderId/order-no", WRITE, schoolOrderController.updateSchoolOrderNo);
+
+  fastify.patch("/:orderId/items", WRITE, schoolOrderController.updateSchoolOrderItems);
+
+  fastify.post("/:orderId/receive", WRITE, schoolOrderController.receiveOrderItems);
+
+  fastify.post("/:orderId/reorder-copy", WRITE, schoolOrderController.reorderCopyWithEdit);
+
+  // keep both if frontend calls either
+  fastify.post("/:orderId/reorder", WRITE, schoolOrderController.reorderPendingForOrder);
+  fastify.post("/:orderId/reorder-pending", WRITE, schoolOrderController.reorderPendingForOrder);
 };
