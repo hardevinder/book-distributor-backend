@@ -88,6 +88,11 @@ const SupplierReceiptAllocation = require("./supplierReceiptAllocation")(sequeli
 const SupplierPayment = require("./supplierPayment")(sequelize, DataTypes);
 const SupplierLedgerTxn = require("./supplierLedgerTxn")(sequelize, DataTypes);
 
+/* ======================
+   ✅ NEW: SupplierReceipt ↔ Multiple SchoolOrders link table
+   ====================== */
+const SupplierReceiptOrderLink = require("./SupplierReceiptOrderLink")(sequelize, DataTypes);
+
 /* =====================================================
    ASSOCIATIONS (manual + safe)
    ===================================================== */
@@ -267,6 +272,7 @@ Sale.belongsTo(User, { foreignKey: "cancelled_by", as: "canceller" });
 Supplier.hasMany(SupplierReceipt, { foreignKey: "supplier_id", as: "receipts" });
 SupplierReceipt.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
+/* ✅ Keep legacy single-order link (still useful for old receipts / UI) */
 SchoolOrder.hasMany(SupplierReceipt, { foreignKey: "school_order_id", as: "supplierReceipts" });
 SupplierReceipt.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "schoolOrder" });
 
@@ -280,6 +286,42 @@ SupplierReceiptItem.belongsTo(SupplierReceipt, { foreignKey: "supplier_receipt_i
 
 Book.hasMany(SupplierReceiptItem, { foreignKey: "book_id", as: "supplier_receipt_items" });
 SupplierReceiptItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+
+/* ---------- ✅ NEW: SupplierReceipt ↔ Multiple SchoolOrders (Link Table) ---------- */
+SupplierReceipt.hasMany(SupplierReceiptOrderLink, {
+  foreignKey: "supplier_receipt_id",
+  as: "order_links",
+  onDelete: "CASCADE",
+  hooks: true,
+});
+SupplierReceiptOrderLink.belongsTo(SupplierReceipt, {
+  foreignKey: "supplier_receipt_id",
+  as: "receipt",
+});
+
+SchoolOrder.hasMany(SupplierReceiptOrderLink, {
+  foreignKey: "school_order_id",
+  as: "receipt_links",
+});
+SupplierReceiptOrderLink.belongsTo(SchoolOrder, {
+  foreignKey: "school_order_id",
+  as: "school_order",
+});
+
+/* ✅ Optional convenience: many-to-many */
+SupplierReceipt.belongsToMany(SchoolOrder, {
+  through: SupplierReceiptOrderLink,
+  foreignKey: "supplier_receipt_id",
+  otherKey: "school_order_id",
+  as: "linkedOrders",
+});
+
+SchoolOrder.belongsToMany(SupplierReceipt, {
+  through: SupplierReceiptOrderLink,
+  foreignKey: "school_order_id",
+  otherKey: "supplier_receipt_id",
+  as: "linkedReceipts",
+});
 
 /* ---------- Supplier Receipt Allocations ---------- */
 SupplierReceipt.hasMany(SupplierReceiptAllocation, {
@@ -374,6 +416,9 @@ const db = {
   SupplierReceiptAllocation,
   SupplierPayment,
   SupplierLedgerTxn,
+
+  // ✅ NEW
+  SupplierReceiptOrderLink,
 };
 
 module.exports = db;

@@ -200,7 +200,7 @@ const start = async () => {
     await sequelize.sync();
     fastify.log.info(`✅ Models synced (env=${NODE_ENV}, alter=false)`);
 
-    await fastify.listen({ port: config.port, host: "0.0.0.0" });
+    await fastify.listen({ port: config.port, host: "127.0.0.1" });
     fastify.log.info(`🚀 Server running on port ${config.port}`);
   } catch (err) {
     console.error("Startup Error:", err);
