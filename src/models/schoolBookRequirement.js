@@ -1,4 +1,5 @@
 // src/models/schoolBookRequirement.js
+"use strict";
 
 module.exports = (sequelize, DataTypes) => {
   const SchoolBookRequirement = sequelize.define(
@@ -60,6 +61,12 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
         defaultValue: false,
       },
+
+      // ✅ Exists in DB
+      supplier_id: {
+        type: DataTypes.INTEGER.UNSIGNED,
+        allowNull: true,
+      },
     },
     {
       tableName: "school_book_requirements",
@@ -70,47 +77,64 @@ module.exports = (sequelize, DataTypes) => {
           unique: true,
           fields: ["school_id", "book_id", "academic_session"],
         },
-        {
-          fields: ["school_id"],
-        },
-        {
-          fields: ["book_id"],
-        },
-        {
-          fields: ["class_id"],
-        },
-        {
-          fields: ["academic_session"],
-        },
+        { fields: ["school_id"] },
+        { fields: ["book_id"] },
+        { fields: ["class_id"] },
+        { fields: ["academic_session"] },
+        { fields: ["supplier_id"] }, // ✅ helpful filter/index
       ],
     }
   );
 
-  // 🧩 Associations
+  // 🧩 Associations (IMPORTANT: keep ALL associations inside this function)
   SchoolBookRequirement.associate = (models) => {
     // 🔗 School
-    SchoolBookRequirement.belongsTo(models.School, {
-      foreignKey: "school_id",
-      as: "school",
-    });
+    if (models.School) {
+      SchoolBookRequirement.belongsTo(models.School, {
+        foreignKey: "school_id",
+        as: "school",
+      });
+    }
 
     // 🔗 Book
-    SchoolBookRequirement.belongsTo(models.Book, {
-      foreignKey: "book_id",
-      as: "book",
-    });
+    if (models.Book) {
+      SchoolBookRequirement.belongsTo(models.Book, {
+        foreignKey: "book_id",
+        as: "book",
+      });
+    }
 
     // 🔗 Class (optional)
-    SchoolBookRequirement.belongsTo(models.Class, {
-      foreignKey: "class_id",
-      as: "class",
-    });
+    if (models.Class) {
+      SchoolBookRequirement.belongsTo(models.Class, {
+        foreignKey: "class_id",
+        as: "class",
+      });
+    }
+
+    // ✅ Supplier (optional)
+    if (models.Supplier) {
+      SchoolBookRequirement.belongsTo(models.Supplier, {
+        foreignKey: "supplier_id",
+        as: "supplier",
+      });
+    }
 
     // 🔗 Links to publisher order items (allocation)
-    SchoolBookRequirement.hasMany(models.RequirementOrderLink, {
-      foreignKey: "requirement_id",
-      as: "order_links",
-    });
+    if (models.RequirementOrderLink) {
+      SchoolBookRequirement.hasMany(models.RequirementOrderLink, {
+        foreignKey: "requirement_id",
+        as: "order_links",
+      });
+    }
+
+    // ✅ If you later want reverse relation from requirement to school sale items
+    if (models.SchoolSaleItem) {
+      SchoolBookRequirement.hasMany(models.SchoolSaleItem, {
+        foreignKey: "requirement_item_id",
+        as: "sale_items",
+      });
+    }
   };
 
   return SchoolBookRequirement;

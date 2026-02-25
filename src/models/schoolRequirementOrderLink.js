@@ -1,8 +1,8 @@
 // src/models/schoolRequirementOrderLink.js
 
 module.exports = (sequelize, DataTypes) => {
-  const SchoolRequirementOrderLink = sequelize.define(
-    "SchoolRequirementOrderLink",
+  const RequirementOrderLink = sequelize.define(
+    "RequirementOrderLink",
     {
       id: {
         type: DataTypes.INTEGER.UNSIGNED,
@@ -15,7 +15,8 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: false,
       },
 
-      school_order_item_id: {
+      // ✅ matches DB column name
+      publisher_order_item_id: {
         type: DataTypes.INTEGER.UNSIGNED,
         allowNull: false,
       },
@@ -27,22 +28,26 @@ module.exports = (sequelize, DataTypes) => {
       },
     },
     {
-      tableName: "school_requirement_order_links",
+      // ✅ matches DB table name
+      tableName: "requirement_order_links",
       timestamps: true,
     }
   );
 
-  SchoolRequirementOrderLink.associate = (models) => {
-    SchoolRequirementOrderLink.belongsTo(models.SchoolBookRequirement, {
+  RequirementOrderLink.associate = (models) => {
+    RequirementOrderLink.belongsTo(models.SchoolBookRequirement, {
       foreignKey: "requirement_id",
       as: "requirement",
     });
 
-    SchoolRequirementOrderLink.belongsTo(models.SchoolOrderItem, {
-      foreignKey: "school_order_item_id",
-      as: "order_item",
-    });
+    // If you have PublisherOrderItem model
+    if (models.PublisherOrderItem) {
+      RequirementOrderLink.belongsTo(models.PublisherOrderItem, {
+        foreignKey: "publisher_order_item_id",
+        as: "publisher_order_item",
+      });
+    }
   };
 
-  return SchoolRequirementOrderLink;
+  return RequirementOrderLink;
 };

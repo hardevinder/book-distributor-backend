@@ -63,21 +63,27 @@ const BundleIssue = require("./bundleIssue")(sequelize, DataTypes);
 const BundleDispatch = require("./bundleDispatch")(sequelize, DataTypes);
 
 /* ======================
-   ✅ User ↔ Distributor (LOGIN / ANALYTICS)  ✅ NEW
+   ✅ User ↔ Distributor (LOGIN / ANALYTICS)
    ====================== */
 Distributor.hasMany(User, { foreignKey: "distributor_id", as: "users" });
 User.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
 
 /* ======================
-   ✅ DISTRIBUTOR ↔ SCHOOL MAPPING (NEW)
+   ✅ DISTRIBUTOR ↔ SCHOOL MAPPING
    ====================== */
 const DistributorSchool = require("./distributorSchool")(sequelize, DataTypes);
 
 /* ======================
-   ✅ SALES (NEW)
+   ✅ SALES (POS / WALKIN / STUDENT)
    ====================== */
 const Sale = require("./sale")(sequelize, DataTypes);
 const SaleItem = require("./saleItem")(sequelize, DataTypes);
+
+/* ======================
+   ✅ NEW: SCHOOL BULK SALES (FROM REQUIREMENTS)
+   ====================== */
+const SchoolSale = require("./schoolSale")(sequelize, DataTypes);
+const SchoolSaleItem = require("./schoolSaleItem")(sequelize, DataTypes);
 
 /* ======================
    SUPPLIER ACCOUNTING
@@ -109,7 +115,7 @@ Book.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 Book.hasMany(Product, { foreignKey: "book_id", as: "products" });
 Product.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 
-/* ---------- ✅ NEW: ProductCategory ↔ Product ---------- */
+/* ---------- ✅ ProductCategory ↔ Product ---------- */
 ProductCategory.hasMany(Product, { foreignKey: "category_id", as: "products" });
 Product.belongsTo(ProductCategory, { foreignKey: "category_id", as: "category" });
 
@@ -216,14 +222,12 @@ if (BundleDispatch.rawAttributes && BundleDispatch.rawAttributes.distributor_id)
    ✅ Distributor ↔ School Restriction (Mapping)
    ========================================================= */
 
-/* direct mapping rows */
 Distributor.hasMany(DistributorSchool, { foreignKey: "distributor_id", as: "schoolMappings" });
 DistributorSchool.belongsTo(Distributor, { foreignKey: "distributor_id", as: "distributor" });
 
 School.hasMany(DistributorSchool, { foreignKey: "school_id", as: "distributorMappings" });
 DistributorSchool.belongsTo(School, { foreignKey: "school_id", as: "school" });
 
-/* many-to-many */
 Distributor.belongsToMany(School, {
   through: DistributorSchool,
   foreignKey: "distributor_id",
@@ -239,40 +243,74 @@ School.belongsToMany(Distributor, {
 });
 
 /* ======================
-   ✅ SALES ASSOCIATIONS
+   ✅ SALES ASSOCIATIONS (POS)
    ====================== */
-
-/* Sale ↔ SaleItem */
 Sale.hasMany(SaleItem, { foreignKey: "sale_id", as: "items", onDelete: "CASCADE", hooks: true });
 SaleItem.belongsTo(Sale, { foreignKey: "sale_id", as: "sale" });
 
-/* SaleItem ↔ Product */
 Product.hasMany(SaleItem, { foreignKey: "product_id", as: "sale_items" });
 SaleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
 
-/* SaleItem ↔ Book (ONLY if sale_items has book_id) */
 if (SaleItem?.rawAttributes?.book_id) {
   Book.hasMany(SaleItem, { foreignKey: "book_id", as: "sale_items" });
   SaleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
 }
 
-/* Sale ↔ Bundle (optional) */
 Sale.belongsTo(Bundle, { foreignKey: "bundle_id", as: "bundle" });
 Bundle.hasMany(Sale, { foreignKey: "bundle_id", as: "sales" });
 
-/* Sale sold_to polymorphic */
 Sale.belongsTo(School, { foreignKey: "sold_to_id", constraints: false, as: "soldSchool" });
 Sale.belongsTo(Distributor, { foreignKey: "sold_to_id", constraints: false, as: "soldDistributor" });
 
-/* created_by / cancelled_by (record sold by whom) */
 Sale.belongsTo(User, { foreignKey: "created_by", as: "creator" });
 Sale.belongsTo(User, { foreignKey: "cancelled_by", as: "canceller" });
+
+/* ======================
+   ✅ NEW: SCHOOL SALES ASSOCIATIONS (BULK)
+   ====================== */
+SchoolSale.hasMany(SchoolSaleItem, {
+  foreignKey: "school_sale_id",
+  as: "items",
+  onDelete: "CASCADE",
+  hooks: true,
+});
+SchoolSaleItem.belongsTo(SchoolSale, { foreignKey: "school_sale_id", as: "sale" });
+
+School.hasMany(SchoolSale, { foreignKey: "school_id", as: "school_sales" });
+SchoolSale.belongsTo(School, { foreignKey: "school_id", as: "school" });
+
+if (SchoolSale?.rawAttributes?.class_id) {
+  Class.hasMany(SchoolSale, { foreignKey: "class_id", as: "school_sales" });
+  SchoolSale.belongsTo(Class, { foreignKey: "class_id", as: "class" });
+}
+
+if (SchoolSale?.rawAttributes?.supplier_id) {
+  Supplier.hasMany(SchoolSale, { foreignKey: "supplier_id", as: "school_sales" });
+  SchoolSale.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
+}
+
+Book.hasMany(SchoolSaleItem, { foreignKey: "book_id", as: "school_sale_items" });
+SchoolSaleItem.belongsTo(Book, { foreignKey: "book_id", as: "book" });
+
+Product.hasMany(SchoolSaleItem, { foreignKey: "product_id", as: "school_sale_items" });
+SchoolSaleItem.belongsTo(Product, { foreignKey: "product_id", as: "product" });
+
+SchoolBookRequirement.hasMany(SchoolSaleItem, {
+  foreignKey: "requirement_item_id",
+  as: "sale_items",
+});
+SchoolSaleItem.belongsTo(SchoolBookRequirement, {
+  foreignKey: "requirement_item_id",
+  as: "requirement_row",
+});
+
+SchoolSale.belongsTo(User, { foreignKey: "created_by", as: "creator" });
+SchoolSale.belongsTo(User, { foreignKey: "cancelled_by", as: "canceller" });
 
 /* ---------- Supplier Receipts ---------- */
 Supplier.hasMany(SupplierReceipt, { foreignKey: "supplier_id", as: "receipts" });
 SupplierReceipt.belongsTo(Supplier, { foreignKey: "supplier_id", as: "supplier" });
 
-/* ✅ Keep legacy single-order link (still useful for old receipts / UI) */
 SchoolOrder.hasMany(SupplierReceipt, { foreignKey: "school_order_id", as: "supplierReceipts" });
 SupplierReceipt.belongsTo(SchoolOrder, { foreignKey: "school_order_id", as: "schoolOrder" });
 
@@ -308,7 +346,6 @@ SupplierReceiptOrderLink.belongsTo(SchoolOrder, {
   as: "school_order",
 });
 
-/* ✅ Optional convenience: many-to-many */
 SupplierReceipt.belongsToMany(SchoolOrder, {
   through: SupplierReceiptOrderLink,
   foreignKey: "supplier_receipt_id",
@@ -381,7 +418,7 @@ const db = {
   CompanyProfile,
 
   Product,
-  ProductCategory, // ✅ NEW EXPORT
+  ProductCategory,
 
   SchoolBookRequirement,
 
@@ -404,12 +441,15 @@ const db = {
   BundleIssue,
   BundleDispatch,
 
-  // ✅ Distributor ↔ School mapping
   DistributorSchool,
 
-  // ✅ SALES
+  // ✅ SALES (POS)
   Sale,
   SaleItem,
+
+  // ✅ NEW: SCHOOL SALES (BULK)
+  SchoolSale,
+  SchoolSaleItem,
 
   SupplierReceipt,
   SupplierReceiptItem,
@@ -417,7 +457,6 @@ const db = {
   SupplierPayment,
   SupplierLedgerTxn,
 
-  // ✅ NEW
   SupplierReceiptOrderLink,
 };
 

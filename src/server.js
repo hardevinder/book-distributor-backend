@@ -154,9 +154,16 @@ const buildServer = () => {
   fastify.register(require("./routes/bundleDispatchRoutes"), { prefix: "/api/bundle-dispatches" });
 
   /* ======================
-     ✅ SALES
+     ✅ SALES (STUDENT / WALKIN / DISTRIBUTOR)
      ====================== */
   fastify.register(require("./routes/saleRoutes"), { prefix: "/api/sales" });
+
+  /* ======================
+     ✅ SCHOOL BULK SALES (FROM REQUIREMENTS)
+     ====================== */
+  // 📌 File: routes/schoolSales.js
+  // Mounted at: /api/school-sales
+  fastify.register(require("./routes/schoolSales"), { prefix: "/api/school-sales" });
 
   /* ======================
      ✅ SALES ANALYTICS
